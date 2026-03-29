@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nvidia-tao-automl"
+version = "0.1.0"
+description = "NVIDIA TAO AutoML — standalone hyperparameter optimization for TAO networks"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+
+dependencies = [
+    "numpy",
+    "scikit-learn",       # GaussianProcessRegressor, kernels (Bayesian, BFBO)
+    "scipy",              # norm, gaussian_kde, minimize, curve_fit (Bayesian, BOHB, HyperBandES)
+    "pandas",             # DataFrame for search space param filtering
+    "omegaconf",          # MISSING sentinel used in network config dataclasses
+    "requests",           # Used by dataclass2json_converter (schema download utility)
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+]
+
+[project.urls]
+Repository = "https://gitlab-master.nvidia.com/nvidia-tao-toolkit/tao-automl"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["tao_automl*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
