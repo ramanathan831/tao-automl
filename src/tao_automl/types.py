@@ -114,6 +114,9 @@ class ResumeRecommendation:
         self.resume_from_job_id = resume_from_job_id
 
 
+# below code was changed from FTMS version - to remove flask/mongo db related fields
+
+
 @dataclass
 class AutoMLContext:
     """Context object for an AutoML session, replacing the FTMS JobContext."""
