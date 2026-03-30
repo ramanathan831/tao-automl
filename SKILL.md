@@ -23,7 +23,7 @@ Before running AutoML:
 
 Verify setup:
 ```bash
-python3 -c "from tao_sdk.automl_runner import AutoMLRunner; print('OK')"
+python3 -c "from tao_automl.runner import AutoMLRunner; print('OK')"
 ```
 
 ---
@@ -64,7 +64,7 @@ If any required field is missing, ask the user. Do NOT guess dataset paths.
 
 ```python
 from tao_sdk import TaoExecutionSDK
-from tao_sdk.automl_runner import AutoMLRunner
+from tao_automl.runner import AutoMLRunner
 
 sdk = TaoExecutionSDK(creds_file="secrets.json")
 runner = AutoMLRunner(sdk)

@@ -11,11 +11,12 @@ license = {text = "Apache-2.0"}
 
 dependencies = [
     "numpy",
-    "scikit-learn",       # GaussianProcessRegressor, kernels (Bayesian, BFBO)
-    "scipy",              # norm, gaussian_kde, minimize, curve_fit (Bayesian, BOHB, HyperBandES)
-    "pandas",             # DataFrame for search space param filtering
-    "omegaconf",          # MISSING sentinel used in network config dataclasses
-    "requests",           # Used by dataclass2json_converter (schema download utility)
+    "scikit-learn",
+    "scipy",
+    "pandas",
+    "omegaconf",
+    "requests",
+    "tao-sdk @ git+ssh://git@gitlab-master.nvidia.com:12051/nvidia-tao-toolkit/tao-sdk.git",
 ]
 
 [project.optional-dependencies]
