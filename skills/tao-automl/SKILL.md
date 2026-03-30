@@ -14,8 +14,11 @@ Run automated hyperparameter optimization (HPO) for any TAO network. The agent u
 
 Before running AutoML:
 
-1. **SDK credentials**: `secrets.json` must exist in the working directory with Lepton credentials
-2. **Dataset**: Training data uploaded to S3-compatible storage (`aws://bucket/path`)
+1. **SDK credentials**: `secrets.json` must exist in the working directory with platform credentials
+2. **Dataset**: Training data accessible from the compute backend. URI format depends on platform:
+   - Lepton/DGX Cloud: `aws://bucket/path` (S3-compatible)
+   - Azure: `azure://container/path`
+   - Local/Docker: local filesystem path
 3. **nvidia-tao-automl installed**: `pip install nvidia-tao-automl` (or `pip install nvidia-tao-sdk[automl]`)
 
 Verify setup:
@@ -32,7 +35,7 @@ Extract from the user's request:
 | Field | Required | Example | How to get it |
 |---|---|---|---|
 | `network_arch` | Yes | `"cosmos-rl"`, `"dino"`, `"clip"` | User states the model |
-| `train_dataset_uri` | Yes | `"aws://bucket/data/subset"` | User provides or agent finds in S3 |
+| `train_dataset_uri` | Yes | `"aws://bucket/data/subset"` | User provides the URI (S3, Azure, or local path) |
 | `metric` | No | `"loss"` (default) | Ask if unclear — loss for regression, accuracy for classification |
 | `algorithm` | No | `"bayesian"` (default) | See algorithm guide below |
 | `max_recommendations` | No | 5–20 | Ask budget — each rec is one full training run |
@@ -215,7 +218,7 @@ The result is a plain dict:
 ### If all recs failed:
 
 Check for common issues:
-- **Dataset path wrong** — verify the S3 URI has `annotations.json` + `images.tar.gz` or `videos.tar.gz`
+- **Dataset path wrong** — verify the URI points to a directory with `annotations.json` + `images.tar.gz` or `videos.tar.gz`
 - **Batch size mismatch** — use `spec_overrides={"train.train_batch_per_replica": 4}`
 - **Model download timeout** — the first run downloads ~15GB from HuggingFace; subsequent runs use cache
 - **OOM** — reduce batch size or model_max_length via spec_overrides
