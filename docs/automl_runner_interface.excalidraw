@@ -1,0 +1,180 @@
+{
+  "type": "excalidraw",
+  "version": 2,
+  "source": "https://excalidraw.com",
+  "elements": [
+    {
+      "type": "text", "id": "title", "x": 180, "y": 20, "width": 700, "height": 35,
+      "text": "AutoMLRunner — The Only Interface an Agent Needs",
+      "originalText": "AutoMLRunner — The Only Interface an Agent Needs",
+      "fontSize": 26, "fontFamily": 3, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#1e40af", "backgroundColor": "transparent",
+      "fillStyle": "solid", "strokeWidth": 1, "strokeStyle": "solid", "roughness": 0,
+      "opacity": 100, "angle": 0, "seed": 10001, "version": 1, "versionNonce": 10002,
+      "isDeleted": false, "groupIds": [], "boundElements": null, "link": null, "locked": false,
+      "containerId": null, "lineHeight": 1.25
+    },
+    {
+      "type": "rectangle", "id": "runner_hero", "x": 50, "y": 70, "width": 520, "height": 580,
+      "strokeColor": "#6d28d9", "backgroundColor": "#ddd6fe",
+      "fillStyle": "solid", "strokeWidth": 3, "strokeStyle": "solid", "roughness": 0,
+      "opacity": 100, "angle": 0, "seed": 10010, "version": 1, "versionNonce": 10011,
+      "isDeleted": false, "groupIds": [], "boundElements": null, "link": null, "locked": false,
+      "roundness": {"type": 3}
+    },
+    {
+      "type": "text", "id": "runner_title", "x": 65, "y": 80, "width": 300, "height": 28,
+      "text": "AutoMLRunner",
+      "originalText": "AutoMLRunner",
+      "fontSize": 22, "fontFamily": 3, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#6d28d9", "backgroundColor": "transparent",
+      "fillStyle": "solid", "strokeWidth": 1, "strokeStyle": "solid", "roughness": 0,
+      "opacity": 100, "angle": 0, "seed": 10012, "version": 1, "versionNonce": 10013,
+      "isDeleted": false, "groupIds": [], "boundElements": null, "link": null, "locked": false,
+      "containerId": null, "lineHeight": 1.25
+    },
+    {
+      "type": "text", "id": "runner_import", "x": 65, "y": 108, "width": 490, "height": 18,
+      "text": "from tao_sdk.automl_runner import AutoMLRunner",
+      "originalText": "from tao_sdk.automl_runner import AutoMLRunner",
+      "fontSize": 12, "fontFamily": 3, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#64748b", "backgroundColor": "transparent",
+      "fillStyle": "solid", "strokeWidth": 1, "strokeStyle": "solid", "roughness": 0,
+      "opacity": 100, "angle": 0, "seed": 10014, "version": 1, "versionNonce": 10015,
+      "isDeleted": false, "groupIds": [], "boundElements": null, "link": null, "locked": false,
+      "containerId": null, "lineHeight": 1.25
+    },
+    {
+      "type": "rectangle", "id": "init_box", "x": 65, "y": 135, "width": 490, "height": 45,
+      "strokeColor": "#c2410c", "backgroundColor": "#fed7aa",
+      "fillStyle": "solid", "strokeWidth": 2, "strokeStyle": "solid", "roughness": 0,
+      "opacity": 100, "angle": 0, "seed": 10020, "version": 1, "versionNonce": 10021,
+      "isDeleted": false, "groupIds": [], "boundElements": [{"id": "init_text", "type": "text"}],
+      "link": null, "locked": false, "roundness": {"type": 3}
+    },
+    {
+      "type": "text", "id": "init_text", "x": 75, "y": 140, "width": 470, "height": 35,
+      "text": "__init__(sdk: TaoExecutionSDK, poll_interval: int = 30)\nCreates runner. Only needs the SDK instance.",
+      "originalText": "__init__(sdk: TaoExecutionSDK, poll_interval: int = 30)\nCreates runner. Only needs the SDK instance.",
+      "fontSize": 12, "fontFamily": 3, "textAlign": "left", "verticalAlign": "middle",
+      "strokeColor": "#374151", "backgroundColor": "transparent",
+      "fillStyle": "solid", "strokeWidth": 1, "strokeStyle": "solid", "roughness": 0,
+      "opacity": 100, "angle": 0, "seed": 10022, "version": 1, "versionNonce": 10023,
+      "isDeleted": false, "groupIds": [], "boundElements": null, "link": null, "locked": false,
+      "containerId": "init_box", "lineHeight": 1.25
+    },
+    {
+      "type": "rectangle", "id": "run_box", "x": 65, "y": 195, "width": 490, "height": 320,
+      "strokeColor": "#047857", "backgroundColor": "#a7f3d0",
+      "fillStyle": "solid", "strokeWidth": 2, "strokeStyle": "solid", "roughness": 0,
+      "opacity": 100, "angle": 0, "seed": 10030, "version": 1, "versionNonce": 10031,
+      "isDeleted": false, "groupIds": [], "boundElements": [{"id": "run_text", "type": "text"}],
+      "link": null, "locked": false, "roundness": {"type": 3}
+    },
+    {
+      "type": "text", "id": "run_text", "x": 75, "y": 200, "width": 470, "height": 310,
+      "text": "run(...) -> dict           THE MAIN METHOD\n\nRequired:\n  network_arch: str              \"cosmos-rl\", \"dino\", ...\n  train_dataset_uri: str         \"aws://bucket/data/subset\"\n\nOptional — Job Config:\n  eval_dataset_uri: str = \"\"     Eval dataset URI\n  base_checkpoint: str = \"\"      Pretrained checkpoint\n  workspace_id: str = None       Lepton workspace (default: SDK)\n  image: str = None              Docker image override\n  backend_details: dict = None   {backend_type, resource_shape}\n\nOptional — AutoML Config:\n  automl_settings: dict = None   {algorithm, metric, max_recs}\n  automl_hyperparameters: list = None  Params to search\n  custom_param_ranges: dict = None    Range overrides\n\nOptional — State & Control:\n  workspace_path: str = \"./automl_workspace\"\n  spec_overrides: dict = None    Override base specs\n  resume: bool = False           Resume from persisted state\n\nOptional — Callbacks:\n  on_recommendation: callable    Called per new rec\n  on_result: callable            Called per result",
+      "originalText": "run(...) -> dict           THE MAIN METHOD\n\nRequired:\n  network_arch: str              \"cosmos-rl\", \"dino\", ...\n  train_dataset_uri: str         \"aws://bucket/data/subset\"\n\nOptional — Job Config:\n  eval_dataset_uri: str = \"\"     Eval dataset URI\n  base_checkpoint: str = \"\"      Pretrained checkpoint\n  workspace_id: str = None       Lepton workspace (default: SDK)\n  image: str = None              Docker image override\n  backend_details: dict = None   {backend_type, resource_shape}\n\nOptional — AutoML Config:\n  automl_settings: dict = None   {algorithm, metric, max_recs}\n  automl_hyperparameters: list = None  Params to search\n  custom_param_ranges: dict = None    Range overrides\n\nOptional — State & Control:\n  workspace_path: str = \"./automl_workspace\"\n  spec_overrides: dict = None    Override base specs\n  resume: bool = False           Resume from persisted state\n\nOptional — Callbacks:\n  on_recommendation: callable    Called per new rec\n  on_result: callable            Called per result",
+      "fontSize": 11, "fontFamily": 3, "textAlign": "left", "verticalAlign": "middle",
+      "strokeColor": "#374151", "backgroundColor": "transparent",
+      "fillStyle": "solid", "strokeWidth": 1, "strokeStyle": "solid", "roughness": 0,
+      "opacity": 100, "angle": 0, "seed": 10032, "version": 1, "versionNonce": 10033,
+      "isDeleted": false, "groupIds": [], "boundElements": null, "link": null, "locked": false,
+      "containerId": "run_box", "lineHeight": 1.25
+    },
+    {
+      "type": "rectangle", "id": "returns_box", "x": 65, "y": 530, "width": 490, "height": 105,
+      "strokeColor": "#1e3a5f", "backgroundColor": "#dbeafe",
+      "fillStyle": "solid", "strokeWidth": 2, "strokeStyle": "solid", "roughness": 0,
+      "opacity": 100, "angle": 0, "seed": 10040, "version": 1, "versionNonce": 10041,
+      "isDeleted": false, "groupIds": [], "boundElements": [{"id": "returns_text", "type": "text"}],
+      "link": null, "locked": false, "roundness": {"type": 3}
+    },
+    {
+      "type": "text", "id": "returns_text", "x": 75, "y": 535, "width": 470, "height": 95,
+      "text": "Returns: dict\n\n  best:     {rec_id: int, specs: dict, metric_value: float}\n  progress: {completed, total, best_metric, best_rec_id, algorithm}\n  history:  [{rec_id, metric, status}, ...]\n\nAll plain dicts — no AutoML classes exposed to the caller.",
+      "originalText": "Returns: dict\n\n  best:     {rec_id: int, specs: dict, metric_value: float}\n  progress: {completed, total, best_metric, best_rec_id, algorithm}\n  history:  [{rec_id, metric, status}, ...]\n\nAll plain dicts — no AutoML classes exposed to the caller.",
+      "fontSize": 11, "fontFamily": 3, "textAlign": "left", "verticalAlign": "middle",
+      "strokeColor": "#374151", "backgroundColor": "transparent",
+      "fillStyle": "solid", "strokeWidth": 1, "strokeStyle": "solid", "roughness": 0,
+      "opacity": 100, "angle": 0, "seed": 10042, "version": 1, "versionNonce": 10043,
+      "isDeleted": false, "groupIds": [], "boundElements": null, "link": null, "locked": false,
+      "containerId": "returns_box", "lineHeight": 1.25
+    },
+    {
+      "type": "rectangle", "id": "code_bg", "x": 610, "y": 70, "width": 440, "height": 250,
+      "strokeColor": "#1e3a5f", "backgroundColor": "#1e293b",
+      "fillStyle": "solid", "strokeWidth": 1, "strokeStyle": "solid", "roughness": 0,
+      "opacity": 100, "angle": 0, "seed": 20010, "version": 1, "versionNonce": 20011,
+      "isDeleted": false, "groupIds": [], "boundElements": [{"id": "code_text", "type": "text"}],
+      "link": null, "locked": false, "roundness": {"type": 3}
+    },
+    {
+      "type": "text", "id": "code_text", "x": 625, "y": 80, "width": 410, "height": 230,
+      "text": "# Agent usage — this is ALL you need\n\nfrom tao_sdk import TaoExecutionSDK\nfrom tao_sdk.automl_runner import AutoMLRunner\n\nsdk = TaoExecutionSDK(creds_file=\"secrets.json\")\nrunner = AutoMLRunner(sdk)\nresult = runner.run(\n    network_arch=\"cosmos-rl\",\n    train_dataset_uri=\"aws://bucket/data\",\n    automl_settings={\n        \"algorithm\": \"bayesian\",\n        \"metric\": \"loss\",\n        \"automl_max_recommendations\": 5,\n    },\n    spec_overrides={\"train.epoch\": 3},\n    resume=False,\n)\nprint(result[\"best\"][\"metric_value\"])",
+      "originalText": "# Agent usage — this is ALL you need\n\nfrom tao_sdk import TaoExecutionSDK\nfrom tao_sdk.automl_runner import AutoMLRunner\n\nsdk = TaoExecutionSDK(creds_file=\"secrets.json\")\nrunner = AutoMLRunner(sdk)\nresult = runner.run(\n    network_arch=\"cosmos-rl\",\n    train_dataset_uri=\"aws://bucket/data\",\n    automl_settings={\n        \"algorithm\": \"bayesian\",\n        \"metric\": \"loss\",\n        \"automl_max_recommendations\": 5,\n    },\n    spec_overrides={\"train.epoch\": 3},\n    resume=False,\n)\nprint(result[\"best\"][\"metric_value\"])",
+      "fontSize": 12, "fontFamily": 3, "textAlign": "left", "verticalAlign": "middle",
+      "strokeColor": "#22c55e", "backgroundColor": "transparent",
+      "fillStyle": "solid", "strokeWidth": 1, "strokeStyle": "solid", "roughness": 0,
+      "opacity": 100, "angle": 0, "seed": 20012, "version": 1, "versionNonce": 20013,
+      "isDeleted": false, "groupIds": [], "boundElements": null, "link": null, "locked": false,
+      "containerId": "code_bg", "lineHeight": 1.25
+    },
+    {
+      "type": "text", "id": "hidden_title", "x": 610, "y": 340, "width": 440, "height": 22,
+      "text": "What the runner handles internally (agent never sees):",
+      "originalText": "What the runner handles internally (agent never sees):",
+      "fontSize": 13, "fontFamily": 3, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#1e40af", "backgroundColor": "transparent",
+      "fillStyle": "solid", "strokeWidth": 1, "strokeStyle": "solid", "roughness": 0,
+      "opacity": 100, "angle": 0, "seed": 20020, "version": 1, "versionNonce": 20021,
+      "isDeleted": false, "groupIds": [], "boundElements": null, "link": null, "locked": false,
+      "containerId": null, "lineHeight": 1.25
+    },
+    {
+      "type": "rectangle", "id": "hidden_box", "x": 610, "y": 370, "width": 440, "height": 280,
+      "strokeColor": "#1e40af", "backgroundColor": "transparent",
+      "fillStyle": "solid", "strokeWidth": 1, "strokeStyle": "dashed", "roughness": 0,
+      "opacity": 100, "angle": 0, "seed": 20030, "version": 1, "versionNonce": 20031,
+      "isDeleted": false, "groupIds": [], "boundElements": null, "link": null, "locked": false,
+      "roundness": {"type": 3}
+    },
+    {
+      "type": "text", "id": "hidden_text", "x": 625, "y": 380, "width": 410, "height": 260,
+      "text": "AutoML class          Creates brain + controller + state\nAutoMLContext          Session ID, network, metric\nStateStore            JSON files + fcntl.flock\nController            next_recommendation(), report_result()\nBayesian / Hyperband  GP fit, EI optimization, brackets\nRecommendation        id, specs, status, result, job_id\nResumeRecommendation  For Hyperband/PBT checkpoint resume\nAlgorithmParams       20+ algorithm-specific settings\nBrainFactory          Picks the right algorithm class\nSearchSpace           Schema → searchable params list\n\nspec fixes:           cosmos-rl batch/model_max_length/etc\nlog caching:          Reads logs during polling, not just after\nmetric extraction:    4 regex patterns for different log formats\nmerge_specs:          Deep-merges dotted keys into nested dict\ndataset injection:    URI → correct annotation + media paths\nExecution status:     Checks for PASS/FAIL in logs",
+      "originalText": "AutoML class          Creates brain + controller + state\nAutoMLContext          Session ID, network, metric\nStateStore            JSON files + fcntl.flock\nController            next_recommendation(), report_result()\nBayesian / Hyperband  GP fit, EI optimization, brackets\nRecommendation        id, specs, status, result, job_id\nResumeRecommendation  For Hyperband/PBT checkpoint resume\nAlgorithmParams       20+ algorithm-specific settings\nBrainFactory          Picks the right algorithm class\nSearchSpace           Schema → searchable params list\n\nspec fixes:           cosmos-rl batch/model_max_length/etc\nlog caching:          Reads logs during polling, not just after\nmetric extraction:    4 regex patterns for different log formats\nmerge_specs:          Deep-merges dotted keys into nested dict\ndataset injection:    URI → correct annotation + media paths\nExecution status:     Checks for PASS/FAIL in logs",
+      "fontSize": 11, "fontFamily": 3, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#64748b", "backgroundColor": "transparent",
+      "fillStyle": "solid", "strokeWidth": 1, "strokeStyle": "solid", "roughness": 0,
+      "opacity": 100, "angle": 0, "seed": 20032, "version": 1, "versionNonce": 20033,
+      "isDeleted": false, "groupIds": [], "boundElements": null, "link": null, "locked": false,
+      "containerId": null, "lineHeight": 1.25
+    },
+    {
+      "type": "arrow", "id": "arrow_run_to_hidden", "x": 557, "y": 360, "width": 50, "height": 120,
+      "strokeColor": "#6d28d9", "backgroundColor": "transparent",
+      "fillStyle": "solid", "strokeWidth": 2, "strokeStyle": "dashed", "roughness": 0,
+      "opacity": 100, "angle": 0, "seed": 20040, "version": 1, "versionNonce": 20041,
+      "isDeleted": false, "groupIds": [], "boundElements": null, "link": null, "locked": false,
+      "points": [[0, 0], [50, 120]],
+      "startBinding": null, "endBinding": null,
+      "startArrowhead": null, "endArrowhead": "arrow"
+    },
+    {
+      "type": "text", "id": "arrow_label", "x": 560, "y": 400, "width": 50, "height": 15,
+      "text": "hides",
+      "originalText": "hides",
+      "fontSize": 11, "fontFamily": 3, "textAlign": "center", "verticalAlign": "top",
+      "strokeColor": "#6d28d9", "backgroundColor": "transparent",
+      "fillStyle": "solid", "strokeWidth": 1, "strokeStyle": "solid", "roughness": 0,
+      "opacity": 100, "angle": 0, "seed": 20042, "version": 1, "versionNonce": 20043,
+      "isDeleted": false, "groupIds": [], "boundElements": null, "link": null, "locked": false,
+      "containerId": null, "lineHeight": 1.25
+    }
+  ],
+  "appState": {
+    "viewBackgroundColor": "#ffffff",
+    "gridSize": 20
+  },
+  "files": {}
+}
