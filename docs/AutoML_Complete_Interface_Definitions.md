@@ -519,14 +519,17 @@ class AutoMLRunner:
         base_checkpoint: str = "",
         workspace_id: str = None,
         image: str = None,
-        backend_details: dict = None,
         automl_settings: dict = None,
         automl_hyperparameters: list = None,
         custom_param_ranges: dict = None,
         workspace_path: str = "./automl_workspace",
+        spec_overrides: dict = None,
+        resume: bool = False,
         on_recommendation: callable = None,   # callback(rec)
         on_result: callable = None,           # callback(rec, metric, status)
     ) -> dict
+        # Platform is handled entirely by the SDK — the runner is
+        # platform-agnostic and has no backend_details parameter.
         # Returns:
         # {
         #   "best": {"rec_id": int, "specs": dict, "metric_value": float},
@@ -543,7 +546,6 @@ class AutoMLRunner:
         eval_dataset_uri: str,
         base_checkpoint: str,
         image: str,
-        backend_details: dict,
         specs: dict,
         rec: Recommendation,
         metric_name: str,

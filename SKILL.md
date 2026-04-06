@@ -87,14 +87,10 @@ result = runner.run(
     network_arch="cosmos-rl",
     train_dataset_uri="aws://bucket/data/my_dataset",
 
-    # Job config
+    # Job config (platform is handled by the SDK, not the runner)
     eval_dataset_uri="aws://bucket/data/eval",       # optional eval set
     base_checkpoint="",                                # pretrained checkpoint
     image="nvcr.io/nvidia/tao/tao-toolkit:6.26.3-cosmos-rl",  # container image
-    backend_details={                                  # GPU config
-        "backend_type": "lepton",
-        "resource_shape": "gpu.h100-sxm",
-    },
 
     # AutoML config
     automl_settings={

@@ -14,12 +14,16 @@
 
 """AutoML runner: wires the tao_automl brain to tao_sdk execution.
 
+The runner is platform-agnostic — it has no knowledge of which backend
+(Lepton, Slurm, K8s) the SDK is connected to. Platform selection and
+resource allocation are handled entirely by the SDK.
+
 Usage::
 
     from tao_sdk import TaoExecutionSDK
     from tao_automl.runner import AutoMLRunner
 
-    sdk = TaoExecutionSDK(creds_file="secrets.json")
+    sdk = TaoExecutionSDK(creds_file="secrets.json")  # SDK knows the platform
     runner = AutoMLRunner(sdk)
     result = runner.run(
         network_arch="cosmos-rl",
@@ -142,7 +146,7 @@ class AutoMLRunner:
 
     def run(self, network_arch, train_dataset_uri, eval_dataset_uri="",
             base_checkpoint="", workspace_id=None, image=None,
-            backend_details=None, automl_settings=None,
+            automl_settings=None,
             automl_hyperparameters=None, custom_param_ranges=None,
             workspace_path="./automl_workspace",
             spec_overrides=None, resume=False,
@@ -154,9 +158,8 @@ class AutoMLRunner:
             train_dataset_uri: Training dataset URI (e.g. "aws://bucket/data").
             eval_dataset_uri: Eval dataset URI (optional).
             base_checkpoint: Pretrained checkpoint URI (optional).
-            workspace_id: Lepton workspace ID (default: from SDK).
+            workspace_id: Workspace ID (default: from SDK).
             image: Docker image override (optional).
-            backend_details: Backend config dict (optional).
             automl_settings: Algorithm config (see AlgorithmParams).
             automl_hyperparameters: Param names to search, or None for schema defaults.
             custom_param_ranges: Per-param range overrides.
@@ -175,8 +178,6 @@ class AutoMLRunner:
 
         automl_settings = automl_settings or {"algorithm": "bayesian", "metric": "loss"}
         workspace_id = workspace_id or self._sdk._workspace_id
-        backend_details = backend_details or {}
-        backend_details.setdefault("backend_type", "lepton")
 
         base_specs = self._sdk.get_default_specs(network_arch, "train")
 
@@ -240,8 +241,7 @@ class AutoMLRunner:
                     train_dataset_uri=train_dataset_uri,
                     eval_dataset_uri=eval_dataset_uri,
                     base_checkpoint=base_checkpoint, image=image,
-                    backend_details=backend_details, specs=merged_specs,
-                    rec=rec, metric_name=metric_name,
+                    specs=merged_specs, rec=rec, metric_name=metric_name,
                 )
                 automl.report_result(
                     rec_id=rec.id,
@@ -270,7 +270,7 @@ class AutoMLRunner:
         return result
 
     def _run_one_job(self, network_arch, workspace_id, train_dataset_uri,
-                     eval_dataset_uri, base_checkpoint, image, backend_details,
+                     eval_dataset_uri, base_checkpoint, image,
                      specs, rec, metric_name) -> tuple[float | None, str]:
         """Launch a single training job and wait for it to finish."""
         try:
@@ -279,7 +279,7 @@ class AutoMLRunner:
                 train_dataset_uri=train_dataset_uri,
                 eval_dataset_uri=eval_dataset_uri,
                 base_checkpoint=base_checkpoint, action="train",
-                specs=specs, backend_details=backend_details, image=image,
+                specs=specs, image=image,
             )
         except Exception as e:
             logger.error("Failed to create job for rec %d: %s", rec.id, e)
@@ -391,7 +391,6 @@ def run_automl_plan(plan: dict, creds_file: str = None) -> dict:
         base_checkpoint=params.get("base_checkpoint", ""),
         workspace_id=params.get("workspace_id"),
         image=params.get("image"),
-        backend_details=params.get("backend_details"),
         automl_settings=automl_settings,
         automl_hyperparameters=plan.get("automl_hyperparameters"),
         custom_param_ranges=plan.get("custom_param_ranges"),
