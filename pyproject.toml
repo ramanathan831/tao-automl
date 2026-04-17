@@ -16,7 +16,7 @@ dependencies = [
     "pandas",
     "omegaconf",
     "requests",
-    "tao-sdk @ git+ssh://git@gitlab-master.nvidia.com:12051/nvidia-tao-toolkit/tao-sdk.git@arahmed/fix-dataset-injection-gpu-cancel",
+    "tao-sdk @ git+ssh://git@gitlab-master.nvidia.com:12051/nvidia-tao-toolkit/tao-sdk.git@main",
 ]
 
 [project.optional-dependencies]
