@@ -1,9 +1,13 @@
 ---
-name: TAO AutoML
-description: Run hyperparameter optimization for TAO networks using the AutoMLRunner. Handles algorithm selection, experiment configuration, job execution on Lepton/DGX, result interpretation, and per-rec custom evaluation hooks.
-dependencies:
-  - bash
-  - python3
+name: tao-automl
+description: >-
+  Run hyperparameter optimization (HPO) for NVIDIA TAO networks using AutoMLRunner.
+  Handles algorithm selection (bayesian, hyperband, asha, bohb, llm, hybrid, autoresearch),
+  WandB experiment tracking, job execution on Lepton/DGX/Slurm, result interpretation,
+  and per-rec custom evaluation hooks. Use when the user mentions TAO AutoML, hyperparameter
+  optimization, HPO, automl, automl_settings, AutoMLRunner, tao_automl, bayesian search,
+  hyperband, ASHA, LLM-guided search, autoresearch, or wants to tune training hyperparameters
+  for any TAO network (cosmos-rl, dino, segformer, clip, etc.).
 ---
 
 # TAO AutoML Skill
@@ -16,24 +20,97 @@ The runner is platform-agnostic: platform selection (Lepton, Slurm, K8s) and GPU
 
 Before running AutoML:
 
-1. **SDK credentials**: `secrets.json` must exist in the working directory with the platform credentials required by the SDK.
+1. **SDK credentials**: `secrets.json` must exist with Lepton/DGX credentials. The existing file lives at `~/tao-sdk/secrets.json`:
+   ```json
+   {
+     "LEPTON_WORKSPACE_ID": "...",
+     "LEPTON_AUTH_TOKEN": "nvapi-...",
+     "NGC_KEY": "nvapi-...",
+     "ACCESS_KEY": "...",
+     "SECRET_KEY": "...",
+     "S3_BUCKET_NAME": "nvcf-storage-handling",
+     "CLOUD_REGION": "us-west-1"
+   }
+   ```
+   Pass it via `TaoExecutionSDK(creds_file="~/tao-sdk/secrets.json")`.
 2. **Dataset**: Training data accessible from the compute backend. URI format depends on the SDK's platform:
    - Lepton / DGX Cloud: `aws://bucket/path` (S3-compatible)
    - Azure: `azure://container/path`
    - Local / Docker: local filesystem path
-3. **Skill bank available**: the runner reads skill config + default specs via `SkillBank`. Point it at the bank with:
+3. **Skill bank available**: lives at `~/tao-skills-external`. Point the runner at it:
    ```bash
-   export TAO_SKILL_BANK_PATH=/path/to/tao-skills-external
+   export TAO_SKILL_BANK_PATH=~/tao-skills-external
    ```
-4. **`nvidia-tao-automl` installed** (editable dev install pulls `tao-sdk` from git):
+   The bank structure is:
+   ```
+   tao-skills-external/
+   ├── applications/         # workflow configs (normal-train, deft-cosmos-rl, ...)
+   ├── models/               # per-network skill packages
+   │   ├── dino/
+   │   │   ├── config.json           # actions, data_sources, container image
+   │   │   ├── defaults-train.json   # default training spec (REQUIRED by AutoML)
+   │   │   └── dino.md
+   │   ├── cosmos-rl/
+   │   ├── segformer/
+   │   └── ...
+   ├── data/
+   └── platform/
+   ```
+   **CRITICAL**: The `SkillBank.get_default_specs(network, "train")` call requires either `references/spec_template_train.yaml` or `defaults-train.json` in the model directory. If missing, the runner raises `ValueError: No default train specs found`. Create `defaults-train.json` from the network's experiment spec (found at `tao-pytorch/nvidia_tao_pytorch/cv/<network>/experiment_specs/train.yaml`).
+4. **Conda environment**: Use the `tao_sdk` conda environment which has `tao-sdk` pre-installed:
    ```bash
-   pip install -e ".[dev]" --extra-index-url https://pypi.nvidia.com
+   conda activate tao_sdk
+   # or prefix commands:
+   conda run -n tao_sdk python3 my_script.py
+   ```
+   For unbuffered output (recommended for long-running AutoML), use the Python binary directly:
+   ```bash
+   PYTHONUNBUFFERED=1 ~/miniconda3/envs/tao_sdk/bin/python my_script.py
+   ```
+5. **`nvidia-tao-automl` installed** (editable dev install into `tao_sdk` env):
+   ```bash
+   conda activate tao_sdk
+   # Core only (classical algorithms)
+   pip install -e "~/tao-automl[dev]" --extra-index-url https://pypi.nvidia.com
+
+   # With LLM/agentic algorithms
+   pip install -e "~/tao-automl[dev,llm]" --extra-index-url https://pypi.nvidia.com
+
+   # Everything
+   pip install -e "~/tao-automl[all,dev]" --extra-index-url https://pypi.nvidia.com
    ```
 
 Verify setup:
 ```bash
-python3 -c "from tao_automl.runner import AutoMLRunner; print('OK')"
+conda run -n tao_sdk python3 -c "from tao_automl.runner import AutoMLRunner; print('OK')"
+
+# Verify LLM features (optional)
+conda run -n tao_sdk python3 -c "from tao_automl.brain.llm_brain import LLMBrain; print('LLM OK')"
+
+# Verify WandB (optional)
+conda run -n tao_sdk python3 -c "import wandb; print('WandB OK')"
 ```
+
+---
+
+## Concepts: What is TAO AutoML?
+
+TAO AutoML automates the "try different hyperparameter values → train → compare results → repeat" cycle. Instead of manually tweaking learning rate, batch size, or backbone settings, you tell AutoML:
+
+- **What network** to train (e.g. `dino`, `cosmos-rl`, `segformer`)
+- **Which hyperparameters** to search over (e.g. `train.optm_lr`, `policy.lora.r`)
+- **What metric** to optimize (e.g. `val_loss`, `accuracy`, `mIoU`)
+- **How many trials** (budget)
+
+AutoML then:
+1. Picks hyperparameter values using a search algorithm (Bayesian, Hyperband, LLM, etc.)
+2. Launches a real training job on your compute backend (Lepton, DGX, Slurm)
+3. Reads the result metric from training logs
+4. Feeds the result back to the algorithm so it learns what works
+5. Repeats until budget is exhausted
+6. Returns the best configuration found
+
+Each "trial" is called a **recommendation** (rec). One rec = one full training run with a specific set of hyperparameters.
 
 ---
 
@@ -62,15 +139,34 @@ If any required field is missing, ask the user. Do NOT guess dataset paths.
 
 ## Step 2: Select Algorithm
 
-| Algorithm | Use when | Typical budget |
-|---|---|---|
-| `bayesian` | **Default choice.** Small budgets, few parameters. Sequential — learns from each result before generating the next. | 5–20 recs |
-| `hyperband` | Large search spaces, many parameters. Trains many configs cheaply, keeps the best, trains longer. | 20–50+ recs |
-| `asha` | Async variant of hyperband, supports parallel execution. | 10–30 recs |
-| `bohb` | Best of both — Bayesian intelligence + Hyperband efficiency. | 15–40 recs |
-| `pbt` | Dynamic schedules — mutates hyperparameters during training. Good for long runs. | population_size × generations |
+### Classical Algorithms
+
+These require no external services — they use statistical/mathematical methods to pick hyperparameters.
+
+| Algorithm | Use when | Typical budget | How it works |
+|---|---|---|---|
+| `bayesian` | **Default choice.** Small budgets, few parameters. | 5–20 recs | Builds a Gaussian Process model of metric vs. hyperparameters. Sequential — waits for each result before proposing the next, so it learns fast but can't parallelize. |
+| `bfbo` | Alternative to bayesian with different acquisition function. | 5–20 recs | UCB-based Bayesian optimization with local penalization. Good when bayesian gets stuck. |
+| `hyperband` | Large search spaces, many parameters. | 20–50+ recs | Trains many configs cheaply for a few epochs, keeps the best, trains longer. Requires `automl_max_epochs` and `automl_reduction_factor`. |
+| `hyperband_es` | Hyperband + early stopping. | 20–50+ recs | Like hyperband but adds early-stop thresholds to halt clearly bad runs sooner. |
+| `asha` | Async variant of hyperband, supports parallel execution. | 10–30 recs | Same successive-halving idea as hyperband, but trials run concurrently. Best when you have many GPUs. Uses `automl_max_concurrent`. |
+| `bohb` | Best of both — Bayesian intelligence + Hyperband efficiency. | 15–40 recs | Combines KDE-based model (like Bayesian) with Hyperband's multi-fidelity scheduling. Good all-rounder for medium budgets. |
+| `dehb` | Evolutionary + multi-fidelity. | 15–40 recs | Differential evolution mutations + hyperband scheduling. Good for complex search spaces with many interacting parameters. |
+| `pbt` | Dynamic schedules — mutates hyperparameters during training. | population_size × generations | Population-Based Training. Starts N configs in parallel, periodically copies weights from winners and perturbs their hyperparameters. Best for long runs where hyperparameters should change over time (e.g. learning rate schedules). |
+
+### LLM/Agentic Algorithms (NEW)
+
+These use a large language model to reason about hyperparameter choices. They require an LLM endpoint (NVIDIA NIM, OpenAI, vLLM, Ollama, etc.) and the `openai` Python package.
+
+| Algorithm | Use when | Typical budget | How it works |
+|---|---|---|---|
+| `llm` | Domain knowledge matters more than statistical rigor. | 5–20 recs | An LLM proposes hyperparameter configs based on the search space schema, experiment history, and its training knowledge. Falls back to random sampling on LLM failure. Sequential like bayesian. |
+| `hybrid` | You want the LLM to orchestrate multi-phase optimization. | 10–50 recs | An LLM strategist plans optimization phases (e.g. "Phase 1: sweep LR with bayesian for 5 trials, Phase 2: sweep backbone with asha for 10 trials"). Each phase uses a classical sub-algorithm. Stops when the strategist detects diminishing returns. |
+| `autoresearch` | Fully autonomous agent loop. | 10–50 recs | The most powerful mode. Combines: (1) RAP knowledge retrieval about the network, (2) LLM-proposed spec modifications, (3) training-free pre-screening of candidates, (4) multi-stage verification (pre-launch + post-result), (5) keep/discard reasoning. Automatically stops on budget exhaustion or consecutive failures. |
 
 **Default to `bayesian` unless** the user specifically asks for something else, has a large GPU budget, or needs early-stopping on cheap intermediate metrics (ASHA / hyperband).
+
+**Use `llm` / `hybrid` / `autoresearch` when** the user wants LLM-guided search, has an API key for NVIDIA NIM or OpenAI, and wants richer reasoning about why certain hyperparameters are chosen.
 
 **Caveat on ASHA with large-checkpoint skills:** ASHA's whole point is running many configs for a cheap 1-epoch rung, then promoting survivors. When the per-epoch checkpoint save is expensive (e.g. cosmos-rl saves a 30+ GB full-model snapshot per epoch), the "cheap rung" stops being cheap. Stick with Bayesian on those workloads until the skill exposes a "skip intermediate checkpoints" knob.
 
@@ -146,8 +242,15 @@ result = runner.run(
     },
 
     # --- State + durability ---
-    workspace_path="./my_experiment",
+    workspace_path="./my_experiment",                # auto-suffixed with run_<timestamp>
     resume=False,                                    # True → recovers in-flight jobs
+
+    # --- WandB tracking (optional) ---
+    wandb_config={
+        "enabled": True,
+        "project": "my-tao-experiments",
+        "api_key": "your-wandb-api-key",             # or set WANDB_API_KEY env var
+    },
 
     # --- Hooks (all optional, opt-in) ---
     metric_extractor=None,                           # custom log→metric parser
@@ -157,17 +260,82 @@ result = runner.run(
 )
 ```
 
+### LLM-Powered Algorithm Example
+
+```python
+result = runner.run(
+    network_arch="dino",
+    train_dataset_uri="aws://bucket/data/coco_subset",
+    automl_settings={
+        "algorithm": "llm",                          # or "hybrid" or "autoresearch"
+        "metric": "kpi",
+        "direction": "maximize",
+        "automl_max_recommendations": 10,
+        # LLM config — also reads AUTOML_LLM_* env vars as fallback
+        "llm_endpoint": "https://integrate.api.nvidia.com/v1",
+        "llm_model": "meta/llama-3.1-70b-instruct",
+        "llm_api_key": "nvapi-...",                  # or set NVIDIA_API_KEY env var
+    },
+    automl_hyperparameters=[
+        "train.optim.lr",
+        "train.optim.weight_decay",
+        "model.num_queries",
+    ],
+)
+```
+
+**LLM endpoint configuration** (in order of precedence):
+1. `automl_settings` keys: `llm_endpoint`, `llm_model`, `llm_api_key`
+2. Environment variables: `AUTOML_LLM_ENDPOINT`, `AUTOML_LLM_MODEL`, `AUTOML_LLM_API_KEY`
+3. Fallback env var for API key: `NVIDIA_API_KEY`
+4. Defaults: NVIDIA NIM endpoint (`https://integrate.api.nvidia.com/v1`) with `meta/llama-3.1-70b-instruct`
+
+### Programmatic API (without runner)
+
+For tighter control, use the `AutoML` class directly:
+
+```python
+from tao_automl import AutoML
+
+automl = AutoML(
+    workspace="/tmp/my_experiment",
+    network="dino",
+    train_specs=my_train_spec_dict,
+    settings={
+        "algorithm": "bayesian",
+        "metric": "loss",
+        "automl_max_recommendations": 10,
+    },
+    wandb_config={"enabled": True, "project": "my-project"},
+)
+
+while not automl.is_complete():
+    recs = automl.next_recommendation()
+    for rec in recs:
+        metric_value = train_model(rec.specs)    # your training function
+        automl.report_result(rec.id, metric_value)
+
+automl.finish()   # close WandB run
+print("Best:", automl.get_best().specs)
+```
+
 ### `automl_settings` keys
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `algorithm` | str | **required** | `bayesian`, `hyperband`, `bohb`, `asha`, `bfbo`, `dehb`, `pbt`, `hyperband_es` |
+| `algorithm` | str | **required** | `bayesian`, `hyperband`, `bohb`, `asha`, `bfbo`, `dehb`, `pbt`, `hyperband_es`, `llm`, `hybrid`, `autoresearch` |
 | `metric` | str | `"loss"` | Metric name. The implicit rule for direction is "contains `'loss'` → minimize, else maximize". Override with `direction`. |
 | `direction` | `"minimize"` \| `"maximize"` | inferred | Explicit direction. Required only when it disagrees with the implicit rule. The runner transparently inverts reported values so callers always see their metric in its original scale. |
-| `automl_max_recommendations` | int | 20 | Max trials (bayesian, bfbo) |
+| `automl_max_recommendations` | int | 20 | Max trials (bayesian, bfbo, llm) |
 | `automl_max_epochs` | int | 27 | Epoch budget (hyperband, bohb, asha, dehb) |
 | `automl_reduction_factor` | int | 3 | Halving factor (hyperband variants) |
 | `automl_max_concurrent` | int | 4 | Max parallel configs (asha only) |
+| `automl_population_size` | int | 10 | Population size (pbt only) |
+| `automl_max_experiments` | int | 50 | Max experiments (autoresearch only) |
+| `llm_endpoint` | str | NVIDIA NIM | OpenAI-compatible API endpoint (llm, hybrid, autoresearch) |
+| `llm_model` | str | `meta/llama-3.1-70b-instruct` | LLM model name (llm, hybrid, autoresearch) |
+| `llm_api_key` | str | from env | API key for the LLM endpoint |
+| `research_program` | str | None | Free-text research directives for the autoresearch agent (e.g. "Focus on LoRA rank and learning rate interaction") |
 
 ### `spec_overrides` common keys
 
@@ -185,11 +353,167 @@ result = runner.run(
 | `policy.model_max_length` | Context window size (40960 for video VLMs) |
 | `policy.parallelism.dp_shard_size` | Must equal number of GPUs |
 
-### Advanced hooks (opt-in)
+---
+
+## WandB Experiment Tracking
+
+AutoML optionally integrates with [Weights & Biases](https://wandb.ai) to track all experiments in a single dashboard.
+
+### Setup
+
+```bash
+pip install wandb
+# or: pip install nvidia-tao-automl[wandb]
+```
+
+### How it works
+
+When `wandb_config={"enabled": True}` is passed:
+
+1. The controller creates a WandB **run** named `automl_brain` in the specified project.
+2. All recommendations are grouped under a WandB **group** (e.g. `automl_abc123`) so parent + child training runs appear together in the dashboard.
+3. After every result, a **WandB table** (`automl_experiments`) is logged containing:
+   - `experiment_id`, `job_id`, `status`, metric value, `best_epoch_number`
+   - All varying hyperparameter values
+4. Call `automl.finish()` (or let `runner.run()` complete) to finalize the WandB run.
+
+### Minimal WandB setup
+
+```python
+# Option 1: via config dict
+result = runner.run(
+    ...,
+    wandb_config={
+        "enabled": True,
+        "project": "tao-hpo",
+        "api_key": "your-key",  # or set WANDB_API_KEY env var
+    },
+)
+
+# Option 2: environment variable (simpler)
+# export WANDB_API_KEY=your-key
+result = runner.run(
+    ...,
+    wandb_config={"enabled": True, "project": "tao-hpo"},
+)
+```
+
+### Dashboard features
+
+Once tracking is active, you can:
+- **Compare all trials** side-by-side in the WandB table view
+- **Sort by metric** to find the best config instantly
+- **Group by hyperparameter** to see which values correlate with good results
+- **Link to child training runs** if the compute backend also logs to WandB (group name is available via `automl.wandb_group`)
+
+---
+
+## LLM/Agentic Features Deep Dive
+
+### Natural Language Configuration
+
+Don't know which algorithm or parameters to use? The `NLConfigGenerator` translates plain English into a valid AutoML configuration:
+
+```python
+from tao_automl.brain.nl_config import NLConfigGenerator
+
+generator = NLConfigGenerator()   # uses NVIDIA NIM by default
+config = generator.generate_config(
+    user_prompt="I want to maximize detection accuracy on a small custom dataset with 500 images",
+    network="dino",
+    available_parameters=param_records,  # from generate_hyperparams_to_search()
+    hardware_info="2x A100 80GB",
+)
+# config = {
+#   "automl_algorithm": "bayesian",
+#   "automl_hyperparameters": ["train.optim.lr", "train.optim.weight_decay", ...],
+#   "algorithm_specific_params": {"automl_max_recommendations": 15},
+#   "metric": "kpi",
+#   "reasoning": "Small dataset + limited budget → bayesian for sample efficiency..."
+# }
+```
+
+### LLM Analyzer (works with ANY algorithm)
+
+The `LLMAnalyzer` can be used alongside any classical algorithm to provide periodic analysis of experiment results:
+
+```python
+from tao_automl.brain.llm_analyzer import LLMAnalyzer
+
+analyzer = LLMAnalyzer(analysis_interval=5, narrow_ranges=True)
+
+# After every 5 completed experiments, call:
+analysis = analyzer.analyze(
+    experiments=experiment_history,
+    parameters=param_records,
+    network="dino",
+    metric_name="kpi",
+    metric_direction="maximize",
+    best_metric=0.85,
+)
+# analysis = {
+#   "patterns": ["LR > 0.01 always causes divergence"],
+#   "convergence_assessment": "improving",
+#   "recommendations": ["Try weight_decay in [0.01, 0.05]"],
+#   "suggested_ranges": {"train.optim.lr": {"min": 0.0005, "max": 0.005, ...}},
+# }
+```
+
+When `narrow_ranges=True`, the analyzer suggests tighter search bounds based on observed patterns. These can be applied to dynamically focus the search.
+
+### Autoresearch Agent Components
+
+The `autoresearch` algorithm integrates five AutoML-Agent concepts:
+
+| Component | What it does | When it runs |
+|---|---|---|
+| **KnowledgeRetriever** (RAP) | Retrieves built-in tuning knowledge for the network (e.g. "DINO works best with LR 1e-4 to 5e-4") and optionally web-searched papers/benchmarks | Once at initialization |
+| **SpecPrescreener** | LLM predicts which of N candidate configs are worth running, WITHOUT training. Saves GPU budget by filtering unlikely-to-improve configs. | Before each trial — proposes 3 candidates, pre-screens to pick the best 1 |
+| **MultiStageVerifier** | Pre-launch: validates proposed changes won't crash/OOM. Post-result: checks metrics are plausible (not NaN, not anomalous). | Before launch + after result |
+| **ExperimentTracker** | Tracks full history with keep/discard decisions and reasoning | After each result |
+| **LLMAnalyzer** | Periodic pattern detection, convergence assessment, and optional range narrowing | Every N completed experiments |
+
+### Research Programs
+
+For complex multi-phase optimization, define a research program:
+
+```python
+from tao_automl.brain.research_program import ResearchProgram, ResearchPhase
+
+program = ResearchProgram(
+    objective="Maximize detection mAP on custom dataset",
+    network="dino",
+    phases=[
+        ResearchPhase(
+            name="LR sweep",
+            algorithm="bayesian",
+            parameters=["train.optim.lr", "train.optim.weight_decay"],
+            trials=8,
+        ),
+        ResearchPhase(
+            name="Architecture search",
+            algorithm="asha",
+            parameters=["model.backbone", "model.num_queries"],
+            trials=15,
+            carry_forward="best",   # best LR values carry into this phase
+        ),
+    ],
+)
+
+# Validate before running
+issues = program.validate(
+    available_parameters=["train.optim.lr", "train.optim.weight_decay", "model.backbone", "model.num_queries"],
+    available_algorithms=["bayesian", "asha"],
+)
+```
+
+---
+
+## Advanced hooks (opt-in)
 
 Both hooks are optional. If neither is provided, the runner uses its built-in log regex extractor.
 
-#### `metric_extractor(logs: str, metric_name: str) → float | None`
+### `metric_extractor(logs: str, metric_name: str) → float | None`
 
 Called on every poll of the training container's logs. Return the most recent/final metric value seen, or `None` if the metric isn't yet present.
 
@@ -210,7 +534,7 @@ runner.run(..., metric_extractor=extract_bleu)
 
 Exceptions raised inside the extractor are caught and logged; the runner continues polling.
 
-#### `eval_fn(rec, train_job_id: str) → float | None`
+### `eval_fn(rec, train_job_id: str) → float | None`
 
 Called once after a rec's training job reaches a terminal state, before the result is reported to the brain. Whatever it returns **overrides** any value captured by `metric_extractor` and becomes what the brain optimizes on.
 
@@ -258,18 +582,20 @@ Each rec takes 10–90 minutes depending on model size, dataset, epochs, and che
 
 ### Resume after interruption
 
-If the orchestrator dies mid-run (network timeout, machine sleep, Ctrl-C), re-run with `resume=True`:
+If the orchestrator dies mid-run (network timeout, machine sleep, Ctrl-C), re-run with `resume=True` and the **full suffixed path** (including the `run_<timestamp>` directory):
 
 ```python
 result = runner.run(
     ...,
-    workspace_path="./my_experiment",   # same path as before
+    workspace_path="./my_experiment/run_20260423_183015",   # full suffixed path
     resume=True,
 )
 ```
 
+When `resume=True`, the runner does NOT append a new timestamp suffix — it reuses the path as-is.
+
 Behaviour on resume:
-1. **Brain state** is reloaded from `<workspace>/state_store/*` — all completed rec results are already registered.
+1. **Brain state** is reloaded from `<workspace>/.automl/*` — all completed rec results are already registered.
 2. **Any in-flight jobs** recorded in `<workspace>/active_jobs.json` (persisted after each submission) are polled to terminal, their metrics extracted, and reported to the brain — *before* the main propose-new-rec loop starts. No duplicate submissions; no leaked GPU work from the previous orchestrator.
 3. After recovery, the loop continues normally until `automl.is_complete()`.
 
@@ -306,7 +632,8 @@ Metric values in `best` and `history` are always in the original scale the user 
 1. **Best config** — show the winning hyperparameters and metric value.
 2. **Comparison table** — rank all recs by metric, highlight the best.
 3. **Insights** — call out what the optimizer learned (e.g. "high-α regime consistently wins; LR in 1-3e-7 range is robust").
-4. **Next steps** — suggest:
+4. **WandB link** — if tracking was enabled, provide the dashboard URL.
+5. **Next steps** — suggest:
    - More recs (re-run with `resume=True` + higher `automl_max_recommendations`).
    - Train longer with the best config using `sdk.create_job(specs=result["best"]["specs"])`.
    - Run a downstream evaluation on the best checkpoint.
@@ -321,6 +648,7 @@ Check common issues:
 - **Model or data download timeout** — the first run downloads ~15 GB from HuggingFace; subsequent runs use Lustre cache.
 - **OOM** — reduce `train.train_policy.mini_batch` or `custom.vision.total_pixels` via `spec_overrides`.
 - **Silent tarball corruption** — a cached, truncated `*.tar.gz` on shared Lustre will silently poison every future run. Symptoms: cryptic data-loader errors like `moov atom not found` / `KeyError: 'video_fps'`. Fix: delete the cached Lustre path and let it re-download.
+- **LLM endpoint unreachable** (llm/hybrid/autoresearch only) — the brain falls back to random sampling. Check `AUTOML_LLM_ENDPOINT` and `AUTOML_LLM_API_KEY`. Verify with: `curl -s $AUTOML_LLM_ENDPOINT/models -H "Authorization: Bearer $AUTOML_LLM_API_KEY"`.
 
 ---
 
@@ -365,7 +693,16 @@ These constraints avoid the overfitting traps (very-low `r` + very-high `α` + h
 
 **LoRA eval pitfall:** Cosmos-rl's direct-LoRA evaluation path assumes a 4-shard base-model filename pattern that the public HF repo doesn't use. Work around by pre-merging: use `peft.merge_and_unload()` to produce a single merged model, then eval that with `model.enable_lora=False`.
 
-### Other networks (dino, clip, segformer, etc.)
+### dino / deformable_detr / grounding_dino / rtdetr
+
+Object detection networks. See `~/tao-skills-external/models/dino/dino.md` for full details including:
+- `defaults-train.json` creation
+- Data sources `mapping` workaround (requires explicit `spec_overrides`)
+- `num_classes` pitfall (`CUDA error: device-side assert triggered`)
+- `val_data_sources` requirement
+- Recommended AutoML hyperparameters and ranges
+
+### segformer / classification_pyt / other vision
 
 No special handling needed. The runner reads base specs from `SkillBank.get_default_specs(network_arch, "train")`. Pass `automl_hyperparameters` to control which params are searched, or leave `None` to use all `automl_enabled` params from the schema.
 
@@ -381,6 +718,82 @@ No special handling needed. The runner reads base specs from `SkillBank.get_defa
 4. **Orchestrator dies mid-sweep.** Relaunch with the same `workspace_path` and `resume=True`. In-flight jobs are recovered from `active_jobs.json`.
 5. **"Rec never reports a metric" with `val_loss`.** Check that `validation.enable=True` and `validation.freq_in_epoch <= train.epoch`. Without this, the container never emits a validation-loss line.
 6. **Parallel Bayesian arms.** Bayesian is inherently sequential. If you want parallelism, use `asha`. If you use multiple `AutoMLRunner` instances, give each its own `TaoExecutionSDK(state_file=...)` to avoid SQLite write races.
+7. **LLM brain returning random configs.** If every LLM recommendation looks random, the LLM endpoint is probably failing silently. Check the logs for "LLM call failed" warnings. Verify your API key and endpoint are correct.
+8. **`openai` package not installed.** The `llm`, `hybrid`, and `autoresearch` algorithms require the `openai` Python package. Install with `pip install openai` or `pip install nvidia-tao-automl[llm]`.
+9. **WandB not logging.** Ensure `wandb_config={"enabled": True}` is passed and either `api_key` is in the config or `WANDB_API_KEY` is set in the environment. Check logs for "WandB initialized" confirmation.
+10. **`No default train specs found` for a network.** The skill bank model directory is missing `defaults-train.json` or `references/spec_template_train.yaml`. Create one from the network's experiment spec in `tao-pytorch/nvidia_tao_pytorch/cv/<network>/experiment_specs/train.yaml`.
+11. **CUDA device-side assert on DINO.** `num_classes` mismatch — see `dino.md` in the model skill bank.
+12. **Empty data paths for DINO / deformable_detr / grounding_dino.** Data sources `mapping` style not handled by runner — see `dino.md` in the model skill bank.
+13. **`conda run` buffers output.** When running AutoML via `conda run -n tao_sdk python script.py`, all output is buffered until completion. Use `PYTHONUNBUFFERED=1 ~/miniconda3/envs/tao_sdk/bin/python script.py` for real-time output.
+
+---
+
+## Querying Experiment Status
+
+Use `query_status()` to check experiment progress from a separate process — no need to read JSON files or parse logs.
+
+```python
+from tao_automl import query_status
+
+status = query_status("./my_experiment")
+
+# Progress summary
+p = status["progress"]
+print(f"{p['completed']}/{p['total']} recs done, "
+      f"{p['succeeded']} succeeded, {p['failed']} failed")
+
+# Best config
+if status["best"]:
+    print(f"Best: rec {status['best']['rec_id']}, "
+          f"metric={status['best']['metric_value']}, "
+          f"specs={status['best']['specs']}")
+
+# Per-rec details
+for rec in status["recommendations"]:
+    print(f"  Rec {rec['rec_id']}: {rec['status']} "
+          f"metric={rec['metric_value']} specs={rec['specs']}")
+
+# In-flight jobs
+for job in status["active_jobs"]:
+    print(f"  Active: rec {job['rec_id']} job {job['job_id']}")
+```
+
+The function reads from the persisted state store (`<workspace>/.automl/`) and `active_jobs.json`. It is safe to call while the runner is active — no locking conflicts.
+
+The `AutoML` class also exposes `get_status()` for in-process queries:
+
+```python
+automl = AutoML(workspace=..., ...)
+status = automl.get_status()
+```
+
+---
+
+## Quick Reference: Algorithm Decision Tree
+
+```
+Is your budget tiny (≤10 recs)?
+  YES → bayesian
+  NO  ↓
+
+Do you have an LLM API key and want AI-guided search?
+  YES → Do you want full autonomy? → autoresearch
+        Just LLM proposals?        → llm
+        LLM orchestrating phases?  → hybrid
+  NO  ↓
+
+Do you need parallel execution?
+  YES → asha (or bohb for smarter sampling)
+  NO  ↓
+
+Is your search space large (10+ parameters)?
+  YES → hyperband or dehb
+  NO  ↓
+
+Do hyperparameters need to change during training (schedules)?
+  YES → pbt
+  NO  → bayesian (safe default)
+```
 
 ---
 
@@ -406,6 +819,30 @@ Agent: For a real eval metric, I'll use the eval_fn hook — each rec runs train
 [executes runner.run(metric="accuracy", direction="maximize", eval_fn=my_eval, ...)]
 ```
 
+### User: "Use the LLM to figure out the best hyperparameters"
+
+```
+Agent: I'll use the LLM algorithm — it reasons about your network architecture and learns from each experiment. I'll need your NVIDIA API key (or set NVIDIA_API_KEY env var).
+
+User: Here's my key: nvapi-...
+
+Agent: Running LLM-guided search with 10 recs. The LLM will explain its reasoning for each config choice in the logs.
+[executes runner.run(automl_settings={"algorithm": "llm", "llm_api_key": "nvapi-...", ...})]
+```
+
+### User: "Run a fully autonomous search — let the AI figure everything out"
+
+```
+Agent: I'll use the autoresearch algorithm. It will:
+1. Retrieve tuning knowledge for your network
+2. Propose modifications, pre-screen them, verify before launch
+3. Make keep/discard decisions with reasoning after each experiment
+4. Automatically stop when it detects diminishing returns
+
+I'll cap it at 30 experiments. Need your dataset URI and LLM API key.
+[executes runner.run(automl_settings={"algorithm": "autoresearch", "automl_max_experiments": 30, ...})]
+```
+
 ### User: "Resume the experiment from yesterday"
 
 ```
@@ -413,9 +850,27 @@ Agent: Resuming. The runner will poll any jobs that were in flight when we stopp
 [executes runner.run(..., workspace_path="./my_experiment", resume=True)]
 ```
 
-### User: "Switch to ASHA with 30 trials"
+### User: "Switch to ASHA with 30 trials and track in WandB"
 
 ```
-Agent: Switching to ASHA — parallel + early-stopping. Worth flagging: on cosmos-rl the per-epoch checkpoint upload is expensive, so ASHA's cheap-rung advantage is muted. For 30 trials it's still faster than Bayesian wall-clock, just not 10x faster.
-[executes runner.run(..., automl_settings={"algorithm": "asha", "automl_max_epochs": 9, ...})]
+Agent: Switching to ASHA — parallel + early-stopping. Enabling WandB tracking so you can see all trials in a dashboard. Worth flagging: on cosmos-rl the per-epoch checkpoint upload is expensive, so ASHA's cheap-rung advantage is muted. For 30 trials it's still faster than Bayesian wall-clock, just not 10x faster.
+[executes runner.run(
+    automl_settings={"algorithm": "asha", "automl_max_epochs": 9, ...},
+    wandb_config={"enabled": True, "project": "tao-hpo"},
+)]
+```
+
+### User: "I don't know what parameters to tune for DINO"
+
+```
+Agent: I can generate a configuration from your goal description. What are you trying to achieve?
+
+User: Maximize detection accuracy on my small custom dataset with 200 images on 1 A100.
+
+Agent: Based on your constraints, I recommend:
+- Algorithm: bayesian (sample-efficient for small budgets)
+- Parameters: train.optim.lr, train.optim.weight_decay, model.num_queries
+- Budget: 12 recs
+- LR range narrowed to [1e-5, 5e-4] (standard for DINO fine-tuning)
+[uses NLConfigGenerator, then executes runner.run with the generated config]
 ```

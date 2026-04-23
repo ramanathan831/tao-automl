@@ -20,9 +20,21 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+llm = [
+    "openai>=1.0",
+]
+wandb = [
+    "wandb>=0.15",
+]
+all = [
+    "openai>=1.0",
+    "wandb>=0.15",
+]
 dev = [
     "pytest>=7.0",
     "pytest-cov",
+    "openai>=1.0",
+    "wandb>=0.15",
 ]
 
 [project.urls]

@@ -38,12 +38,137 @@ Usage::
 
 __version__ = "0.1.0"
 
+import json
 import logging
+import os
 import uuid
 
-from tao_automl.types import AutoMLContext
+from tao_automl.types import AutoMLContext, JobStates
 
 logger = logging.getLogger(__name__)
+
+
+def query_status(workspace_path: str) -> dict:
+    """Query experiment status from a workspace without a live runner.
+
+    Reads the persisted state files to reconstruct the current status.
+    Safe to call from a separate process while the runner is active.
+
+    Args:
+        workspace_path: Path to the AutoML workspace directory.
+            Since ``AutoMLRunner.run()`` appends a timestamped suffix
+            (e.g. ``run_20260423_183015``) to the base path, pass the
+            full suffixed path here — or iterate over subdirectories
+            of the base path.
+
+    Returns:
+        dict with keys:
+
+        - ``progress``: ``{completed, failed, pending, total, best_metric, best_rec_id, algorithm}``
+        - ``best``: ``{rec_id, specs, metric_value}``
+        - ``recommendations``: list of per-rec dicts
+        - ``active_jobs``: list of ``{rec_id, job_id, updated_at}`` for in-flight jobs
+        - ``experiment_id``: the experiment session ID
+
+        Returns a dict with ``error`` key if the workspace has no state.
+
+    Example::
+
+        from tao_automl import query_status
+
+        status = query_status("./my_experiment")
+        print(f"Progress: {status['progress']['completed']}/{status['progress']['total']}")
+        print(f"Best mAP: {status['best']['metric_value']}")
+        for rec in status['recommendations']:
+            print(f"  Rec {rec['rec_id']}: {rec['status']} metric={rec['metric_value']}")
+    """
+    automl_dir = os.path.join(workspace_path, ".automl")
+    if not os.path.isdir(automl_dir):
+        return {"error": f"No AutoML state found at {workspace_path}"}
+
+    controller_dir = os.path.join(automl_dir, "controller")
+    if not os.path.isdir(controller_dir):
+        return {"error": "No controller state found"}
+
+    controller_files = [f for f in os.listdir(controller_dir) if f.endswith(".json")]
+    if not controller_files:
+        return {"error": "No experiment data found"}
+
+    controller_files.sort(
+        key=lambda f: os.path.getmtime(os.path.join(controller_dir, f)),
+        reverse=True,
+    )
+    experiment_id = controller_files[0].replace(".json", "")
+
+    controller_path = os.path.join(controller_dir, f"{experiment_id}.json")
+    with open(controller_path) as f:
+        recs = json.load(f)
+
+    best_rec_path = os.path.join(automl_dir, "best_rec", f"{experiment_id}.json")
+    best_info = None
+    if os.path.exists(best_rec_path):
+        with open(best_rec_path) as f:
+            best_info = json.load(f)
+
+    active_jobs_path = os.path.join(workspace_path, "active_jobs.json")
+    active_jobs = []
+    if os.path.exists(active_jobs_path):
+        with open(active_jobs_path) as f:
+            active_jobs = json.load(f)
+
+    terminal = {JobStates.success, JobStates.done, JobStates.failure, JobStates.error}
+    completed = [r for r in recs if r.get("status") in terminal]
+    succeeded = [r for r in completed if r.get("status") in (JobStates.success, JobStates.done)]
+    failed = [r for r in completed if r.get("status") in (JobStates.failure, JobStates.error)]
+    pending = [r for r in recs if r.get("status") not in terminal]
+
+    brain_path = os.path.join(automl_dir, "brain", f"{experiment_id}.json")
+    algorithm = None
+    total = len(recs)
+    if os.path.exists(brain_path):
+        with open(brain_path) as f:
+            brain_info = json.load(f)
+        algorithm = brain_info.get("algorithm")
+        max_recs = brain_info.get("max_recommendations")
+        if max_recs:
+            total = max_recs
+
+    best = {}
+    if best_info:
+        bd = best_info.get("rec_data", {})
+        best = {
+            "rec_id": bd.get("id"),
+            "specs": bd.get("specs", {}),
+            "metric_value": bd.get("result"),
+        }
+
+    return {
+        "experiment_id": experiment_id,
+        "progress": {
+            "completed": len(completed),
+            "succeeded": len(succeeded),
+            "failed": len(failed),
+            "pending": len(pending),
+            "total": total,
+            "best_metric": best.get("metric_value"),
+            "best_rec_id": best.get("rec_id"),
+            "algorithm": algorithm,
+        },
+        "best": best,
+        "recommendations": [
+            {
+                "rec_id": r.get("id"),
+                "specs": r.get("specs", {}),
+                "job_id": r.get("job_id"),
+                "status": r.get("status"),
+                "metric_value": r.get("result"),
+                "created_on": r.get("created_on"),
+                "last_modified": r.get("last_modified"),
+            }
+            for r in recs
+        ],
+        "active_jobs": active_jobs,
+    }
 
 
 class AutoML:
@@ -81,6 +206,7 @@ class AutoML:
         automl_hyperparameters=None,
         custom_param_ranges=None,
         resume=False,
+        wandb_config=None,
     ):
         """
         Args:
@@ -98,6 +224,10 @@ class AutoML:
                 ``{"train.optim.lr": {"valid_min": 1e-5, "valid_max": 1e-2}}``).
             resume: Whether to resume from previously persisted state in
                 *workspace*.
+            wandb_config: Optional dict for WandB integration. Keys:
+                ``enabled`` (bool), ``project``, ``entity``, ``api_key``,
+                ``group``. Pass ``{"enabled": True}`` to activate; the
+                API key can also come from ``WANDB_API_KEY`` env var.
         """
         # Lazy imports to avoid pulling in heavy deps (requests, omegaconf)
         # at package import time.
@@ -179,6 +309,7 @@ class AutoML:
                 metric=metric,
                 algorithm=algorithm,
                 parameter_names=param_names,
+                wandb_config=wandb_config,
             )
         else:
             self._controller = Controller(
@@ -189,6 +320,7 @@ class AutoML:
                 metric=metric,
                 algorithm=algorithm,
                 parameter_names=param_names,
+                wandb_config=wandb_config,
             )
 
         logger.info(
@@ -237,6 +369,24 @@ class AutoML:
         """Get all Recommendation objects generated so far."""
         return self._controller.get_history()
 
+    def get_status(self):
+        """Get a full status snapshot of the experiment.
+
+        Returns:
+            dict with keys ``progress``, ``best``, ``recommendations``,
+            ``active_rec_ids``.
+        """
+        return self._controller.get_status()
+
     def is_complete(self):
         """Check if the optimization is done."""
         return self._controller.is_complete()
+
+    def finish(self):
+        """Finalize the AutoML session (close WandB, etc.)."""
+        self._controller.finish_wandb()
+
+    @property
+    def wandb_group(self) -> str:
+        """Return the WandB group name for child training runs to join."""
+        return self._controller.wandb_group

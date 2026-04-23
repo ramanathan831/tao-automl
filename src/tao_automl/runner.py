@@ -43,6 +43,7 @@ Or execute a plan file::
 
 import json
 import logging
+import os
 import re
 import signal
 import sys
@@ -334,6 +335,12 @@ class AutoMLRunner:
 
         automl_settings = automl_settings or {"algorithm": "bayesian", "metric": "loss"}
         workspace_id = workspace_id or self._sdk._workspace_id
+
+        if not resume:
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            workspace_path = os.path.join(workspace_path, f"run_{ts}")
+        os.makedirs(workspace_path, exist_ok=True)
+        logger.info("Workspace: %s", workspace_path)
 
         # Load network knowledge from the skill bank. Set TAO_SKILL_BANK_PATH
         # to point at tao-skills-external (or a submodule). Everything below
