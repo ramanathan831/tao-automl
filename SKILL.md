@@ -37,7 +37,12 @@ Before running AutoML:
    - Lepton / DGX Cloud: `aws://bucket/path` (S3-compatible)
    - Azure: `azure://container/path`
    - Local / Docker: local filesystem path
-3. **Skill bank available**: lives at `~/tao-skills-external`. Point the runner at it:
+3. **Skill bank available**: lives at `~/tao-skills-external`. **CRITICAL**: The runner raises `ValueError: No skill config found for '<network>'` if the skill bank is not set. You MUST set it before importing the runner:
+   ```python
+   import os
+   os.environ["TAO_SKILL_BANK_PATH"] = os.path.expanduser("~/tao-skills-external")
+   ```
+   Or in bash:
    ```bash
    export TAO_SKILL_BANK_PATH=~/tao-skills-external
    ```
@@ -126,8 +131,34 @@ Extract from the user's request:
 | `direction` | No | `"minimize"` or `"maximize"` | **Only needed if your metric name doesn't contain `"loss"` AND you want to minimize, or contains `"loss"` AND you want to maximize.** Otherwise the implicit "contains 'loss' → minimize, else maximize" rule applies. |
 | `algorithm` | No | `"bayesian"` (default) | See algorithm guide below |
 | `max_recommendations` | No | 5–20 | Ask budget — each rec is one full training run |
+| `skill_bank_path` | Yes (if not set) | `"~/tao-skills-external"` | Check if `TAO_SKILL_BANK_PATH` env var is set. If not, ask the user for the path. Default: `~/tao-skills-external`. The runner raises `ValueError: No skill config found` without it. |
+| `llm_endpoint` | **Yes** (for `llm`/`hybrid`/`autoresearch`) | `"https://inference-api.nvidia.com"` | **MUST prompt.** The code default `https://integrate.api.nvidia.com/v1` returns 404. Always ask for and pass explicitly. |
+| `llm_model` | **Yes** (for `llm`/`hybrid`/`autoresearch`) | `"gcp/google/gemini-3.1-pro-preview"` | **MUST prompt.** Ask which model to use. Default: `meta/llama-3.1-70b-instruct` via NIM. |
+| `llm_api_key` | **Yes** (for `llm`/`hybrid`/`autoresearch`) | `"nvapi-..."` or `"sk-..."` | **MUST prompt** if `NVIDIA_API_KEY` / `AUTOML_LLM_API_KEY` env vars are not set. |
 
-If any required field is missing, ask the user. Do NOT guess dataset paths.
+If any required field is missing, ask the user. Do NOT guess dataset paths, skill bank paths, or LLM endpoints.
+
+**MANDATORY prompting for LLM-based algorithms (`llm`, `hybrid`, `autoresearch`):**
+
+When the user requests an LLM-powered algorithm, you MUST explicitly ask for ALL THREE of the following before generating the script. Do not assume defaults — the code defaults are broken (endpoint 404s) and API keys are never pre-configured:
+
+1. **`llm_endpoint`** — "What is your LLM endpoint?" (default: `https://inference-api.nvidia.com`)
+2. **`llm_model`** — "Which LLM model?" (default: `meta/llama-3.1-70b-instruct`, or e.g. `gcp/google/gemini-3.1-pro-preview`)
+3. **`llm_api_key`** — "What is your API key?" (check env vars first: `NVIDIA_API_KEY` / `AUTOML_LLM_API_KEY`)
+
+If the user doesn't provide these, the LLM brain silently falls back to random sampling — wasting GPU budget on random configs instead of intelligent ones. There is no error message; the only clue is "LLM call failed... Falling back to random" in the logs.
+
+**MANDATORY: Timestamped workspace folders.**
+
+ALWAYS generate `workspace_path` with a timestamp suffix. Running the same script twice without a timestamp overwrites the previous experiment. Pattern:
+
+```python
+from datetime import datetime
+TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+workspace_path = f"./experiment_name/{TIMESTAMP}"
+```
+
+Do NOT use a flat path like `workspace_path="./my_experiment"`. The user should never have to manually delete old workspace folders.
 
 **Best-practice on metric choice** (learned the hard way from real sweeps):
 
@@ -177,10 +208,19 @@ These use a large language model to reason about hyperparameter choices. They re
 ### Minimal Example
 
 ```python
+import os
+from datetime import datetime
+
+# MANDATORY: Set skill bank path before importing the runner.
+# Without this, runner.run() raises ValueError: No skill config found.
+os.environ["TAO_SKILL_BANK_PATH"] = os.path.expanduser("~/tao-skills-external")
+
 from tao_sdk.sdk import TaoExecutionSDK
 from tao_automl.runner import AutoMLRunner
 
-sdk = TaoExecutionSDK(creds_file="secrets.json")
+TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+sdk = TaoExecutionSDK(creds_file=os.path.expanduser("~/tao-sdk/secrets.json"))
 runner = AutoMLRunner(sdk)
 result = runner.run(
     network_arch="cosmos-rl",
@@ -190,6 +230,7 @@ result = runner.run(
         "metric": "loss",
         "automl_max_recommendations": 5,
     },
+    workspace_path=f"./automl_workspace/{TIMESTAMP}",  # timestamped to avoid collisions
 )
 ```
 
@@ -242,7 +283,7 @@ result = runner.run(
     },
 
     # --- State + durability ---
-    workspace_path="./my_experiment",                # auto-suffixed with run_<timestamp>
+    workspace_path=f"./my_experiment/{TIMESTAMP}",   # ALWAYS timestamp to avoid collisions
     resume=False,                                    # True → recovers in-flight jobs
 
     # --- WandB tracking (optional) ---
@@ -260,27 +301,62 @@ result = runner.run(
 )
 ```
 
-### LLM-Powered Algorithm Example
+### LLM-Powered Algorithm Example (DINO)
+
+This is a complete, runnable example for DINO with LLM brain. It includes every mandatory piece that the agent MUST generate to avoid first-run errors:
 
 ```python
+import os
+from datetime import datetime
+
+os.environ["TAO_SKILL_BANK_PATH"] = os.path.expanduser("~/tao-skills-external")
+
+from tao_sdk.sdk import TaoExecutionSDK
+from tao_automl.runner import AutoMLRunner
+
+TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+S3_BASE = "aws://bucket/data/coco_subset"
+
+sdk = TaoExecutionSDK(creds_file=os.path.expanduser("~/tao-sdk/secrets.json"))
+runner = AutoMLRunner(sdk)
 result = runner.run(
     network_arch="dino",
-    train_dataset_uri="aws://bucket/data/coco_subset",
+    train_dataset_uri=S3_BASE,
     automl_settings={
         "algorithm": "llm",                          # or "hybrid" or "autoresearch"
         "metric": "kpi",
         "direction": "maximize",
         "automl_max_recommendations": 10,
-        # LLM config — also reads AUTOML_LLM_* env vars as fallback
-        "llm_endpoint": "https://integrate.api.nvidia.com/v1",
+        # LLM config — MUST pass llm_endpoint explicitly (code default 404s)
+        "llm_endpoint": "https://inference-api.nvidia.com",
         "llm_model": "meta/llama-3.1-70b-instruct",
         "llm_api_key": "nvapi-...",                  # or set NVIDIA_API_KEY env var
     },
     automl_hyperparameters=[
         "train.optim.lr",
         "train.optim.weight_decay",
+        "model.backbone",
         "model.num_queries",
+        "model.dropout_ratio",
     ],
+    custom_param_ranges={
+        "train.optim.lr": {"valid_min": 1e-5, "valid_max": 5e-4},
+        "model.num_queries": {"valid_min": 100, "valid_max": 900},
+        "model.dropout_ratio": {"valid_min": 0.0, "valid_max": 0.3},
+    },
+    # DINO MANDATORY: both train and val data sources (val is always required)
+    spec_overrides={
+        "dataset.train_data_sources": [
+            {"image_dir": f"{S3_BASE}/images.tar.gz", "json_file": f"{S3_BASE}/annotations.json"}
+        ],
+        "dataset.val_data_sources": [
+            {"image_dir": f"{S3_BASE}/images.tar.gz", "json_file": f"{S3_BASE}/annotations.json"}
+        ],
+        "dataset.num_classes": 91,                   # >= max(category_id) + 1
+        "train.num_epochs": 12,
+        "train.validation_interval": 1,
+    },
+    workspace_path=f"./dino_llm_automl/{TIMESTAMP}",
 )
 ```
 
@@ -288,7 +364,7 @@ result = runner.run(
 1. `automl_settings` keys: `llm_endpoint`, `llm_model`, `llm_api_key`
 2. Environment variables: `AUTOML_LLM_ENDPOINT`, `AUTOML_LLM_MODEL`, `AUTOML_LLM_API_KEY`
 3. Fallback env var for API key: `NVIDIA_API_KEY`
-4. Defaults: NVIDIA NIM endpoint (`https://integrate.api.nvidia.com/v1`) with `meta/llama-3.1-70b-instruct`
+4. Defaults: NVIDIA NIM endpoint (`https://inference-api.nvidia.com`) with `meta/llama-3.1-70b-instruct`. **Note:** the code hardcodes `https://integrate.api.nvidia.com/v1` as the fallback which may 404 — always pass `llm_endpoint` explicitly or set `AUTOML_LLM_ENDPOINT`.
 
 ### Programmatic API (without runner)
 
@@ -695,12 +771,49 @@ These constraints avoid the overfitting traps (very-low `r` + very-high `α` + h
 
 ### dino / deformable_detr / grounding_dino / rtdetr
 
-Object detection networks. See `~/tao-skills-external/models/dino/dino.md` for full details including:
-- `defaults-train.json` creation
-- Data sources `mapping` workaround (requires explicit `spec_overrides`)
-- `num_classes` pitfall (`CUDA error: device-side assert triggered`)
-- `val_data_sources` requirement
-- Recommended AutoML hyperparameters and ranges
+Object detection networks using COCO-format data. See `~/tao-skills-external/models/dino/dino.md` for full details.
+
+**MANDATORY setup for DINO AutoML** (without this, every rec fails with `FileNotFoundError`):
+
+1. **Data paths via `spec_overrides`**: DINO's original `config.json` had empty `data_sources: {}`, so the runner's `_apply_data_sources` does nothing. The updated `config.json` declares `inputs` for the first data source entry, so the SDK's script_runner downloads S3 data and rewrites paths to local. You still must set the paths via `spec_overrides`:
+
+```python
+S3_BASE = "aws://bucket/data/my_coco_dataset"
+spec_overrides={
+    "dataset.train_data_sources": [
+        {"image_dir": f"{S3_BASE}/images.tar.gz", "json_file": f"{S3_BASE}/annotations.json"}
+    ],
+    "dataset.val_data_sources": [
+        {"image_dir": f"{S3_BASE}/images.tar.gz", "json_file": f"{S3_BASE}/annotations.json"}
+    ],
+    "dataset.num_classes": 91,  # MUST be >= max(category_id) + 1
+    "train.num_epochs": 12,
+    "train.validation_interval": 1,
+}
+```
+
+2. **`val_data_sources` is ALWAYS required**: DINO's dataloader unconditionally builds a val dataset. Even if optimizing `train_loss`, `val_data_sources` must point to valid data. Reuse the train data if no separate eval split exists.
+
+3. **`num_classes` pitfall**: Default is 91 (COCO). If your dataset uses category IDs 1–N, set `num_classes >= max(category_id) + 1`. Too low → `CUDA error: device-side assert triggered`.
+
+4. **Recommended hyperparameters** (includes model architecture params):
+
+```python
+automl_hyperparameters=[
+    "train.optim.lr",
+    "train.optim.weight_decay",
+    "model.backbone",
+    "model.num_queries",
+    "model.dropout_ratio",
+]
+custom_param_ranges={
+    "train.optim.lr": {"valid_min": 1e-5, "valid_max": 5e-4},
+    "model.num_queries": {"valid_min": 100, "valid_max": 900},
+    "model.dropout_ratio": {"valid_min": 0.0, "valid_max": 0.3},
+}
+```
+
+5. **Metric**: Use `metric="kpi"` with `direction="maximize"` — mAP is emitted during validation.
 
 ### segformer / classification_pyt / other vision
 
@@ -712,19 +825,24 @@ No special handling needed. The runner reads base specs from `SkillBank.get_defa
 
 ## Common Pitfalls
 
-1. **Using `train_loss` for small-dataset fine-tuning.** The brain will find configs that memorize. Switch to `val_loss` or provide `eval_fn`.
-2. **Implicit direction trap.** `metric="perplexity"` → brain maximizes (wrong). Set `direction="minimize"` explicitly.
-3. **Spec-override typos.** `save_freq_in_epochs` (plural) used to silently do nothing; now raises `ValueError` with suggestion. If you see that error, it's the fix working.
-4. **Orchestrator dies mid-sweep.** Relaunch with the same `workspace_path` and `resume=True`. In-flight jobs are recovered from `active_jobs.json`.
-5. **"Rec never reports a metric" with `val_loss`.** Check that `validation.enable=True` and `validation.freq_in_epoch <= train.epoch`. Without this, the container never emits a validation-loss line.
-6. **Parallel Bayesian arms.** Bayesian is inherently sequential. If you want parallelism, use `asha`. If you use multiple `AutoMLRunner` instances, give each its own `TaoExecutionSDK(state_file=...)` to avoid SQLite write races.
-7. **LLM brain returning random configs.** If every LLM recommendation looks random, the LLM endpoint is probably failing silently. Check the logs for "LLM call failed" warnings. Verify your API key and endpoint are correct.
-8. **`openai` package not installed.** The `llm`, `hybrid`, and `autoresearch` algorithms require the `openai` Python package. Install with `pip install openai` or `pip install nvidia-tao-automl[llm]`.
-9. **WandB not logging.** Ensure `wandb_config={"enabled": True}` is passed and either `api_key` is in the config or `WANDB_API_KEY` is set in the environment. Check logs for "WandB initialized" confirmation.
-10. **`No default train specs found` for a network.** The skill bank model directory is missing `defaults-train.json` or `references/spec_template_train.yaml`. Create one from the network's experiment spec in `tao-pytorch/nvidia_tao_pytorch/cv/<network>/experiment_specs/train.yaml`.
-11. **CUDA device-side assert on DINO.** `num_classes` mismatch — see `dino.md` in the model skill bank.
-12. **Empty data paths for DINO / deformable_detr / grounding_dino.** Data sources `mapping` style not handled by runner — see `dino.md` in the model skill bank.
-13. **`conda run` buffers output.** When running AutoML via `conda run -n tao_sdk python script.py`, all output is buffered until completion. Use `PYTHONUNBUFFERED=1 ~/miniconda3/envs/tao_sdk/bin/python script.py` for real-time output.
+1. **`TAO_SKILL_BANK_PATH` not set.** The #1 first-run error. The runner raises `ValueError: No skill config found for '<network>'`. Fix: `os.environ["TAO_SKILL_BANK_PATH"] = os.path.expanduser("~/tao-skills-external")` before importing the runner. ALWAYS include this in generated scripts.
+2. **Wrong LLM endpoint (404).** The code hardcodes `https://integrate.api.nvidia.com/v1` as the default, which returns 404. The correct endpoint is `https://inference-api.nvidia.com`. ALWAYS pass `llm_endpoint` explicitly in `automl_settings`. The LLM brain silently falls back to random sampling on 404, so you won't see a crash — just useless random configs.
+3. **DINO data not downloaded (`FileNotFoundError`).** Vision skills (DINO, segformer, etc.) originally shipped with empty `"inputs": {}` in their `config.json`. Without declared inputs, the SDK's script_runner doesn't download S3 data — the container sees raw `aws://...` URIs as filesystem paths. Fix: ensure the skill's `config.json` declares `inputs` with `[0]`-indexed spec keys (e.g. `dataset.train_data_sources[0].image_dir`). The DINO config.json has been updated; other vision skills may need the same fix.
+4. **Workspace path collisions.** Running the same script twice overwrites the previous experiment. Always include a timestamp: `workspace_path=f"./automl_workspace/{TIMESTAMP}"` where `TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")`.
+5. **Using `train_loss` for small-dataset fine-tuning.** The brain will find configs that memorize. Switch to `val_loss` or provide `eval_fn`.
+6. **Implicit direction trap.** `metric="perplexity"` → brain maximizes (wrong). Set `direction="minimize"` explicitly.
+7. **Spec-override typos.** `save_freq_in_epochs` (plural) used to silently do nothing; now raises `ValueError` with suggestion. If you see that error, it's the fix working.
+8. **Orchestrator dies mid-sweep.** Relaunch with the same `workspace_path` and `resume=True`. In-flight jobs are recovered from `active_jobs.json`.
+9. **"Rec never reports a metric" with `val_loss`.** Check that `validation.enable=True` and `validation.freq_in_epoch <= train.epoch`. Without this, the container never emits a validation-loss line.
+10. **Parallel Bayesian arms.** Bayesian is inherently sequential. If you want parallelism, use `asha`. If you use multiple `AutoMLRunner` instances, give each its own `TaoExecutionSDK(state_file=...)` to avoid SQLite write races.
+11. **LLM brain returning random configs.** If every LLM recommendation looks random, the LLM endpoint is probably failing silently. Check the logs for "LLM call failed" warnings. Verify your API key and endpoint are correct. Common cause: using the wrong endpoint URL (see pitfall #2).
+12. **`openai` package not installed.** The `llm`, `hybrid`, and `autoresearch` algorithms require the `openai` Python package. Install with `pip install openai` or `pip install nvidia-tao-automl[llm]`.
+13. **WandB not logging.** Ensure `wandb_config={"enabled": True}` is passed and either `api_key` is in the config or `WANDB_API_KEY` is set in the environment. Check logs for "WandB initialized" confirmation.
+14. **`No default train specs found` for a network.** The skill bank model directory is missing `defaults-train.json` or `references/spec_template_train.yaml`. Create one from the network's experiment spec in `tao-pytorch/nvidia_tao_pytorch/cv/<network>/experiment_specs/train.yaml`.
+15. **CUDA device-side assert on DINO.** `num_classes` mismatch — see `dino.md` in the model skill bank.
+16. **DINO `val_data_sources` missing.** DINO unconditionally builds a val dataloader. Omitting `val_data_sources` from `spec_overrides` crashes the job even when optimizing `train_loss`. Always set both `train_data_sources` and `val_data_sources`.
+17. **LLM brain proposes invalid backbone names.** The LLM may suggest backbone names like `fan_small`, `fan_tiny`, `efficientvit_b2` that don't exist in DINO's codebase. These cause silent training failures. Use `custom_param_ranges` to constrain categorical params, or accept that some recs will fail and the brain will learn from failures.
+18. **`conda run` buffers output.** When running AutoML via `conda run -n tao_sdk python script.py`, all output is buffered until completion. Use `PYTHONUNBUFFERED=1 ~/miniconda3/envs/tao_sdk/bin/python script.py` for real-time output.
 
 ---
 
@@ -822,12 +940,22 @@ Agent: For a real eval metric, I'll use the eval_fn hook — each rec runs train
 ### User: "Use the LLM to figure out the best hyperparameters"
 
 ```
-Agent: I'll use the LLM algorithm — it reasons about your network architecture and learns from each experiment. I'll need your NVIDIA API key (or set NVIDIA_API_KEY env var).
+Agent: I'll use the LLM algorithm — it reasons about your network architecture and learns from each experiment.
+I need three things for the LLM brain:
+1. LLM endpoint URL (default: https://inference-api.nvidia.com)
+2. LLM model name (default: meta/llama-3.1-70b-instruct, or e.g. gcp/google/gemini-3.1-pro-preview)
+3. API key for the endpoint (or set NVIDIA_API_KEY env var)
 
-User: Here's my key: nvapi-...
+User: endpoint "https://inference-api.nvidia.com", model "gcp/google/gemini-3.1-pro-preview", key "sk-abc123"
 
 Agent: Running LLM-guided search with 10 recs. The LLM will explain its reasoning for each config choice in the logs.
-[executes runner.run(automl_settings={"algorithm": "llm", "llm_api_key": "nvapi-...", ...})]
+[executes runner.run(automl_settings={
+    "algorithm": "llm",
+    "llm_endpoint": "https://inference-api.nvidia.com",
+    "llm_model": "gcp/google/gemini-3.1-pro-preview",
+    "llm_api_key": "sk-abc123",
+    ...
+})]
 ```
 
 ### User: "Run a fully autonomous search — let the AI figure everything out"
@@ -839,8 +967,21 @@ Agent: I'll use the autoresearch algorithm. It will:
 3. Make keep/discard decisions with reasoning after each experiment
 4. Automatically stop when it detects diminishing returns
 
-I'll cap it at 30 experiments. Need your dataset URI and LLM API key.
-[executes runner.run(automl_settings={"algorithm": "autoresearch", "automl_max_experiments": 30, ...})]
+I'll cap it at 30 experiments. I need:
+- Dataset URI
+- LLM endpoint (default: https://inference-api.nvidia.com)
+- LLM model (default: meta/llama-3.1-70b-instruct)
+- LLM API key (or set NVIDIA_API_KEY env var)
+
+User: dataset aws://bucket/data, endpoint https://inference-api.nvidia.com, model gcp/google/gemini-3.1-pro-preview, key sk-abc123
+
+[executes runner.run(automl_settings={
+    "algorithm": "autoresearch", "automl_max_experiments": 30,
+    "llm_endpoint": "https://inference-api.nvidia.com",
+    "llm_model": "gcp/google/gemini-3.1-pro-preview",
+    "llm_api_key": "sk-abc123",
+    ...
+})]
 ```
 
 ### User: "Resume the experiment from yesterday"
