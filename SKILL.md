@@ -148,6 +148,18 @@ When the user requests an LLM-powered algorithm, you MUST explicitly ask for ALL
 
 If the user doesn't provide these, the LLM brain silently falls back to random sampling — wasting GPU budget on random configs instead of intelligent ones. There is no error message; the only clue is "LLM call failed... Falling back to random" in the logs.
 
+**MANDATORY: Read the model skill before generating the script.**
+
+AutoML runs training. Before generating any AutoML script, read `~/tao-skills-external/models/<network>/<network>.md`. The model skill `.md` contains all model-specific knowledge:
+
+- **Training Requirements** — dataset type, formats, monitoring metric, required dataset URIs to prompt for, required user prompts (data format, num_classes, etc.), and mandatory `spec_overrides`. Prompt the user for every required field. Apply mandatory spec_overrides exactly.
+- **Per-Action Dataset Requirements** — table mapping each action to its spec keys, data source, expected files, and whether the field is a list. Use this table to construct the correct data source `spec_overrides` for the requested action. If the model's Typical Spec Overrides mark data sources as "mandatory", construct them from this table and the user's dataset URIs.
+- **Typical Spec Overrides** — per-action override suggestions (train, evaluate, export, inference, etc.) extracted from SDK notebooks. Use these as the starting point for `spec_overrides` and suggest them to the user. When overrides are marked "mandatory data sources", they MUST be included — the runner cannot auto-resolve them. Merge with any other mandatory overrides from Training Requirements.
+- **AutoML / HPO Notes** — recommended hyperparameters, metric, direction, and AutoML-specific constraints.
+- **Error Patterns** — common training failure modes that apply to AutoML recs too.
+
+Do NOT hardcode model-specific knowledge in the AutoML script without reading the model skill first. Each network has different requirements.
+
 **MANDATORY: Timestamped workspace folders.**
 
 ALWAYS generate `workspace_path` with a timestamp suffix. Running the same script twice without a timestamp overwrites the previous experiment. Pattern:
@@ -344,13 +356,13 @@ result = runner.run(
         "model.num_queries": {"valid_min": 100, "valid_max": 900},
         "model.dropout_ratio": {"valid_min": 0.0, "valid_max": 0.3},
     },
-    # DINO MANDATORY: both train and val data sources (val is always required)
+    # spec_overrides from dino.md AutoML Requirements section
     spec_overrides={
         "dataset.train_data_sources": [
-            {"image_dir": f"{S3_BASE}/images.tar.gz", "json_file": f"{S3_BASE}/annotations.json"}
+            {"image_dir": f"{S3_BASE}/images", "json_file": f"{S3_BASE}/annotations.json"}
         ],
         "dataset.val_data_sources": [
-            {"image_dir": f"{S3_BASE}/images.tar.gz", "json_file": f"{S3_BASE}/annotations.json"}
+            {"image_dir": f"{S3_BASE}/images", "json_file": f"{S3_BASE}/annotations.json"}
         ],
         "dataset.num_classes": 91,                   # >= max(category_id) + 1
         "train.num_epochs": 12,
@@ -771,55 +783,11 @@ These constraints avoid the overfitting traps (very-low `r` + very-high `α` + h
 
 ### dino / deformable_detr / grounding_dino / rtdetr
 
-Object detection networks using COCO-format data. See `~/tao-skills-external/models/dino/dino.md` for full details.
-
-**MANDATORY setup for DINO AutoML** (without this, every rec fails with `FileNotFoundError`):
-
-1. **Data paths via `spec_overrides`**: DINO's original `config.json` had empty `data_sources: {}`, so the runner's `_apply_data_sources` does nothing. The updated `config.json` declares `inputs` for the first data source entry, so the SDK's script_runner downloads S3 data and rewrites paths to local. You still must set the paths via `spec_overrides`:
-
-```python
-S3_BASE = "aws://bucket/data/my_coco_dataset"
-spec_overrides={
-    "dataset.train_data_sources": [
-        {"image_dir": f"{S3_BASE}/images.tar.gz", "json_file": f"{S3_BASE}/annotations.json"}
-    ],
-    "dataset.val_data_sources": [
-        {"image_dir": f"{S3_BASE}/images.tar.gz", "json_file": f"{S3_BASE}/annotations.json"}
-    ],
-    "dataset.num_classes": 91,  # MUST be >= max(category_id) + 1
-    "train.num_epochs": 12,
-    "train.validation_interval": 1,
-}
-```
-
-2. **`val_data_sources` is ALWAYS required**: DINO's dataloader unconditionally builds a val dataset. Even if optimizing `train_loss`, `val_data_sources` must point to valid data. Reuse the train data if no separate eval split exists.
-
-3. **`num_classes` pitfall**: Default is 91 (COCO). If your dataset uses category IDs 1–N, set `num_classes >= max(category_id) + 1`. Too low → `CUDA error: device-side assert triggered`.
-
-4. **Recommended hyperparameters** (includes model architecture params):
-
-```python
-automl_hyperparameters=[
-    "train.optim.lr",
-    "train.optim.weight_decay",
-    "model.backbone",
-    "model.num_queries",
-    "model.dropout_ratio",
-]
-custom_param_ranges={
-    "train.optim.lr": {"valid_min": 1e-5, "valid_max": 5e-4},
-    "model.num_queries": {"valid_min": 100, "valid_max": 900},
-    "model.dropout_ratio": {"valid_min": 0.0, "valid_max": 0.3},
-}
-```
-
-5. **Metric**: Use `metric="kpi"` with `direction="maximize"` — mAP is emitted during validation.
+Object detection networks using COCO-format data. Read `~/tao-skills-external/models/dino/dino.md` — the **"Training Requirements"** section has required datasets, user prompts, and mandatory spec_overrides. The **"AutoML / HPO Notes"** section has recommended hyperparameters and metric.
 
 ### segformer / classification_pyt / other vision
 
-No special handling needed. The runner reads base specs from `SkillBank.get_default_specs(network_arch, "train")`. Pass `automl_hyperparameters` to control which params are searched, or leave `None` to use all `automl_enabled` params from the schema.
-
-**Segformer-like skills** expose real val metrics (`val_mIoU`) in the training loop — use them directly as the AutoML metric. For generative skills (LLM/VLM) only `val_loss` is cheap; real task accuracy requires `eval_fn`.
+No special handling needed. The runner reads base specs from `SkillBank.get_default_specs(network_arch, "train")`. Pass `automl_hyperparameters` to control which params are searched, or leave `None` to use all `automl_enabled` params from the schema. Read the model's `<network>.md` for any model-specific requirements.
 
 ---
 
@@ -827,7 +795,7 @@ No special handling needed. The runner reads base specs from `SkillBank.get_defa
 
 1. **`TAO_SKILL_BANK_PATH` not set.** The #1 first-run error. The runner raises `ValueError: No skill config found for '<network>'`. Fix: `os.environ["TAO_SKILL_BANK_PATH"] = os.path.expanduser("~/tao-skills-external")` before importing the runner. ALWAYS include this in generated scripts.
 2. **Wrong LLM endpoint (404).** The code hardcodes `https://integrate.api.nvidia.com/v1` as the default, which returns 404. The correct endpoint is `https://inference-api.nvidia.com`. ALWAYS pass `llm_endpoint` explicitly in `automl_settings`. The LLM brain silently falls back to random sampling on 404, so you won't see a crash — just useless random configs.
-3. **DINO data not downloaded (`FileNotFoundError`).** Vision skills (DINO, segformer, etc.) originally shipped with empty `"inputs": {}` in their `config.json`. Without declared inputs, the SDK's script_runner doesn't download S3 data — the container sees raw `aws://...` URIs as filesystem paths. Fix: ensure the skill's `config.json` declares `inputs` with `[0]`-indexed spec keys (e.g. `dataset.train_data_sources[0].image_dir`). The DINO config.json has been updated; other vision skills may need the same fix.
+3. **Model-specific training failures (data format, missing datasets, invalid params).** Each network has unique training requirements. ALWAYS read `~/tao-skills-external/models/<network>/<network>.md` — the "Training Requirements" and "Error Patterns" sections document model-specific failure modes that apply to AutoML recs too.
 4. **Workspace path collisions.** Running the same script twice overwrites the previous experiment. Always include a timestamp: `workspace_path=f"./automl_workspace/{TIMESTAMP}"` where `TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")`.
 5. **Using `train_loss` for small-dataset fine-tuning.** The brain will find configs that memorize. Switch to `val_loss` or provide `eval_fn`.
 6. **Implicit direction trap.** `metric="perplexity"` → brain maximizes (wrong). Set `direction="minimize"` explicitly.
@@ -839,10 +807,7 @@ No special handling needed. The runner reads base specs from `SkillBank.get_defa
 12. **`openai` package not installed.** The `llm`, `hybrid`, and `autoresearch` algorithms require the `openai` Python package. Install with `pip install openai` or `pip install nvidia-tao-automl[llm]`.
 13. **WandB not logging.** Ensure `wandb_config={"enabled": True}` is passed and either `api_key` is in the config or `WANDB_API_KEY` is set in the environment. Check logs for "WandB initialized" confirmation.
 14. **`No default train specs found` for a network.** The skill bank model directory is missing `defaults-train.json` or `references/spec_template_train.yaml`. Create one from the network's experiment spec in `tao-pytorch/nvidia_tao_pytorch/cv/<network>/experiment_specs/train.yaml`.
-15. **CUDA device-side assert on DINO.** `num_classes` mismatch — see `dino.md` in the model skill bank.
-16. **DINO `val_data_sources` missing.** DINO unconditionally builds a val dataloader. Omitting `val_data_sources` from `spec_overrides` crashes the job even when optimizing `train_loss`. Always set both `train_data_sources` and `val_data_sources`.
-17. **LLM brain proposes invalid backbone names.** The LLM may suggest backbone names like `fan_small`, `fan_tiny`, `efficientvit_b2` that don't exist in DINO's codebase. These cause silent training failures. Use `custom_param_ranges` to constrain categorical params, or accept that some recs will fail and the brain will learn from failures.
-18. **`conda run` buffers output.** When running AutoML via `conda run -n tao_sdk python script.py`, all output is buffered until completion. Use `PYTHONUNBUFFERED=1 ~/miniconda3/envs/tao_sdk/bin/python script.py` for real-time output.
+15. **`conda run` buffers output.** When running AutoML via `conda run -n tao_sdk python script.py`, all output is buffered until completion. Use `PYTHONUNBUFFERED=1 ~/miniconda3/envs/tao_sdk/bin/python script.py` for real-time output.
 
 ---
 
