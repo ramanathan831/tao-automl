@@ -7,7 +7,7 @@ description: >-
   and per-rec custom evaluation hooks. Use when the user mentions TAO AutoML, hyperparameter
   optimization, HPO, automl, automl_settings, AutoMLRunner, tao_automl, bayesian search,
   hyperband, ASHA, LLM-guided search, autoresearch, or wants to tune training hyperparameters
-  for any TAO network (cosmos-rl, dino, segformer, clip, etc.).
+  for any TAO network.
 ---
 
 # TAO AutoML Skill
@@ -34,7 +34,7 @@ Before running AutoML:
    ```
    Pass it via `TaoExecutionSDK(creds_file="~/tao-sdk/secrets.json")`.
 2. **Dataset**: Training data accessible from the compute backend. URI format depends on the SDK's platform:
-   - Lepton / DGX Cloud: `aws://bucket/path` (S3-compatible)
+   - Lepton / DGX Cloud: `s3://bucket/path` (S3-compatible; do not generate `aws://...`)
    - Azure: `azure://container/path`
    - Local / Docker: local filesystem path
 3. **Skill bank available**: lives at `~/tao-skills-external`. **CRITICAL**: The runner raises `ValueError: No skill config found for '<network>'` if the skill bank is not set. You MUST set it before importing the runner:
@@ -49,14 +49,13 @@ Before running AutoML:
    The bank structure is:
    ```
    tao-skills-external/
-   ├── applications/         # workflow configs (normal-train, deft-cosmos-rl, ...)
+   ├── applications/         # workflow configs
    ├── models/               # per-network skill packages
-   │   ├── dino/
+   │   ├── <network>/
    │   │   ├── config.json           # actions, data_sources, container image
    │   │   ├── defaults-train.json   # default training spec (REQUIRED by AutoML)
-   │   │   └── dino.md
-   │   ├── cosmos-rl/
-   │   ├── segformer/
+   │   │   └── <network>.md
+   │   ├── <another-network>/
    │   └── ...
    ├── data/
    └── platform/
@@ -70,7 +69,7 @@ Before running AutoML:
    ```
    For unbuffered output (recommended for long-running AutoML), use the Python binary directly:
    ```bash
-   PYTHONUNBUFFERED=1 ~/miniconda3/envs/tao_sdk/bin/python my_script.py
+   PYTHONPATH=~/tao-sdk:~/tao-automl/src PYTHONUNBUFFERED=1 ~/miniconda3/envs/tao_sdk/bin/python my_script.py
    ```
 5. **`nvidia-tao-automl` installed** (editable dev install into `tao_sdk` env):
    ```bash
@@ -100,11 +99,11 @@ conda run -n tao_sdk python3 -c "import wandb; print('WandB OK')"
 
 ## Concepts: What is TAO AutoML?
 
-TAO AutoML automates the "try different hyperparameter values → train → compare results → repeat" cycle. Instead of manually tweaking learning rate, batch size, or backbone settings, you tell AutoML:
+TAO AutoML automates the "try different hyperparameter values → train → compare results → repeat" cycle. Instead of manually tweaking training settings, you tell AutoML:
 
-- **What network** to train (e.g. `dino`, `cosmos-rl`, `segformer`)
-- **Which hyperparameters** to search over (e.g. `train.optm_lr`, `policy.lora.r`)
-- **What metric** to optimize (e.g. `val_loss`, `accuracy`, `mIoU`)
+- **What network** to train (`network_arch`)
+- **Which hyperparameters** to search over (from the model skill and schema)
+- **What metric** to optimize (from the model skill or user request)
 - **How many trials** (budget)
 
 AutoML then:
@@ -125,9 +124,9 @@ Extract from the user's request:
 
 | Field | Required | Example | How to get it |
 |---|---|---|---|
-| `network_arch` | Yes | `"cosmos-rl"`, `"dino"`, `"clip"` | User states the model |
-| `train_dataset_uri` | Yes | `"aws://bucket/data/subset"` | User provides the URI |
-| `metric` | No | `"loss"` (default) | Ask if unclear — `loss` / `val_loss` for generative tasks, `accuracy` / `mIoU` / custom for classification / segmentation |
+| `network_arch` | Yes | `"<network_arch>"` | User states the model |
+| `train_dataset_uri` | Yes | `"s3://bucket/data/subset"` | User provides the URI |
+| `metric` | No | `"<metric_name>"` | Use the model skill recommendation or ask if unclear. Do not choose model-specific metrics from this AutoML skill. |
 | `direction` | No | `"minimize"` or `"maximize"` | **Only needed if your metric name doesn't contain `"loss"` AND you want to minimize, or contains `"loss"` AND you want to maximize.** Otherwise the implicit "contains 'loss' → minimize, else maximize" rule applies. |
 | `algorithm` | No | `"bayesian"` (default) | See algorithm guide below |
 | `max_recommendations` | No | 5–20 | Ask budget — each rec is one full training run |
@@ -149,16 +148,16 @@ Before diving into configuration, ask the user (or infer from context) whether t
 - Ranges: schema defaults (no `custom_param_ranges`)
 - The agent only needs: `network_arch`, `train_dataset_uri`, and LLM credentials (for hybrid)
 
-When `automl_hyperparameters=None`, the runner automatically discovers all params marked `automl_enabled=True` in the network's JSON schema. For cosmos-rl these are: `policy.lora.r`, `policy.lora.lora_alpha`, `policy.lora.lora_dropout`, `train.epoch`, `train.optm_lr`, `train.optm_decay_type`, `custom.vision.fps`. Each network has its own set — the dataclass definitions in `tao-automl/src/tao_automl/config/<network>/` are the source of truth.
+When `automl_hyperparameters=None`, the runner automatically discovers all params marked `automl_enabled=True` in the network's JSON schema. Each network has its own set; the dataclass definitions in `tao-automl/src/tao_automl/config/<network>/` and the model skill's **AutoML / HPO Notes** are the source of truth.
 
 ```python
 # Quick start — all defaults
 result = runner.run(
-    network_arch="cosmos-rl",
+    network_arch=network_arch,
     train_dataset_uri=S3_TRAIN,
     automl_settings={
         "algorithm": "hybrid",
-        "metric": "val_loss",
+        "metric": metric,
         "automl_max_recommendations": 10,
         "llm_endpoint": "https://inference-api.nvidia.com",
         "llm_model": "gcp/google/gemini-3.1-pro-preview",
@@ -204,21 +203,10 @@ Then the user picks from this list and optionally customizes ranges:
 ```python
 result = runner.run(
     ...,
-    automl_hyperparameters=[
-        "train.optm_lr",
-        "policy.lora.r",
-        "policy.lora.lora_alpha",
-        "train.optm_decay_type",
-    ],
+    automl_hyperparameters=selected_param_names,
     custom_param_ranges={
-        "train.optm_lr": {"valid_min": 5e-6, "valid_max": 2e-4},
-        "train.epoch": {"valid_min": 1, "valid_max": 3},
-        "train.optm_betas": {"valid_min": [0.9, 0.995], "valid_max": [0.95, 0.999]},
-        "train.optm_decay_type": {"valid_options": ["cosine", "none"], "option_weights": [0.7, 0.3]},
-        "policy.lora.r": {"valid_min": 4, "valid_max": 64},
-        "policy.lora.lora_alpha": {"valid_min": 128, "valid_max": 1024},
-        "policy.lora.lora_dropout": {"valid_min": 0.03, "valid_max": 0.1},
-        "custom.vision.fps": {"valid_min": 1, "valid_max": 2},
+        "<param_name>": {"valid_min": min_value, "valid_max": max_value},
+        "<categorical_param>": {"valid_options": ["option_a", "option_b"], "option_weights": [0.7, 0.3]},
     },
 )
 ```
@@ -247,6 +235,10 @@ AutoML runs training. Before generating any AutoML script, read `~/tao-skills-ex
 
 Do NOT hardcode model-specific knowledge in the AutoML script without reading the model skill first. Each network has different requirements.
 
+**MANDATORY: No model-specific constants in this AutoML skill.**
+
+The AutoML skill must not define model-specific hyperparameter names, metric names, dataset layouts, archive names, class-count rules, spec override keys, container images, checkpoint quirks, or custom metric regexes. Those belong in `~/tao-skills-external/models/<network>/<network>.md`, especially the **Training Requirements**, **Typical Spec Overrides**, **AutoML / HPO Notes**, and **Error Patterns** sections. This skill may describe how to read and apply those sections, but not the concrete per-model values.
+
 **MANDATORY: Timestamped workspace folders.**
 
 ALWAYS generate `workspace_path` with a timestamp suffix. Running the same script twice without a timestamp overwrites the previous experiment. Pattern:
@@ -259,11 +251,34 @@ workspace_path = f"./experiment_name/{TIMESTAMP}"
 
 Do NOT use a flat path like `workspace_path="./my_experiment"`. The user should never have to manually delete old workspace folders.
 
-**Best-practice on metric choice** (learned the hard way from real sweeps):
+**MANDATORY: Fresh runner per new AutoML request.**
 
-- `train_loss` is cheap but a footgun for small-dataset fine-tunes — the brain will find configs that memorize rather than generalize. Only use it for large-scale pretraining.
-- `val_loss` (held-out slice of train) is cheap AND robust. Best default for fine-tuning. Cosmos-rl and similar frameworks emit this natively when `validation.enable=True` + `validation.freq_in_epoch=1`.
-- Real task metric (accuracy / F1 / BLEU / mIoU) via the `eval_fn` hook is the most honest but also the most expensive per rec. Use when val_loss proxy isn't discriminating enough.
+Every new user request to run AutoML MUST create a new runner script and launch a new AutoML job, even if an older runner script for the same network/algorithm already exists. Existing runner files and logs may be read only as references for dataset URIs, credentials patterns, and proven fixes; do not reuse them as the execution target for a new request.
+
+Use a unique timestamp in the new runner filename, log filename, PID filename, SDK `state_file`, and `workspace_path`. Derive path components from the requested `network_arch` and `algorithm`; do not hardcode any model or algorithm name unless it is the actual requested value.
+
+```python
+import re
+
+def slug(value):
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_").lower()
+
+TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+RUN_NAME = f"{slug(network_arch)}_{slug(algorithm)}"
+runner_path = f"automl_runs/run_{RUN_NAME}_{TIMESTAMP}.py"
+log_path = f"automl_runs/{RUN_NAME}_{TIMESTAMP}.log"
+pid_path = f"automl_runs/{RUN_NAME}_{TIMESTAMP}.pid"
+state_file = f"tao_session_state_{RUN_NAME}_{TIMESTAMP}.json"
+workspace_path = f"./automl_runs/{RUN_NAME}/{TIMESTAMP}"
+```
+
+Only resume an existing runner/workspace when the user explicitly asks to resume, continue, recover, or inspect an existing experiment. If the user says "run automl" or asks for a new AutoML run, treat it as a fresh job.
+
+**Best-practice on metric choice**:
+
+- Training loss is cheap, but can overfit on small fine-tuning datasets. Prefer the model skill's recommended validation or task metric when available.
+- If the model skill recommends a validation proxy, also apply the model skill's required validation-related `spec_overrides` so the metric is actually emitted.
+- A real task metric via `eval_fn` is often the most honest but adds per-rec cost. Use it when the model skill says log-based metrics are insufficient or the user explicitly wants downstream evaluation.
 
 ---
 
@@ -291,14 +306,14 @@ These use a large language model to reason about hyperparameter choices. They re
 | Algorithm | Use when | Typical budget | How it works |
 |---|---|---|---|
 | `llm` | Domain knowledge matters more than statistical rigor. | 5–20 recs | An LLM proposes hyperparameter configs based on the search space schema, experiment history, and its training knowledge. Falls back to random sampling on LLM failure. Sequential like bayesian. |
-| `hybrid` | You want the LLM to orchestrate multi-phase optimization. | 10–50 recs | An LLM strategist plans optimization phases (e.g. "Phase 1: sweep LR with bayesian for 5 trials, Phase 2: sweep backbone with asha for 10 trials"). Each phase uses a classical sub-algorithm. Stops when the strategist detects diminishing returns. |
+| `hybrid` | You want the LLM to orchestrate multi-phase optimization. | 10–50 recs | An LLM strategist plans optimization phases over model-skill parameters. Each phase uses a classical sub-algorithm. Stops when the strategist detects diminishing returns. |
 | `autoresearch` | Fully autonomous agent loop. | 10–50 recs | The most powerful mode. Combines: (1) RAP knowledge retrieval about the network, (2) LLM-proposed spec modifications, (3) training-free pre-screening of candidates, (4) multi-stage verification (pre-launch + post-result), (5) keep/discard reasoning. Automatically stops on budget exhaustion or consecutive failures. |
 
 **Default to `bayesian` unless** the user specifically asks for something else, has a large GPU budget, or needs early-stopping on cheap intermediate metrics (ASHA / hyperband).
 
 **Use `llm` / `hybrid` / `autoresearch` when** the user wants LLM-guided search, has an API key for NVIDIA NIM or OpenAI, and wants richer reasoning about why certain hyperparameters are chosen.
 
-**Caveat on ASHA with large-checkpoint skills:** ASHA's whole point is running many configs for a cheap 1-epoch rung, then promoting survivors. When the per-epoch checkpoint save is expensive (e.g. cosmos-rl saves a 30+ GB full-model snapshot per epoch), the "cheap rung" stops being cheap. Stick with Bayesian on those workloads until the skill exposes a "skip intermediate checkpoints" knob.
+**Caveat on ASHA with expensive checkpoints:** ASHA's whole point is running many configs cheaply for early rungs, then promoting survivors. If the model skill warns that checkpoints, validation, or startup cost dominate short trials, prefer the model skill's recommended algorithm instead of assuming ASHA will be cheaper.
 
 ---
 
@@ -322,12 +337,12 @@ TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
 sdk = TaoExecutionSDK(creds_file=os.path.expanduser("~/tao-sdk/secrets.json"))
 runner = AutoMLRunner(sdk)
 result = runner.run(
-    network_arch="cosmos-rl",
-    train_dataset_uri="aws://bucket/data/my_dataset",
+    network_arch=network_arch,
+    train_dataset_uri=train_dataset_uri,
     automl_settings={
-        "algorithm": "bayesian",
-        "metric": "loss",
-        "automl_max_recommendations": 5,
+        "algorithm": algorithm,
+        "metric": metric,
+        "automl_max_recommendations": max_recommendations,
     },
     workspace_path=f"./automl_workspace/{TIMESTAMP}",  # timestamped to avoid collisions
 )
@@ -339,19 +354,19 @@ result = runner.run(
 def my_eval(rec, train_job_id):
     """Optional post-training evaluator. Return a float (the real metric)
     or None to fall back to the log-based extractor."""
-    # e.g. read a results.json uploaded by the container and compute accuracy
+    # e.g. read a results file uploaded by the container and compute the requested metric
     ...
     return 0.71
 
 result = runner.run(
     # --- Required ---
-    network_arch="cosmos-rl",
-    train_dataset_uri="aws://bucket/data/my_dataset",
+    network_arch=network_arch,
+    train_dataset_uri=train_dataset_uri,
 
     # --- Dataset + resources ---
-    eval_dataset_uri="aws://bucket/data/eval",
+    eval_dataset_uri=eval_dataset_uri,
     base_checkpoint="",
-    image="nvcr.io/nvidia/tao/tao-toolkit:6.26.3-cosmos-rl",  # default: from skill
+    image=image,                                      # only set if the model skill or user requires it
     backend_details={                                # platform-specific
         "backend_type": "lepton",
         "resource_shape": "gpu.h100-sxm",
@@ -359,27 +374,16 @@ result = runner.run(
 
     # --- AutoML config ---
     automl_settings={
-        "algorithm": "bayesian",
-        "metric": "val_loss",
-        "direction": "minimize",                     # explicit; optional
-        "automl_max_recommendations": 10,
+        "algorithm": algorithm,
+        "metric": metric,
+        "direction": direction,                       # explicit when needed
+        "automl_max_recommendations": max_recommendations,
     },
-    automl_hyperparameters=[                         # validated at launch (typos → error)
-        "train.optm_lr",
-        "policy.lora.r",
-        "policy.lora.lora_alpha",
-    ],
-    custom_param_ranges={
-        "train.optm_lr": {"valid_min": 1e-7, "valid_max": 1e-5},
-    },
+    automl_hyperparameters=automl_hyperparameters,    # from model skill / schema
+    custom_param_ranges=custom_param_ranges,          # from model skill / user constraints
 
     # --- Per-rec spec overrides ---
-    spec_overrides={                                 # validated — typos raise ValueError
-        "train.epoch": 4,
-        "validation.enable": True,                   # enable per-epoch val_loss for cosmos-rl
-        "validation.freq_in_epoch": 1,
-        "train.train_policy.dataset.test_size": 100, # 100 held-out val samples
-    },
+    spec_overrides=spec_overrides,                    # mandatory model-specific overrides from model skill
 
     # --- State + durability ---
     workspace_path=f"./my_experiment/{TIMESTAMP}",   # ALWAYS timestamp to avoid collisions
@@ -400,67 +404,9 @@ result = runner.run(
 )
 ```
 
-### LLM-Powered Algorithm Example (DINO)
+### LLM-Powered Algorithm Example
 
-This is a complete, runnable example for DINO with LLM brain. It includes every mandatory piece that the agent MUST generate to avoid first-run errors:
-
-```python
-import os
-from datetime import datetime
-
-os.environ["TAO_SKILL_BANK_PATH"] = os.path.expanduser("~/tao-skills-external")
-
-from tao_sdk.sdk import TaoExecutionSDK
-from tao_automl.runner import AutoMLRunner
-
-TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
-S3_BASE = "s3://bucket/data/coco_subset"
-IMAGE_ARCHIVE = "images.tar.gz"
-
-sdk = TaoExecutionSDK(creds_file=os.path.expanduser("~/tao-sdk/secrets.json"))
-runner = AutoMLRunner(sdk)
-result = runner.run(
-    network_arch="dino",
-    train_dataset_uri=S3_BASE,
-    automl_settings={
-        "algorithm": "llm",                          # or "hybrid" or "autoresearch"
-        "metric": "kpi",
-        "direction": "maximize",
-        "automl_max_recommendations": 10,
-        # LLM config — MUST pass llm_endpoint explicitly (code default 404s)
-        "llm_endpoint": "https://inference-api.nvidia.com",
-        "llm_model": "meta/llama-3.1-70b-instruct",
-        "llm_api_key": "nvapi-...",                  # or set NVIDIA_API_KEY env var
-    },
-    automl_hyperparameters=[
-        "train.optim.lr",
-        "train.optim.weight_decay",
-        "model.backbone",
-        "model.num_queries",
-        "model.dropout_ratio",
-    ],
-    custom_param_ranges={
-        "train.optim.lr": {"valid_min": 1e-5, "valid_max": 5e-4},
-        "model.num_queries": {"valid_min": 100, "valid_max": 900},
-        "model.dropout_ratio": {"valid_min": 0.0, "valid_max": 0.3},
-    },
-    # spec_overrides from dino.md AutoML Requirements section
-    # Use the remote archive path. The SDK extracts images.tar.gz and rewrites
-    # the runtime spec to the extracted images folder.
-    spec_overrides={
-        "dataset.train_data_sources": [
-            {"image_dir": f"{S3_BASE}/{IMAGE_ARCHIVE}", "json_file": f"{S3_BASE}/annotations.json"}
-        ],
-        "dataset.val_data_sources": [
-            {"image_dir": f"{S3_BASE}/{IMAGE_ARCHIVE}", "json_file": f"{S3_BASE}/annotations.json"}
-        ],
-        "dataset.num_classes": 91,                   # >= max(category_id) + 1
-        "train.num_epochs": 12,
-        "train.validation_interval": 1,
-    },
-    workspace_path=f"./dino_llm_automl/{TIMESTAMP}",
-)
-```
+For `llm`, `hybrid`, or `autoresearch`, use the same generic runner shape as above, plus the required LLM endpoint, model, and key in `automl_settings`. All model-specific hyperparameters, metric extractors, and `spec_overrides` must still come from the model skill.
 
 **LLM endpoint configuration** (in order of precedence):
 1. `automl_settings` keys: `llm_endpoint`, `llm_model`, `llm_api_key`
@@ -477,7 +423,7 @@ from tao_automl import AutoML
 
 automl = AutoML(
     workspace="/tmp/my_experiment",
-    network="dino",
+    network=network_arch,
     train_specs=my_train_spec_dict,
     settings={
         "algorithm": "bayesian",
@@ -513,18 +459,13 @@ print("Best:", automl.get_best().specs)
 | `llm_endpoint` | str | NVIDIA NIM | OpenAI-compatible API endpoint (llm, hybrid, autoresearch) |
 | `llm_model` | str | `meta/llama-3.1-70b-instruct` | LLM model name (llm, hybrid, autoresearch) |
 | `llm_api_key` | str | from env | API key for the LLM endpoint |
-| `research_program` | str | None | Free-text research directives for the autoresearch agent (e.g. "Focus on LoRA rank and learning rate interaction") |
+| `research_program` | str | None | Free-text research directives for the autoresearch agent |
 | `automl_delete_intermediate_ckpt` | bool | False | Delete non-best checkpoints to save storage. Hyperband-family algorithms defer deletion until bracket completion for safety. |
 | `override_automl_disabled_params` | bool | False | Include params whose schema `automl_enabled` is False. For advanced users who want to search over params the network author didn't flag for AutoML. |
 
 ### `kpi` metric resolution
 
-When `metric="kpi"`, the controller resolves the actual metric key from the network config's `metrics.monitoring_metric` field. For example:
-- cosmos-rl: `kpi` → `val/avg_loss` (minimized)
-- dino: `kpi` → `val_mAP50` (maximized)
-- segformer: `kpi` → (network-specific primary metric)
-
-This is the recommended approach — use `metric="kpi"` and the system picks the right metric for the network. Only use explicit metric names when you need a non-default metric.
+When `metric="kpi"`, the controller resolves the actual metric key from the network config's `metrics.monitoring_metric` field. Whether `kpi` is appropriate, and whether a custom `metric_extractor` is needed, is model-specific. Follow the model skill's **AutoML / HPO Notes**.
 
 ### `custom_param_ranges` format
 
@@ -532,32 +473,28 @@ Each entry can include:
 
 | Field | Type | Description |
 |---|---|---|
-| `valid_min` | float/int/list | Min value. For `list_2` types (e.g. `optm_betas`), pass a list: `[0.9, 0.995]` |
+| `valid_min` | float/int/list | Min value. For list-valued parameters, pass the list shape required by the schema. |
 | `valid_max` | float/int/list | Max value. Same list rules as min. |
 | `valid_options` | list[str] | For categorical/ordered params: restrict to these values |
 | `option_weights` | list[float] | Sampling weights for `valid_options`. Must match length. Higher weight = more likely to be sampled. |
-| `disable_list` | bool | For params that can be float OR list (e.g. `train.optm_lr` in cosmos-rl): `True` keeps it as a single float for optimization, bypassing network list helpers. |
+| `disable_list` | bool | For params that can be float OR list: `True` keeps it as a single float for optimization, bypassing network list helpers. Use only when supported by the schema/model skill. |
 
 Example with all features:
 
 ```python
 custom_param_ranges={
-    "train.optm_lr": {"valid_min": 5e-6, "valid_max": 2e-4, "disable_list": True},
-    "train.optm_decay_type": {
-        "valid_options": ["cosine", "none"],
+    "<float_param>": {"valid_min": min_value, "valid_max": max_value, "disable_list": True},
+    "<categorical_param>": {
+        "valid_options": ["option_a", "option_b"],
         "option_weights": [0.7, 0.3],
     },
-    "train.optm_betas": {"valid_min": [0.9, 0.995], "valid_max": [0.95, 0.999]},
-    "policy.lora.r": {"valid_min": 4, "valid_max": 64},
+    "<list_param>": {"valid_min": [min_a, min_b], "valid_max": [max_a, max_b]},
 }
 ```
 
-### Network-specific auto-exclusions
+### Model-specific search-space rules
 
-The search space builder has built-in safety rules:
-
-- **cosmos-rl LoRA exclusion:** If `policy.lora.*` keys are absent from the training spec (i.e. full fine-tuning, not LoRA), all LoRA parameters are auto-excluded from the search space. No action needed — just be aware that LoRA params won't appear if LoRA is disabled in `spec_overrides`.
-- **classification_pyt + hyperband:** If `model.head.type` is in the search space and algorithm is `hyperband`, AutoML raises an error. Use `bayesian` instead for head-type search.
+Some networks have built-in search-space exclusions or algorithm restrictions. Do not document them here; read the model skill's **AutoML / HPO Notes** and let schema validation report unsupported combinations.
 
 ### LLM Analyzer (server-side range narrowing)
 
@@ -571,21 +508,11 @@ os.environ["AUTOML_LLM_ANALYZER_NARROW_RANGES"] = "true" # auto-tighten custom_p
 
 When enabled, after every N completed experiments the analyzer reviews patterns, assesses convergence, and optionally narrows search ranges to focus on promising regions. This happens server-side and persists the narrowed ranges.
 
-### `spec_overrides` common keys
+### `spec_overrides`
 
-(Every key you pass is validated against the skill's spec schema. Typos that look like existing keys raise `ValueError` with a suggestion; genuinely-new keys are accepted with a warning. This catches `save_freq_in_epochs` → `save_freq_in_epoch` style silent failures.)
+`spec_overrides` keys are model-specific. Read the model skill's **Training Requirements**, **Per-Action Dataset Requirements**, and **Typical Spec Overrides** sections, then pass only the keys required or recommended there. Do not infer override keys from examples in this AutoML skill.
 
-| Key | Effect |
-|---|---|
-| `train.epoch` | Number of training epochs |
-| `train.train_batch_per_replica` | Batch size per GPU |
-| `train.optm_lr` | Base learning rate |
-| `train.ckpt.save_freq_in_epoch` | Save checkpoint every N epochs (default for cosmos-rl is 10 — override to `train.epoch` if running fewer) |
-| `train.ckpt.max_keep` | Max checkpoints to keep on disk |
-| `validation.enable` / `validation.freq_in_epoch` | Enable per-epoch validation for `val_loss` metric |
-| `train.train_policy.dataset.test_size` | Validation split size (int = absolute samples; float = ratio) |
-| `policy.model_max_length` | Context window size (40960 for video VLMs) |
-| `policy.parallelism.dp_shard_size` | Must equal number of GPUs |
+Every key you pass is validated against the skill's spec schema. Typos that look like existing keys raise `ValueError` with a suggestion; genuinely-new keys are accepted with a warning.
 
 ---
 
@@ -653,17 +580,17 @@ from tao_automl.brain.nl_config import NLConfigGenerator
 
 generator = NLConfigGenerator()   # uses NVIDIA NIM by default
 config = generator.generate_config(
-    user_prompt="I want to maximize detection accuracy on a small custom dataset with 500 images",
-    network="dino",
+    user_prompt=user_goal,
+    network=network_arch,
     available_parameters=param_records,  # from generate_hyperparams_to_search()
-    hardware_info="2x A100 80GB",
+    hardware_info=hardware_info,
 )
 # config = {
 #   "automl_algorithm": "bayesian",
-#   "automl_hyperparameters": ["train.optim.lr", "train.optim.weight_decay", ...],
+#   "automl_hyperparameters": ["<param_from_model_schema>", ...],
 #   "algorithm_specific_params": {"automl_max_recommendations": 15},
-#   "metric": "kpi",
-#   "reasoning": "Small dataset + limited budget → bayesian for sample efficiency..."
+#   "metric": "<metric_from_model_skill_or_user_request>",
+#   "reasoning": "..."
 # }
 ```
 
@@ -680,16 +607,16 @@ analyzer = LLMAnalyzer(analysis_interval=5, narrow_ranges=True)
 analysis = analyzer.analyze(
     experiments=experiment_history,
     parameters=param_records,
-    network="dino",
-    metric_name="kpi",
-    metric_direction="maximize",
-    best_metric=0.85,
+    network=network_arch,
+    metric_name=metric,
+    metric_direction=direction,
+    best_metric=best_metric,
 )
 # analysis = {
-#   "patterns": ["LR > 0.01 always causes divergence"],
+#   "patterns": ["..."],
 #   "convergence_assessment": "improving",
-#   "recommendations": ["Try weight_decay in [0.01, 0.05]"],
-#   "suggested_ranges": {"train.optim.lr": {"min": 0.0005, "max": 0.005, ...}},
+#   "recommendations": ["..."],
+#   "suggested_ranges": {"<param_name>": {"min": ..., "max": ...}},
 # }
 ```
 
@@ -701,7 +628,7 @@ The `autoresearch` algorithm integrates five AutoML-Agent concepts:
 
 | Component | What it does | When it runs |
 |---|---|---|
-| **KnowledgeRetriever** (RAP) | Retrieves built-in tuning knowledge for the network (e.g. "DINO works best with LR 1e-4 to 5e-4") and optionally web-searched papers/benchmarks | Once at initialization |
+| **KnowledgeRetriever** (RAP) | Retrieves built-in tuning knowledge for the requested network and optionally web-searched papers/benchmarks | Once at initialization |
 | **SpecPrescreener** | LLM predicts which of N candidate configs are worth running, WITHOUT training. Saves GPU budget by filtering unlikely-to-improve configs. | Before each trial — proposes 3 candidates, pre-screens to pick the best 1 |
 | **MultiStageVerifier** | Pre-launch: validates proposed changes won't crash/OOM. Post-result: checks metrics are plausible (not NaN, not anomalous). | Before launch + after result |
 | **ExperimentTracker** | Tracks full history with keep/discard decisions and reasoning | After each result |
@@ -715,28 +642,28 @@ For complex multi-phase optimization, define a research program:
 from tao_automl.brain.research_program import ResearchProgram, ResearchPhase
 
 program = ResearchProgram(
-    objective="Maximize detection mAP on custom dataset",
-    network="dino",
+    objective=objective,
+    network=network_arch,
     phases=[
         ResearchPhase(
-            name="LR sweep",
+            name="Phase 1",
             algorithm="bayesian",
-            parameters=["train.optim.lr", "train.optim.weight_decay"],
+            parameters=["<param_from_model_schema>", "..."],
             trials=8,
         ),
         ResearchPhase(
-            name="Architecture search",
+            name="Phase 2",
             algorithm="asha",
-            parameters=["model.backbone", "model.num_queries"],
+            parameters=["<another_param_from_model_schema>", "..."],
             trials=15,
-            carry_forward="best",   # best LR values carry into this phase
+            carry_forward="best",   # best values carry into this phase
         ),
     ],
 )
 
 # Validate before running
 issues = program.validate(
-    available_parameters=["train.optim.lr", "train.optim.weight_decay", "model.backbone", "model.num_queries"],
+    available_parameters=available_parameters,
     available_algorithms=["bayesian", "asha"],
 )
 ```
@@ -759,11 +686,11 @@ Use it when:
 ```python
 import re
 
-def extract_bleu(logs: str, metric_name: str):
-    m = re.search(r"BLEU-4:\s*([0-9.]+)", logs)
+def extract_custom_metric(logs: str, metric_name: str):
+    m = re.search(rf"{re.escape(metric_name)}:\s*([0-9.]+)", logs)
     return float(m.group(1)) if m else None
 
-runner.run(..., metric_extractor=extract_bleu)
+runner.run(..., metric_extractor=extract_custom_metric)
 ```
 
 Exceptions raised inside the extractor are caught and logged; the runner continues polling.
@@ -773,22 +700,19 @@ Exceptions raised inside the extractor are caught and logged; the runner continu
 Called once after a rec's training job reaches a terminal state, before the result is reported to the brain. Whatever it returns **overrides** any value captured by `metric_extractor` and becomes what the brain optimizes on.
 
 Use it when:
-- The real task metric lives outside the training logs (results.json, external benchmark, merge-then-inference pipeline).
+- The real task metric lives outside the training logs.
 - You want a true-test-metric sweep without building surrounding plumbing yourself.
 - Per-rec cost is acceptable relative to `metric_extractor`.
 
 ```python
 def eval_on_held_out(rec, train_job_id):
-    # 1. Find the LoRA adapter the training job saved on S3
-    adapter = f"s3://{BUCKET}/results/{train_job_id}/train_output_dir/..."
-    # 2. Merge into base + run inference on the eval set
-    merged = merge_lora(adapter, base="nvidia/Cosmos-Reason2-8B")
-    acc, _ = run_classification_eval(merged, eval_dataset_uri)
-    return acc
+    # Implement the model-specific evaluation flow documented in the model skill.
+    metric_value = run_model_specific_eval(rec, train_job_id)
+    return metric_value
 
 runner.run(
     ...,
-    automl_settings={"metric": "accuracy", "direction": "maximize", ...},
+    automl_settings={"metric": task_metric, "direction": direction, ...},
     eval_fn=eval_on_held_out,
 )
 ```
@@ -803,8 +727,7 @@ Exceptions from `eval_fn` are caught and logged — the runner falls back to the
 
 ```python
 def on_rec(rec):
-    print(f"Rec {rec.id}: trying lr={rec.specs.get('train.optm_lr')}, "
-          f"lora_r={rec.specs.get('policy.lora.r')}")
+    print(f"Rec {rec.id}: trying {rec.specs}")
 
 def on_result(rec, metric, status):
     print(f"Rec {rec.id}: {status}, metric={metric}")
@@ -843,7 +766,7 @@ The result is a plain dict:
 {
     "best": {
         "rec_id": 4,
-        "specs": {"train.optm_lr": 2.83e-7, "policy.lora.r": 8, "policy.lora.lora_alpha": 512, ...},
+        "specs": {"<param_name>": "<value>", "...": "..."},
         "metric_value": 0.7077,
     },
     "progress": {
@@ -865,75 +788,30 @@ Metric values in `best` and `history` are always in the original scale the user 
 
 1. **Best config** — show the winning hyperparameters and metric value.
 2. **Comparison table** — rank all recs by metric, highlight the best.
-3. **Insights** — call out what the optimizer learned (e.g. "high-α regime consistently wins; LR in 1-3e-7 range is robust").
+3. **Insights** — call out what the optimizer learned from the requested parameters and metric.
 4. **WandB link** — if tracking was enabled, provide the dashboard URL.
 5. **Next steps** — suggest:
    - More recs (re-run with `resume=True` + higher `automl_max_recommendations`).
    - Train longer with the best config using `sdk.create_job(specs=result["best"]["specs"])`.
    - Run a downstream evaluation on the best checkpoint.
-   - Export / merge / deploy the best model.
+   - Run the model skill's recommended export/deploy workflow for the best model.
 
 ### If all recs failed
 
 Check common issues:
-- **Dataset path wrong** — verify the URI points to a directory with the files the skill expects (e.g. `annotations.json` + `videos.tar.gz` for cosmos-rl).
-- **Validation never fires** — if `metric="val_loss"` but `validation.freq_in_epoch > train.epoch`, no val-loss line ever appears in the log. Set `validation.freq_in_epoch=1` and `validation.enable=True`.
-- **Checkpoint never saves** — if `train.ckpt.save_freq_in_epoch > train.epoch`, no checkpoint is saved; downstream merge/eval fails.
-- **Model or data download timeout** — the first run downloads ~15 GB from HuggingFace; subsequent runs use Lustre cache.
-- **OOM** — reduce `train.train_policy.mini_batch` or `custom.vision.total_pixels` via `spec_overrides`.
-- **Silent tarball corruption** — a cached, truncated `*.tar.gz` on shared Lustre will silently poison every future run. Symptoms: cryptic data-loader errors like `moov atom not found` / `KeyError: 'video_fps'`. Fix: delete the cached Lustre path and let it re-download.
+- **Dataset path wrong** — verify the URI points to the layout required by the model skill.
+- **Metric never appears** — verify the model skill's required metric-related overrides and custom extractor are present.
+- **Checkpoint or eval artifact missing** — verify the model skill's checkpoint/export/eval requirements.
+- **Model or data download timeout** — inspect backend logs and model-skill error patterns.
+- **OOM** — reduce the model-specific batch, resolution, sequence length, or memory-heavy knobs recommended by the model skill.
+- **Cached data corruption** — inspect the model skill's dataset/cache error patterns and clear only the affected cache path if documented.
 - **LLM endpoint unreachable** (llm/hybrid/autoresearch only) — the brain falls back to random sampling. Check `AUTOML_LLM_ENDPOINT` and `AUTOML_LLM_API_KEY`. Verify with: `curl -s $AUTOML_LLM_ENDPOINT/models -H "Authorization: Bearer $AUTOML_LLM_API_KEY"`.
 
 ---
 
-## Network-Specific Notes
+## Model-Specific Notes
 
-### cosmos-rl
-
-Dataset layout: `annotations.json` + `videos.tar.gz` (or `images.tar.gz`) per split. The runner auto-applies tarball extraction + spec-rewrite inside the container so annotation-relative video paths resolve after download.
-
-**Recommended spec_overrides for fine-tuning:**
-
-```python
-spec_overrides={
-    "train.epoch": 4,                                 # 3-5 is typical for small datasets
-    "train.ckpt.save_freq_in_epoch": 4,               # save exactly at the final epoch
-    "train.ckpt.max_keep": 1,
-    "validation.enable": True,                        # emit "[SFT] Validation loss: X" lines
-    "validation.freq_in_epoch": 1,                    # every epoch — cheap
-    "train.train_policy.dataset.test_size": 100,      # 100 held-out samples
-}
-```
-
-With these overrides, `automl_settings={"metric": "val_loss", ...}` gives the brain a clean, cheap signal and the built-in extractor picks up cosmos-rl's `[SFT] Validation loss: X for train step N/M, epoch E` lines automatically.
-
-**Common hyperparameter search space that works well for small-dataset LoRA:**
-
-```python
-automl_hyperparameters=[
-    "train.optm_lr",
-    "policy.lora.r",
-    "policy.lora.lora_alpha",
-    "policy.lora.lora_dropout",
-    "train.optm_decay_type",
-]
-custom_param_ranges={
-    "policy.lora.r": {"valid_min": 4, "valid_max": 32},
-    "policy.lora.lora_dropout": {"valid_min": 0.0, "valid_max": 0.05},
-}
-```
-
-These constraints avoid the overfitting traps (very-low `r` + very-high `α` + high `dropout` = aggressive memorization on small data).
-
-**LoRA eval pitfall:** Cosmos-rl's direct-LoRA evaluation path assumes a 4-shard base-model filename pattern that the public HF repo doesn't use. Work around by pre-merging: use `peft.merge_and_unload()` to produce a single merged model, then eval that with `model.enable_lora=False`.
-
-### dino / deformable_detr / grounding_dino / rtdetr
-
-Object detection networks using COCO-format data. Read `~/tao-skills-external/models/dino/dino.md` — the **"Training Requirements"** section has required datasets, user prompts, and mandatory spec_overrides. The **"AutoML / HPO Notes"** section has recommended hyperparameters and metric.
-
-### segformer / classification_pyt / other vision
-
-No special handling needed. The runner reads base specs from `SkillBank.get_default_specs(network_arch, "train")`. Pass `automl_hyperparameters` to control which params are searched, or leave `None` to use all `automl_enabled` params from the schema. Read the model's `<network>.md` for any model-specific requirements.
+Model-specific notes do not belong in this AutoML skill. For every requested `network_arch`, read `~/tao-skills-external/models/<network>/<network>.md` and use its **Training Requirements**, **Per-Action Dataset Requirements**, **Typical Spec Overrides**, **AutoML / HPO Notes**, and **Error Patterns** sections as the source of truth.
 
 ---
 
@@ -943,11 +821,11 @@ No special handling needed. The runner reads base specs from `SkillBank.get_defa
 2. **Wrong LLM endpoint (404).** The code hardcodes `https://integrate.api.nvidia.com/v1` as the default, which returns 404. The correct endpoint is `https://inference-api.nvidia.com`. ALWAYS pass `llm_endpoint` explicitly in `automl_settings`. The LLM brain silently falls back to random sampling on 404, so you won't see a crash — just useless random configs.
 3. **Model-specific training failures (data format, missing datasets, invalid params).** Each network has unique training requirements. ALWAYS read `~/tao-skills-external/models/<network>/<network>.md` — the "Training Requirements" and "Error Patterns" sections document model-specific failure modes that apply to AutoML recs too.
 4. **Workspace path collisions.** Running the same script twice overwrites the previous experiment. Always include a timestamp: `workspace_path=f"./automl_workspace/{TIMESTAMP}"` where `TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")`.
-5. **Using `train_loss` for small-dataset fine-tuning.** The brain will find configs that memorize. Switch to `val_loss` or provide `eval_fn`.
-6. **Implicit direction trap.** `metric="perplexity"` → brain maximizes (wrong). Set `direction="minimize"` explicitly.
+5. **Using a weak proxy metric.** The brain can optimize a metric that does not reflect real task quality. Use the metric recommended by the model skill or provide `eval_fn`.
+6. **Implicit direction trap.** If the metric name does not imply the desired direction, set `direction` explicitly.
 7. **Spec-override typos.** `save_freq_in_epochs` (plural) used to silently do nothing; now raises `ValueError` with suggestion. If you see that error, it's the fix working.
 8. **Orchestrator dies mid-sweep.** Relaunch with the same `workspace_path` and `resume=True`. In-flight jobs are recovered from `active_jobs.json`.
-9. **"Rec never reports a metric" with `val_loss`.** Check that `validation.enable=True` and `validation.freq_in_epoch <= train.epoch`. Without this, the container never emits a validation-loss line.
+9. **Rec never reports a metric.** Check the model skill's metric-emission requirements and custom extractor guidance.
 10. **Parallel Bayesian arms.** Bayesian is inherently sequential. If you want parallelism, use `asha`. If you use multiple `AutoMLRunner` instances, give each its own `TaoExecutionSDK(state_file=...)` to avoid SQLite write races.
 11. **LLM brain returning random configs.** If every LLM recommendation looks random, the LLM endpoint is probably failing silently. Check the logs for "LLM call failed" warnings. Verify your API key and endpoint are correct. Common cause: using the wrong endpoint URL (see pitfall #2).
 12. **`openai` package not installed.** The `llm`, `hybrid`, and `autoresearch` algorithms require the `openai` Python package. Install with `pip install openai` or `pip install nvidia-tao-automl[llm]`.
@@ -1028,24 +906,24 @@ Do hyperparameters need to change during training (schedules)?
 
 ## Example Conversations
 
-### User: "Optimize cosmos-rl training on my ITS dataset, using val_loss"
+### User: "Optimize `<network_arch>` training on my dataset"
 
 ```
-Agent: I'll run Bayesian HPO driven by val_loss (cheaper + more overfit-robust than train loss). I need:
-1. Your dataset URI (e.g. aws://bucket/data/its_subset)
-2. How many trials? (default: 10, each ~60 min on H100)
+Agent: I'll read the model skill for `<network_arch>` first, then generate a fresh timestamped runner using its required datasets, spec overrides, metric, and recommended search space. I need:
+1. The dataset URI or URIs required by that model skill
+2. How many trials? (default: 10)
 
-User: aws://nvcf-storage-handling/data/cosmos_rl_its/, 10 recs
+User: s3://bucket/data/train, 10 recs
 
-Agent: Running. Enabling per-epoch validation on a 100-sample held-out slice so val_loss actually appears in the logs. I'll merge + eval the best config once the sweep converges.
-[executes runner.run(metric="val_loss", spec_overrides={"validation.*": ..., ...})]
+Agent: Running a fresh job with a new runner, log, state file, and workspace. The model-specific metric and overrides come from `<network>.md`.
+[executes runner.run(...)]
 ```
 
-### User: "I want the real accuracy, not val_loss"
+### User: "I want the real task metric, not the default proxy"
 
 ```
-Agent: For a real eval metric, I'll use the eval_fn hook — each rec runs train → merge LoRA → inference → accuracy. ~2x cost per rec, so I'd start with 8 recs instead of 10.
-[executes runner.run(metric="accuracy", direction="maximize", eval_fn=my_eval, ...)]
+Agent: For a real task metric, I'll use the eval_fn hook described by the model skill. This adds per-rec cost, so I’ll adjust the budget if needed.
+[executes runner.run(metric=task_metric, direction=direction, eval_fn=model_specific_eval, ...)]
 ```
 
 ### User: "Use the LLM to figure out the best hyperparameters"
@@ -1084,7 +962,7 @@ I'll cap it at 30 experiments. I need:
 - LLM model (default: meta/llama-3.1-70b-instruct)
 - LLM API key (or set NVIDIA_API_KEY env var)
 
-User: dataset aws://bucket/data, endpoint https://inference-api.nvidia.com, model gcp/google/gemini-3.1-pro-preview, key sk-abc123
+User: dataset s3://bucket/data, endpoint https://inference-api.nvidia.com, model gcp/google/gemini-3.1-pro-preview, key sk-abc123
 
 [executes runner.run(automl_settings={
     "algorithm": "autoresearch", "automl_max_experiments": 30,
@@ -1105,24 +983,24 @@ Agent: Resuming. The runner will poll any jobs that were in flight when we stopp
 ### User: "Switch to ASHA with 30 trials and track in WandB"
 
 ```
-Agent: Switching to ASHA — parallel + early-stopping. Enabling WandB tracking so you can see all trials in a dashboard. Worth flagging: on cosmos-rl the per-epoch checkpoint upload is expensive, so ASHA's cheap-rung advantage is muted. For 30 trials it's still faster than Bayesian wall-clock, just not 10x faster.
+Agent: Switching to ASHA — parallel + early-stopping. I’ll first check the model skill for any warning that short trials are dominated by startup, validation, or checkpoint cost, then generate a fresh runner with WandB tracking.
 [executes runner.run(
     automl_settings={"algorithm": "asha", "automl_max_epochs": 9, ...},
     wandb_config={"enabled": True, "project": "tao-hpo"},
 )]
 ```
 
-### User: "I don't know what parameters to tune for DINO"
+### User: "I don't know what parameters to tune for `<network_arch>`"
 
 ```
 Agent: I can generate a configuration from your goal description. What are you trying to achieve?
 
-User: Maximize detection accuracy on my small custom dataset with 200 images on 1 A100.
+User: Maximize my task metric on a small custom dataset with 1 GPU.
 
 Agent: Based on your constraints, I recommend:
 - Algorithm: bayesian (sample-efficient for small budgets)
-- Parameters: train.optim.lr, train.optim.weight_decay, model.num_queries
+- Parameters: from the model skill's AutoML / HPO Notes and the generated schema
 - Budget: 12 recs
-- LR range narrowed to [1e-5, 5e-4] (standard for DINO fine-tuning)
+- Ranges: from the model skill and user constraints
 [uses NLConfigGenerator, then executes runner.run with the generated config]
 ```
