@@ -143,7 +143,6 @@ All discovered during real Cosmos-RL training on DGX Cloud Lepton (H100 GPUs):
 ```
 tao-automl/
 ├── pyproject.toml              # nvidia-tao-automl wheel config
-├── SKILL.md                    # Agent skill for agentic AutoML usage
 ├── src/
 │   └── tao_automl/
 │       ├── __init__.py         # AutoML class (public API)
@@ -222,8 +221,9 @@ print(result["best"])
 python -m tao_automl.runner automl_plan.json secrets.json
 ```
 
-### Agentic (via SKILL.md)
-The AutoML skill guides an LLM agent through: parse intent → select algorithm → configure & run → monitor → interpret results.
+### Agentic (via skill bank)
+The AutoML skill lives in `tao-skills-external/applications/tao-automl/SKILL.md`.
+It guides an LLM agent through: parse intent → select algorithm → configure & run → monitor → interpret results.
 
 ---
 

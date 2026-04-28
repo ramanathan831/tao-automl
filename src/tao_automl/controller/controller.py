@@ -16,9 +16,12 @@
 
 The controller manages the brain algorithm, generates recommendations,
 and tracks results.  It does NOT launch jobs -- the caller does that.
+
+Optionally integrates with Weights & Biases (wandb) for experiment tracking.
 """
 
 import logging
+import os
 
 from tao_automl.types import Recommendation, JobStates
 
@@ -27,10 +30,11 @@ logger = logging.getLogger(__name__)
 # Algorithms whose completion is determined by brain.done()
 _BRAIN_DONE_ALGORITHMS = frozenset({
     "hyperband", "h", "bohb", "asha", "dehb", "hyperband_es", "hes", "pbt",
+    "hybrid", "autoresearch",
 })
 
 # Algorithms whose completion is determined by max recommendations count
-_MAX_REC_ALGORITHMS = frozenset({"bayesian", "b", "bfbo"})
+_MAX_REC_ALGORITHMS = frozenset({"bayesian", "b", "bfbo", "llm"})
 
 
 class Controller:
@@ -49,6 +53,7 @@ class Controller:
         metric,
         algorithm,
         parameter_names=None,
+        wandb_config=None,
     ):
         """
         Args:
@@ -59,6 +64,9 @@ class Controller:
             metric: Optimization metric name
             algorithm: Algorithm name string
             parameter_names: List of parameter names being searched
+            wandb_config: Optional dict with WandB settings.
+                Keys: ``project``, ``entity``, ``api_key``, ``group``,
+                ``enabled`` (bool, default False).
         """
         self.brain = brain
         self.context = context
@@ -69,6 +77,14 @@ class Controller:
         self.parameter_names = parameter_names or []
         self.history = []  # list of Recommendation objects
         self._next_id = 0
+
+        # WandB integration (optional)
+        self._wandb_config = wandb_config or {}
+        self._wandb_initialized = False
+        self._wandb_table = None
+        self._wandb_group = f"automl_{self.context.id}"
+        if self._wandb_config.get("enabled"):
+            self._initialize_wandb()
 
     # ------------------------------------------------------------------
     # Public API
@@ -137,6 +153,8 @@ class Controller:
             rec_id, metric_value, status,
         )
 
+        self._update_wandb_table()
+
     def get_best(self):
         """Return the best Recommendation so far, or None.
 
@@ -181,6 +199,41 @@ class Controller:
         """Return the full list of Recommendation objects."""
         return list(self.history)
 
+    def get_status(self):
+        """Return a structured status snapshot of the entire experiment.
+
+        Returns:
+            dict with keys ``progress``, ``best``, ``recommendations``,
+            ``active_rec_id``.
+        """
+        progress = self.get_progress()
+        best = self.get_best()
+
+        recs = []
+        for r in self.history:
+            recs.append({
+                "rec_id": r.id,
+                "specs": r.specs,
+                "job_id": r.job_id,
+                "status": r.status,
+                "metric_value": r.result,
+                "created_on": r.created_on,
+                "last_modified": r.last_modified,
+            })
+
+        active = [r.id for r in self.history if r.status in (JobStates.pending, JobStates.started, JobStates.running)]
+
+        return {
+            "progress": progress,
+            "best": {
+                "rec_id": best.id if best else None,
+                "specs": best.specs if best else {},
+                "metric_value": best.result if best else None,
+            },
+            "recommendations": recs,
+            "active_rec_ids": active,
+        }
+
     def is_complete(self):
         """Check if the optimization loop is done.
 
@@ -211,6 +264,115 @@ class Controller:
         return False
 
     # ------------------------------------------------------------------
+    # WandB integration
+    # ------------------------------------------------------------------
+
+    def _initialize_wandb(self):
+        """Initialize WandB run for AutoML experiment tracking."""
+        if self._wandb_initialized:
+            return
+
+        try:
+            import wandb
+
+            api_key = self._wandb_config.get(
+                "api_key", os.getenv("WANDB_API_KEY", "")
+            )
+            if not api_key:
+                logger.info("No WANDB_API_KEY found, skipping WandB initialization")
+                return
+
+            if not wandb.login(key=api_key):
+                logger.warning("Failed to login to WandB, skipping")
+                return
+
+            group = self._wandb_config.get("group", self._wandb_group)
+            wandb.init(
+                project=self._wandb_config.get("project", "TAO AutoML"),
+                entity=self._wandb_config.get("entity"),
+                name="automl_brain",
+                group=group,
+                config={
+                    "network": self.context.network,
+                    "algorithm": self.algorithm,
+                    "metric": self.metric,
+                },
+                dir=os.path.join(self.context.workspace_path, "wandb")
+                if self.context.workspace_path else None,
+                reinit=True,
+            )
+
+            self._wandb_initialized = True
+            self._wandb_group = group
+            logger.info("WandB initialized with group: %s", group)
+
+            columns = ["experiment_id", "job_id", "status", self.metric, "best_epoch_number"]
+            columns.extend(self.parameter_names)
+            self._wandb_table = wandb.Table(columns=columns)
+
+        except ImportError:
+            logger.info("wandb package not installed, skipping WandB integration")
+        except Exception as e:
+            logger.warning("Failed to initialize WandB: %s", e)
+            self._wandb_initialized = False
+
+    def _update_wandb_table(self):
+        """Rebuild and log the WandB table with current recommendation state."""
+        if not self._wandb_initialized or self._wandb_table is None:
+            return
+
+        try:
+            import wandb
+
+            columns = ["experiment_id", "job_id", "status", self.metric, "best_epoch_number"]
+            columns.extend(self.parameter_names)
+            self._wandb_table = wandb.Table(columns=columns)
+
+            for rec in self.history:
+                result_value = rec.result
+                if isinstance(result_value, float):
+                    formatted = f"{result_value:.10f}".rstrip('0')
+                    if formatted.endswith('.'):
+                        formatted += '0'
+                    result_value = formatted
+
+                row_data = [
+                    rec.id,
+                    rec.job_id or "",
+                    rec.status,
+                    result_value,
+                    rec.best_epoch_number,
+                ]
+                for param_name in self.parameter_names:
+                    value = rec.specs.get(param_name, "N/A")
+                    row_data.append(value)
+
+                self._wandb_table.add_data(*row_data)
+
+            wandb.log({"automl_experiments": self._wandb_table})
+            logger.debug("Updated WandB table with %d recommendations", len(self.history))
+
+        except Exception as e:
+            logger.warning("Failed to update WandB table: %s", e)
+
+    def finish_wandb(self):
+        """Finalize WandB run. Call when the optimization loop ends."""
+        if not self._wandb_initialized:
+            return
+        self._update_wandb_table()
+        try:
+            import wandb
+            wandb.finish()
+            logger.info("Closed WandB run")
+        except Exception as e:
+            logger.warning("Failed to close WandB run: %s", e)
+
+    @property
+    def wandb_group(self) -> str:
+        """Return the WandB group name for child runs to join."""
+        return self._wandb_group
+
+    # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
 
@@ -238,6 +400,7 @@ class Controller:
         metric,
         algorithm,
         parameter_names=None,
+        wandb_config=None,
     ):
         """Load controller from persisted state.
 
@@ -251,6 +414,7 @@ class Controller:
             metric=metric,
             algorithm=algorithm,
             parameter_names=parameter_names,
+            wandb_config=wandb_config,
         )
 
         saved = state_store.get_controller_info(context.id)

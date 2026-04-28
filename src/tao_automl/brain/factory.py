@@ -15,7 +15,7 @@
 """AutoML brain factory"""
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from tao_automl.brain.bayesian import Bayesian
 from tao_automl.brain.hyperband import HyperBand
@@ -25,6 +25,9 @@ from tao_automl.brain.asha import ASHA
 from tao_automl.brain.pbt import PBT
 from tao_automl.brain.dehb import DEHB
 from tao_automl.brain.hyperband_es import HyperBandES
+from tao_automl.brain.llm_brain import LLMBrain
+from tao_automl.brain.hybrid_controller import HybridBrain
+from tao_automl.brain.autoresearch_controller import AutoresearchBrain
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +44,9 @@ class AlgorithmType:
     PBT = ("pbt",)
     DEHB = ("dehb",)
     HYPERBAND_ES = ("hyperband_es", "hes")
+    LLM = ("llm",)
+    HYBRID = ("hybrid",)
+    AUTORESEARCH = ("autoresearch",)
 
 
 @dataclass
@@ -66,6 +72,15 @@ class AlgorithmParams:
     automl_max_trials: int = None  # ASHA: max configs to try (None = unlimited)
     automl_min_top_configs: int = 5  # ASHA: min configs that must reach final rung before stopping
 
+    # LLM/agentic algorithm params
+    llm_endpoint: str = ""
+    llm_model: str = ""
+    llm_api_key: str = ""
+    llm_temperature: float = 0.7
+    llm_max_tokens: int = 4096
+    automl_max_experiments: int = 50  # autoresearch budget
+    research_program: Optional[str] = None
+
     @classmethod
     def from_dict(cls, params_dict: Dict[str, Any]) -> 'AlgorithmParams':
         """Create AlgorithmParams from dictionary with defaults"""
@@ -87,8 +102,30 @@ class AlgorithmParams:
             automl_top_n_percent=params_dict.get("automl_top_n_percent", 15.0),
             automl_min_points_in_model=params_dict.get("automl_min_points_in_model", 10),
             automl_max_trials=params_dict.get("automl_max_trials", None),
-            automl_min_top_configs=params_dict.get("automl_min_top_configs", 5)
+            automl_min_top_configs=params_dict.get("automl_min_top_configs", 5),
+            llm_endpoint=params_dict.get("llm_endpoint", ""),
+            llm_model=params_dict.get("llm_model", ""),
+            llm_api_key=params_dict.get("llm_api_key", ""),
+            llm_temperature=float(params_dict.get("llm_temperature", 0.7)),
+            llm_max_tokens=int(params_dict.get("llm_max_tokens", 4096)),
+            automl_max_experiments=int(params_dict.get("automl_max_experiments", 50)),
+            research_program=params_dict.get("research_program"),
         )
+
+    def get_llm_params(self) -> Dict[str, Any]:
+        """Extract LLM-related params as a dict for LLMClient."""
+        d = {}
+        if self.llm_endpoint:
+            d["llm_endpoint"] = self.llm_endpoint
+        if self.llm_model:
+            d["llm_model"] = self.llm_model
+        if self.llm_api_key:
+            d["llm_api_key"] = self.llm_api_key
+        if self.llm_temperature != 0.7:
+            d["llm_temperature"] = str(self.llm_temperature)
+        if self.llm_max_tokens != 4096:
+            d["llm_max_tokens"] = str(self.llm_max_tokens)
+        return d if d else None
 
 
 class BrainFactory:
@@ -216,6 +253,38 @@ class BrainFactory:
                 "epoch_multiplier": int(params.epoch_multiplier),
                 "early_stop_threshold": float(params.automl_early_stop_threshold),
                 "min_early_stop_epochs": int(params.automl_min_early_stop_epochs)
+            }
+        elif algo_lower in AlgorithmType.LLM:
+            brain_class = LLMBrain
+            kwargs = {
+                "context": context,
+                "state_store": state_store,
+                "network": network,
+                "parameters": parameters,
+                "llm_params": params.get_llm_params(),
+                "metric": metric,
+            }
+        elif algo_lower in AlgorithmType.HYBRID:
+            brain_class = HybridBrain
+            kwargs = {
+                "context": context,
+                "state_store": state_store,
+                "network": network,
+                "parameters": parameters,
+                "llm_params": params.get_llm_params(),
+                "metric": metric,
+            }
+        elif algo_lower in AlgorithmType.AUTORESEARCH:
+            brain_class = AutoresearchBrain
+            kwargs = {
+                "context": context,
+                "state_store": state_store,
+                "network": network,
+                "parameters": parameters,
+                "llm_params": params.get_llm_params(),
+                "metric": metric,
+                "max_experiments": int(params.automl_max_experiments),
+                "research_program": params.research_program,
             }
         else:
             raise ValueError(f"AutoML Algorithm {algorithm} is not valid")
