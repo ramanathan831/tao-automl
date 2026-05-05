@@ -1,0 +1,509 @@
+// =============================================================================
+// nvidia-tao-automl — Wheel-only release pipeline
+// =============================================================================
+// - Builds and publishes a pure-Python wheel (setuptools, py3-none-any)
+// - Patches `version = "..."` in pyproject.toml + `__version__` in
+//   src/tao_automl/__init__.py in lockstep.
+// - Patches the `nvidia-tao-sdk` runtime dependency in pyproject.toml to
+//   `nvidia-tao-sdk[all]==${params.TAO_SDK_VERSION}` so the published wheel
+//   pins to a specific (RC or final) SDK release with all platform extras
+//   (lepton, brev, docker, slurm, kubernetes) baked in.
+// - No Docker image build/push.
+// - SKIP_PROD_PROMOTE gates the final (non-RC) wheel publish.
+//
+// Notes:
+// - Build system is setuptools-via-pyproject.toml (no setup.py), so we use
+//   `python -m build --wheel` directly, NOT buildWheel().
+// - Build parameters (TAO_VERSION, TAO_SDK_VERSION, RC, FORCE_REBUILD,
+//   SKIP_PROD_PROMOTE, RELEASE_APPROVER) are configured via the Jenkins job
+//   UI, not declaratively in this file.
+//     * TAO_SDK_VERSION is the exact SDK wheel to pin against (e.g.
+//       `6.26.6rc1` or `6.26.6`). Required.
+// - Each agent relies on Jenkins's automatic `checkout scm` (job SCM is
+//   configured to track the release branch).
+// - The pinned `nvidia-tao-sdk` wheel is fetched from the TAO Artifactory
+//   PyPI repo (`sw-tao-pypi-local`, where tao-sdk's own release pipeline
+//   publishes). If the requested version isn't on Artifactory yet (e.g.
+//   when iterating on tao-automl ahead of an SDK publish), the install
+//   falls back to building from the tao-sdk GitLab repo's default-branch
+//   HEAD. Either way, the published tao-automl wheel still pins to
+//   `nvidia-tao-sdk[all]==${TAO_SDK_VERSION}` — that's the contract the
+//   param promises and what downstream installers will resolve.
+// =============================================================================
+
+@Library('tao-jenkins-shared-library') _
+import org.tao.TaoConfig
+import org.tao.PodTemplates
+
+// === CONFIGURATION ===
+TaoConfig.init([
+    projectName: 'nvidia-tao-automl',
+
+    ciAuthorName: 'TAO Release CI',
+    ciAuthorEmail: 'tao-ci-bot@nvidia.com',
+    podLabelPrefix: 'tao-automl-release',
+
+    registries: [
+        GITLAB: [
+            url: 'https://gitlab-master.nvidia.com',
+            connection: 'git-lab-master'
+        ],
+        ARTIFACTORY: [
+            url: 'https://artifactory.nvidia.com/artifactory/',
+            pypiRepo: 'sw-tao-pypi-local'
+        ]
+    ],
+
+    credentials: [
+        GITLAB_TOKEN: 'gitlab-api-token',
+        ARTIFACTORY: 'tao-artifactory-tkn-christwang',  // must have delete/overwrite permission
+        JENKINS_API_TOKEN: 'jenkins-api-token',
+    ],
+
+    images: [
+        // Pure-Python build host. requires-python>=3.10 in pyproject.toml.
+        BUILD_X86: 'python:3.12-slim',
+    ],
+
+    kubernetes: [
+        cloud: 'sc-ipp-blossom-prod',
+        imagePullSecrets: ['svc-tlt-ci-ngcimagepullsecret', 'gitlab-tao-imagepullsecret']
+    ],
+
+    gitlab: [
+        projectId: '264868'  // nvidia-tao-toolkit/tao-automl
+    ]
+])
+
+// === POD TEMPLATES ===
+PodTemplates.init([
+    imagePullSecrets: TaoConfig.kubernetes.imagePullSecrets,  // REQUIRED — NPE if omitted
+    containers: [
+        'checkout-container': [
+            image: 'alpine/git:latest',  // alpine + git preinstalled (needed by checkoutWithSafeDirectory)
+            command: ['cat'],
+            tty: true,
+            resources: [
+                requests: [cpu: '500m', memory: '512Mi'],
+                limits:   [cpu: '2',    memory: '2Gi']
+            ]
+        ],
+        'build-x86': [
+            image: TaoConfig.images.BUILD_X86,
+            command: ['cat'],
+            tty: true,
+            resources: [
+                requests: [cpu: '2', memory: '4Gi'],
+                limits:   [cpu: '8', memory: '16Gi']
+            ]
+        ],
+    ],
+    affinityPools: [
+        // CPU-only pool for both lightweight checkout and the wheel build pod.
+        'docker-only': [os: 'linux', arch: 'amd64'],
+    ]
+])
+
+// === STATE TRACKED ACROSS STAGES ===
+def TAO_VERSION_RESOLVED = ''
+def BUILD_TYPE = 'rc'
+def RC_VER = ''
+def FINAL_VER = ''
+def VER = ''
+def COMPONENT_NAME = 'nvidia-tao-automl'   // hyphenated TAO convention (publishWheel converts to underscores for filename matching)
+
+pipeline {
+    agent none
+    options {
+        timestamps()
+        ansiColor('xterm')
+        timeout(time: 60, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '50'))
+    }
+
+    stages {
+
+        // ---------------------------------------------------------------------
+        // 1. Preliminary: checkout + skip-build detection
+        // ---------------------------------------------------------------------
+        stage('checkout_and_detect_skip_build') {
+            agent {
+                kubernetes {
+                    cloud TaoConfig.kubernetes.cloud
+                    yaml PodTemplates.generate(containers: ['checkout-container'], affinityPool: 'docker-only')
+                }
+            }
+            stages {
+                stage('init_versions') {
+                    steps {
+                        container('checkout-container') {
+                            script {
+                                TAO_VERSION_RESOLVED = normalizeVersion(params.TAO_VERSION)
+
+                                def parts = TAO_VERSION_RESOLVED.split('\\.')
+                                def majorMinor = "${parts[0]}.${parts[1]}"
+                                def patch = parts[-1]
+
+                                // PEP 440: 6.26.3rc92 (no dot before rc)
+                                RC_VER = "${majorMinor}.${patch}${BUILD_TYPE}${BUILD_NUMBER}"
+                                FINAL_VER = TAO_VERSION_RESOLVED
+                                VER = params.RC ? RC_VER : FINAL_VER
+
+                                // Required: the nvidia-tao-sdk wheel to pin against.
+                                // Set via Jenkins UI parameter (e.g. '6.26.6rc1' or '6.26.6').
+                                if (!params.TAO_SDK_VERSION?.trim()) {
+                                    error "TAO_SDK_VERSION parameter is required (e.g. '6.26.6rc1' or '6.26.6'). Set it in the Jenkins job UI."
+                                }
+
+                                env.TAO_VERSION = TAO_VERSION_RESOLVED
+                                env.RC_VER = RC_VER
+                                env.FINAL_VER = FINAL_VER
+                                env.VER = VER
+                                env.TAO_SDK_VERSION = params.TAO_SDK_VERSION.trim()
+
+                                echo "=== Version plan ==="
+                                echo "TAO_VERSION:        ${TAO_VERSION_RESOLVED}"
+                                echo "RC build:           ${params.RC} (RC_VER=${RC_VER})"
+                                echo "FINAL_VER:          ${FINAL_VER}"
+                                echo "Active VER:         ${VER}"
+                                echo "TAO_SDK_VERSION:    ${env.TAO_SDK_VERSION} (pinned in published wheel as nvidia-tao-sdk[all]==${env.TAO_SDK_VERSION})"
+                                echo "SKIP_PROD_PROMOTE:  ${params.SKIP_PROD_PROMOTE}"
+                                echo "FORCE_REBUILD:      ${params.FORCE_REBUILD}"
+                            }
+                        }
+                    }
+                }
+
+                stage('checkout') {
+                    steps {
+                        container('checkout-container') {
+                            catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                                withGitLabStatus('checkout') {
+                                    checkoutWithSafeDirectory()
+                                    sh 'git rev-parse --short HEAD'
+                                }
+                            }
+                        }
+                    }
+                }
+
+                stage('detect_skip_build') {
+                    steps {
+                        container('checkout-container') {
+                            catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                                withGitLabStatus('detect_skip_build') {
+                                    script {
+                                        def skipResult = detectSkipBuild.checkAndSetEnv(
+                                            taoVersion: TAO_VERSION_RESOLVED,
+                                            isRC: params.RC,
+                                            forceRebuild: params.FORCE_REBUILD,
+                                            skipProdPromote: params.SKIP_PROD_PROMOTE
+                                        )
+                                        if (skipResult.shouldSkip) {
+                                            echo "⏭ Skipping build — reusing #${skipResult.previousBuildNumber}"
+                                            env.SKIP_BUILD = 'true'
+                                        } else {
+                                            echo "✓ Proceeding with full build"
+                                            env.SKIP_BUILD = 'false'
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // 2. Build & publish the wheel (CPU-only pod)
+        // ---------------------------------------------------------------------
+        stage('x86_build_and_publish_wheel') {
+            when { expression { env.SKIP_BUILD != 'true' } }
+            agent {
+                kubernetes {
+                    cloud TaoConfig.kubernetes.cloud
+                    yaml PodTemplates.generate(containers: ['build-x86'], affinityPool: 'docker-only')
+                }
+            }
+            stages {
+                stage('x86_checkout') {
+                    steps {
+                        catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                            withGitLabStatus('x86_checkout') {
+                                // Run on default jnlp container (has git); workspace volume is
+                                // shared with build-x86, so the checkout is visible there too.
+                                checkoutWithSafeDirectory()
+                            }
+                        }
+                    }
+                }
+
+                stage('x86_setup') {
+                    steps {
+                        container('build-x86') {
+                            script {
+                                env.COMMAND_ENV_X86 = ''
+                                // python:3.12-slim ships without wget/gpg/curl/git. publishWheel()
+                                // installs the JFrog `jf` CLI via apt (needs wget+gpg). git is
+                                // required for the tao-sdk git-HEAD fallback path in
+                                // x86_dependency_install when the pinned SDK wheel isn't on
+                                // Artifactory yet.
+                                sh '''
+                                    apt-get update
+                                    apt-get install -y --no-install-recommends \
+                                        wget gnupg ca-certificates curl git
+                                    rm -rf /var/lib/apt/lists/*
+
+                                    python -m pip install --upgrade pip
+                                    pip install build
+                                    python --version
+                                    pip --version
+                                '''
+                            }
+                        }
+                    }
+                }
+
+                stage('x86_dependency_install') {
+                    steps {
+                        container('build-x86') {
+                            catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                                withGitLabStatus('x86_dependency_install') {
+                                    // Resolve nvidia-tao-sdk[all] in two phases:
+                                    //
+                                    //   Phase 1 — try the pinned wheel from the TAO Artifactory
+                                    //     PyPI repo (sw-tao-pypi-local, where tao-sdk's release
+                                    //     pipeline publishes). Normal case once the SDK release
+                                    //     for ${TAO_SDK_VERSION} has gone through.
+                                    //
+                                    //   Phase 2 (fallback) — if the pinned wheel isn't on
+                                    //     Artifactory yet, install nvidia-tao-sdk[all] straight
+                                    //     from the tao-sdk GitLab repo's default-branch HEAD so
+                                    //     this build can still proceed.
+                                    //
+                                    // Regardless of which phase wins, the workspace's
+                                    // pyproject.toml is left pinned to
+                                    // `nvidia-tao-sdk[all]==${TAO_SDK_VERSION}` — that's what the
+                                    // downstream-facing wheels built in later stages will declare,
+                                    // honoring the param contract.
+                                    //
+                                    // Subsequent stages re-patch only the `version = "..."` line,
+                                    // leaving the SDK pin intact.
+                                    withCredentials([
+                                        usernamePassword(credentialsId: TaoConfig.credentials.ARTIFACTORY,
+                                                         usernameVariable: 'ARTIFACTORY_USER',
+                                                         passwordVariable: 'ARTIFACTORY_TOKEN'),
+                                        string(credentialsId: TaoConfig.credentials.GITLAB_TOKEN,
+                                               variable: 'GITLAB_TOKEN')
+                                    ]) {
+                                        sh '''
+                                            set -e
+
+                                            ARTIFACTORY_INDEX="https://${ARTIFACTORY_USER}:${ARTIFACTORY_TOKEN}@artifactory.nvidia.com/artifactory/api/pypi/sw-tao-pypi-local/simple"
+                                            echo "Artifactory PyPI index: https://****@artifactory.nvidia.com/artifactory/api/pypi/sw-tao-pypi-local/simple"
+
+                                            # Patch pyproject.toml to the pinned PyPI form. This is
+                                            # both the install requirement for Phase 1 and the
+                                            # final state we want for the wheel build.
+                                            sed -i \
+                                                "s|\\"nvidia-tao-sdk[^\\"]*\\"|\\"nvidia-tao-sdk[all]==${TAO_SDK_VERSION}\\"|" \
+                                                pyproject.toml
+                                            grep nvidia-tao-sdk pyproject.toml
+
+                                            # Phase 1: install with pinned dep from Artifactory.
+                                            if pip install -e ".[dev]" --extra-index-url "${ARTIFACTORY_INDEX}"; then
+                                                echo "✓ Installed nvidia-tao-sdk[all]==${TAO_SDK_VERSION} from Artifactory"
+                                            else
+                                                echo "⚠ nvidia-tao-sdk[all]==${TAO_SDK_VERSION} not found on Artifactory; falling back to tao-sdk git default-branch HEAD"
+
+                                                # Temporarily swap the pinned dep for the git+https
+                                                # form (with [all] extras) so pip can clone tao-sdk
+                                                # at default HEAD.
+                                                sed -i \
+                                                    "s|\\"nvidia-tao-sdk[^\\"]*\\"|\\"nvidia-tao-sdk[all] @ git+https://gitlab-master.nvidia.com/nvidia-tao-toolkit/tao-sdk.git\\"|" \
+                                                    pyproject.toml
+
+                                                # Inject the GitLab token for the implicit clone.
+                                                git config --global \
+                                                    url."https://oauth2:${GITLAB_TOKEN}@gitlab-master.nvidia.com/".insteadOf \
+                                                    "https://gitlab-master.nvidia.com/"
+
+                                                pip install -e ".[dev]"
+
+                                                # Restore the pinned form so the wheels built in
+                                                # later stages still declare ==${TAO_SDK_VERSION}.
+                                                sed -i \
+                                                    "s|\\"nvidia-tao-sdk[^\\"]*\\"|\\"nvidia-tao-sdk[all]==${TAO_SDK_VERSION}\\"|" \
+                                                    pyproject.toml
+                                                grep nvidia-tao-sdk pyproject.toml
+                                                echo "✓ Installed nvidia-tao-sdk[all] from tao-sdk git HEAD; pyproject.toml re-pinned to ==${TAO_SDK_VERSION} for wheel build"
+                                            fi
+                                        '''
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                stage('x86_functional_tests') {
+                    when { expression { params.RC } }
+                    steps {
+                        container('build-x86') {
+                            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                                withGitLabStatus('x86_functional_tests') {
+                                    sh 'pytest tests/ -v'
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // -------------------------------------------------------------
+                // RC wheel: only when params.RC is true
+                // -------------------------------------------------------------
+                stage('x86_rc_wheel_publish') {
+                    when { expression { params.RC } }
+                    steps {
+                        container('build-x86') {
+                            catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                                withGitLabStatus('x86_rc_wheel_publish') {
+                                    script {
+                                        sh "rm -rf dist/*.whl || true"
+
+                                        // Patch version → RC_VER in pyproject.toml + __init__.py
+                                        sh """
+                                            sed -i 's/^version = \\".*\\"/version = \\"${RC_VER}\\"/' pyproject.toml
+                                            sed -i 's/__version__ = \\".*\\"/__version__ = \\"${RC_VER}\\"/' src/tao_automl/__init__.py
+                                            grep '^version' pyproject.toml
+                                            grep '__version__' src/tao_automl/__init__.py
+                                            python -m build --wheel
+                                            ls -la dist/
+                                        """
+
+                                        def rcResult = publishWheel(
+                                            version: RC_VER,
+                                            componentName: COMPONENT_NAME,
+                                            releaseApprover: params.RELEASE_APPROVER,
+                                            overwrite: true
+                                        )
+                                        env.RC_WHEEL_INSTALL_LOC = rcResult.wheelInstallLocation
+                                        env.PYTHON_VERSION = sh(
+                                            script: "python -c 'import platform; print(platform.python_version())'",
+                                            returnStdout: true
+                                        ).trim()
+                                        echo "✓ RC wheel published: ${RC_VER}"
+                                        echo "  Install location: ${env.RC_WHEEL_INSTALL_LOC}"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // -------------------------------------------------------------
+                // Final wheel: only when SKIP_PROD_PROMOTE is false
+                // (publishes the non-RC version regardless of params.RC)
+                // -------------------------------------------------------------
+                stage('x86_final_wheel_publish') {
+                    when { expression { !params.SKIP_PROD_PROMOTE } }
+                    steps {
+                        container('build-x86') {
+                            catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                                withGitLabStatus('x86_final_wheel_publish') {
+                                    script {
+                                        sh "rm -rf dist/*.whl || true"
+
+                                        // Re-patch to FINAL_VER and rebuild
+                                        sh """
+                                            sed -i 's/^version = \\".*\\"/version = \\"${FINAL_VER}\\"/' pyproject.toml
+                                            sed -i 's/__version__ = \\".*\\"/__version__ = \\"${FINAL_VER}\\"/' src/tao_automl/__init__.py
+                                            grep '^version' pyproject.toml
+                                            grep '__version__' src/tao_automl/__init__.py
+                                            python -m build --wheel
+                                            ls -la dist/
+                                        """
+
+                                        def finalResult = publishWheel(
+                                            version: FINAL_VER,
+                                            componentName: COMPONENT_NAME,
+                                            releaseApprover: params.RELEASE_APPROVER,
+                                            overwrite: true
+                                        )
+                                        env.FINAL_WHEEL_INSTALL_LOC = finalResult.wheelInstallLocation
+                                        env.PYTHON_VERSION = env.PYTHON_VERSION ?: sh(
+                                            script: "python -c 'import platform; print(platform.python_version())'",
+                                            returnStdout: true
+                                        ).trim()
+                                        echo "✓ Final wheel published: ${FINAL_VER}"
+                                        echo "  Install location: ${env.FINAL_WHEEL_INSTALL_LOC}"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // 3. Consolidate & archive metadata
+        // ---------------------------------------------------------------------
+        stage('consolidate_and_archive') {
+            when { expression { env.SKIP_BUILD != 'true' } }
+            agent {
+                kubernetes {
+                    cloud TaoConfig.kubernetes.cloud
+                    yaml PodTemplates.generate(containers: ['checkout-container'], affinityPool: 'docker-only')
+                }
+            }
+            stages {
+                stage('archive_checkout') {
+                    steps {
+                        container('checkout-container') {
+                            catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                                withGitLabStatus('archive_checkout') {
+                                    checkoutWithSafeDirectory()
+                                }
+                            }
+                        }
+                    }
+                }
+
+                stage('archive_metadata') {
+                    steps {
+                        container('checkout-container') {
+                            catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                                withGitLabStatus('archive_metadata') {
+                                    script {
+                                        archiveReleaseMetadata(
+                                            taoVersion: TAO_VERSION_RESOLVED,
+                                            wheelVersion: VER,
+                                            isRC: params.RC,
+                                            forceRebuild: params.FORCE_REBUILD,
+                                            skipProdPromote: params.SKIP_PROD_PROMOTE,
+                                            componentName: COMPONENT_NAME,
+                                            wheelInstallLocation: env.RC_WHEEL_INSTALL_LOC ?: '',
+                                            finalWheelInstallLocation: env.FINAL_WHEEL_INSTALL_LOC ?: '',
+                                            pythonVersion: env.PYTHON_VERSION ?: 'unknown'
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "✓ nvidia-tao-automl release pipeline completed successfully"
+        }
+        failure {
+            echo "✗ nvidia-tao-automl release pipeline failed"
+        }
+    }
+}
