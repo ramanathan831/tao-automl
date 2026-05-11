@@ -12,22 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""AutoML runner: wires the tao_automl brain to tao_sdk execution.
+"""AutoML runner: wires the tao_automl brain to a platform SDK for HPO.
 
-The runner is platform-agnostic — it has no knowledge of which backend
-(Lepton, Slurm, K8s) the SDK is connected to. Platform selection and
-resource allocation are handled entirely by the SDK.
+The runner is platform-agnostic: it accepts any of the 5 platform SDKs
+(Lepton/Slurm/Kubernetes/Docker/Brev). The caller picks the platform; the
+runner doesn't choose for them.
 
 Usage::
 
-    from tao_sdk import TaoExecutionSDK
+    from pathlib import Path
+    from tao_sdk.platforms.lepton import LeptonSDK   # or Slurm/K8s/Docker/Brev
     from tao_automl.runner import AutoMLRunner
 
-    sdk = TaoExecutionSDK(creds_file="secrets.json")  # SDK knows the platform
-    runner = AutoMLRunner(sdk)
+    sdk = LeptonSDK()                                 # reads creds from env
+    runner = AutoMLRunner(
+        sdk=sdk,
+        skill_dir=Path.home() / "tao-sdk/tao-skills-external/models/cosmos-rl",
+        action="train",
+    )
     result = runner.run(
-        network_arch="cosmos-rl",
-        train_dataset_uri="aws://bucket/data/subset",
+        train_dataset_uri="s3://bucket/data/subset",
         automl_settings={
             "algorithm": "bayesian",
             "metric": "loss",
@@ -38,9 +42,11 @@ Usage::
 
 Or execute a plan file::
 
-    python -m tao_automl.runner automl_plan.json secrets.json
+    python -m tao_automl.runner automl_plan.json --platform lepton
 """
 
+import argparse
+import copy
 import json
 import logging
 import os
@@ -49,9 +55,72 @@ import signal
 import sys
 import time
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import yaml
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# SkillContext — replaces the deleted SkillBank. Reads skill_info.yaml and
+# spec_template_<action>.yaml directly from the skill bank dir, the same way
+# agent launch scripts do per platform/tao-sdk/SKILL.md's "Constructing the
+# spec / args" guidance.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SkillContext:
+    """Resolved skill metadata for a single (skill, action) pair.
+
+    The runner used to call ``SkillBank.get_model_config(network_arch)`` and
+    ``SkillBank.get_default_specs(network_arch, action)`` — both methods are
+    gone. This class replaces both by loading directly from the skill bank
+    layout that's documented and validated by tao-skills-external/scripts/
+    validate-skills.sh.
+    """
+    skill_dir: Path
+    action: str
+    skill_info: dict[str, Any] = field(init=False)
+    action_cfg: dict[str, Any] = field(init=False)
+    default_specs: dict[str, Any] = field(init=False)
+    container_image: str = field(init=False)
+    network_arch: str = field(init=False)
+
+    def __post_init__(self):
+        self.skill_dir = Path(self.skill_dir)
+        info_path = self.skill_dir / "references/skill_info.yaml"
+        if not info_path.exists():
+            raise FileNotFoundError(
+                f"skill_info.yaml not found at {info_path}. "
+                f"skill_dir must point at a model directory inside "
+                f"tao-skills-external/models/<name>/."
+            )
+        self.skill_info = yaml.safe_load(info_path.read_text()) or {}
+
+        actions = self.skill_info.get("actions") or {}
+        if self.action not in actions:
+            raise KeyError(
+                f"Action {self.action!r} not declared in {info_path}. "
+                f"Available: {sorted(actions.keys())}"
+            )
+        self.action_cfg = actions[self.action]
+        self.network_arch = self.skill_info.get("network_arch", self.skill_dir.name)
+
+        template_path = self.skill_dir / f"references/spec_template_{self.action}.yaml"
+        self.default_specs = (
+            yaml.safe_load(template_path.read_text()) if template_path.exists() else {}
+        ) or {}
+
+        # Container image: accept either a versions.yaml key or an absolute URI.
+        from tao_sdk.versions import resolve_container_image
+        self.container_image = resolve_container_image(
+            self.skill_info.get("container_image", "")
+        )
 
 _DEFAULT_POLL_INTERVAL = 30
 _TERMINAL_STATUSES = {"Complete", "Error", "Canceled"}
@@ -259,32 +328,44 @@ def _load_active_jobs(workspace_path: str) -> list:
 
 
 class AutoMLRunner:
-    """Wires AutoML brain to SDK execution for automated HPO loops."""
+    """Wires AutoML brain to SDK execution for automated HPO loops.
 
-    def __init__(self, sdk, poll_interval: int = _DEFAULT_POLL_INTERVAL):
+    The runner accepts any of the 5 platform SDKs (LeptonSDK / SlurmSDK /
+    KubernetesSDK / DockerSDK / BrevSDK). It does NOT pick a platform for
+    the caller — instantiate the SDK you want and pass it in.
+
+    ``skill_dir`` is the absolute path to a model directory inside the
+    skill bank (e.g. ``Path.home() / 'tao-sdk/tao-skills-external/models/dino'``).
+    The runner reads ``references/skill_info.yaml`` and
+    ``references/spec_template_<action>.yaml`` from there.
+    """
+
+    def __init__(self, sdk, skill_dir, action: str = "train",
+                 poll_interval: int = _DEFAULT_POLL_INTERVAL):
         self._sdk = sdk
+        self.skill_ctx = SkillContext(skill_dir=Path(skill_dir), action=action)
         self._poll_interval = poll_interval
         self._active_jobs = {}
 
-    def run(self, network_arch, train_dataset_uri, eval_dataset_uri="",
+    def run(self, train_dataset_uri, eval_dataset_uri="",
             base_checkpoint="", workspace_id=None, image=None,
             automl_settings=None,
             automl_hyperparameters=None, custom_param_ranges=None,
             workspace_path="./automl_workspace",
             spec_overrides=None, resume=False,
-            backend_details=None,
             metric_extractor=None,
             eval_fn=None,
-            on_recommendation=None, on_result=None) -> dict:
+            on_recommendation=None, on_result=None,
+            **platform_kwargs) -> dict:
         """Run a full AutoML optimization loop.
 
         Args:
-            network_arch: Model name (e.g. "cosmos-rl", "dino").
-            train_dataset_uri: Training dataset URI (e.g. "aws://bucket/data").
+            train_dataset_uri: Training dataset URI (e.g. "s3://bucket/data").
             eval_dataset_uri: Eval dataset URI (optional).
             base_checkpoint: Pretrained checkpoint URI (optional).
             workspace_id: Workspace ID (default: from SDK).
-            image: Docker image override. Default: from skill config.
+            image: Docker image override. Default: from skill_info.yaml's
+                ``container_image`` (resolved via tao_sdk.versions).
             automl_settings: Algorithm config (see AlgorithmParams).
             automl_hyperparameters: Param names to search, or None for schema defaults.
             custom_param_ranges: Per-param range overrides.
@@ -293,8 +374,14 @@ class AutoMLRunner:
                 AutoML starts. Dotted keys supported (e.g.
                 {"train.epoch": 5, "policy.model_max_length": 40960}).
             resume: If True, resume from persisted state in workspace_path.
-            backend_details: Dict with 'backend_type', 'resource_shape',
-                'dedicated_node_group', 'num_gpus', etc. Passed to sdk.create_job.
+            **platform_kwargs: Forwarded to ``sdk.create_job(...)``. Pass
+                whichever kwargs your platform SDK accepts (Lepton:
+                ``dedicated_node_group``, ``resource_shape``, ``num_nodes``;
+                SLURM: ``partition``, ``account``, ``num_nodes``;
+                Kubernetes: ``namespace``, ``node_selector``, ``num_nodes``;
+                Docker: ``mounts``; Brev: ``instance_id``, ``gpu_type``).
+                Plus the platform-agnostic ``gpu_count`` (defaults to 1 if
+                not specified).
             metric_extractor: Optional callable ``(logs: str, metric_name: str) -> float | None``
                 invoked on each poll of a rec's training logs to pull the
                 current/latest metric value. Return ``None`` if the metric
@@ -331,10 +418,10 @@ class AutoMLRunner:
             Dict with keys: best, progress, history.
         """
         from tao_automl import AutoML
-        from tao_sdk.planner import SkillBank
 
         automl_settings = automl_settings or {"algorithm": "bayesian", "metric": "loss"}
-        workspace_id = workspace_id or self._sdk._workspace_id
+        workspace_id = workspace_id or getattr(self._sdk, "_workspace_id", "")
+        network_arch = self.skill_ctx.network_arch
 
         if not resume:
             ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -342,62 +429,28 @@ class AutoMLRunner:
         os.makedirs(workspace_path, exist_ok=True)
         logger.info("Workspace: %s", workspace_path)
 
-        # Load network knowledge from the skill bank. Set TAO_SKILL_BANK_PATH
-        # to point at tao-skills-external (or a submodule). Everything below
-        # is driven by skill config — no per-network special cases here.
-        skill_bank = SkillBank()
-        model_config = skill_bank.get_model_config(network_arch)
-        if not model_config:
-            raise ValueError(
-                f"No skill config found for '{network_arch}'. "
-                f"Set TAO_SKILL_BANK_PATH or install a skill bank."
-            )
-        base_specs = skill_bank.get_default_specs(network_arch, "train")
-        if base_specs is None:
-            raise ValueError(f"No default train specs found for '{network_arch}'.")
+        # Skill metadata is loaded once at __init__ via SkillContext (replaces
+        # the deleted SkillBank). action_cfg carries command/inputs/outputs/
+        # config_format/upload_excludes — exactly what build_entrypoint takes.
+        base_specs = copy.deepcopy(self.skill_ctx.default_specs)
+        resolved_image = image or self.skill_ctx.container_image
+        action_cfg = self.skill_ctx.action_cfg
+        data_format = self.skill_ctx.skill_info.get("data_format")
 
-        resolved_image = image or model_config.get("container_image")
-        script_runner = model_config.get("actions", {}).get("train")
-        data_format = model_config.get("data_format")
-
-        # Skills that declare tarball packing (e.g. path_from_format lists
-        # "videos.tar.gz" / "images.tar.gz") ship datasets packed; the
-        # script_runner only downloads, so we prepend an extraction step.
-        # --strip-components=1 drops the tarball's top-level dir so extracted
-        # files land where annotations reference them.
-        if script_runner and self._skill_has_tarball_media(model_config):
-            # The SDK entrypoint wraps this command in single quotes when
-            # shelling out, so we avoid any single-quote characters here.
-            # When no .tao_extracted marker is present we force-clean any
-            # prior partial extraction (wipes subdirs; keeps the tarball and
-            # annotation file) before re-extracting with --overwrite. This
-            # recovers from interrupted/raced extractions.
-            extract_cmd = (
-                "echo [runner] extracting tarball media if present; "
-                "find /mnt/lustre /results -type f "
-                "\\( -name videos.tar.gz -o -name images.tar.gz \\) "
-                "2>/dev/null | while read f; do "
-                "d=\"$(dirname \"$f\")\"; "
-                "marker=\"$d/.tao_extracted\"; "
-                "if [ -f \"$marker\" ]; then echo [runner] already extracted \"$f\"; continue; fi; "
-                "echo [runner] cleaning stale subdirs under \"$d\"; "
-                "find \"$d\" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {{}} + 2>/dev/null; "
-                "echo [runner] tar -xzf \"$f\"; "
-                "tar --overwrite -xzf \"$f\" -C \"$d\" "
-                "--strip-components=1 && touch \"$marker\"; done; "
-                # Rewrite config file: /.../videos.tar.gz → /.../ (parent dir).
-                # Runs whether or not extraction found anything (no-op if not).
-                "sed -i -e \"s|/videos\\.tar\\.gz|/|g\" "
-                "-e \"s|/images\\.tar\\.gz|/|g\" {config_path}; "
-            )
-            script_runner = dict(script_runner)
-            script_runner["command"] = extract_cmd + script_runner["command"]
+        # Tar-extraction note: the in-container script_runner now handles
+        # tar/tar.gz extraction inline (commit 661040b on tao-sdk main:
+        # "Port tar/tar.gz extraction into script_runner"). We no longer
+        # need to prepend an extract_cmd to the action command — the runner
+        # detects archive inputs and extracts them as part of input download.
+        # The old AutoML extract_cmd is gone; if a future skill's media
+        # layout breaks this assumption, fix it in script_runner, not here.
 
         # Inject dataset URIs declared by the skill's data_sources config.
         # Generic over any skill: maps spec keys to train/eval URIs using the
         # skill's own rules (source, path template, path_from_format).
         self._apply_data_sources(
-            model_config=model_config, specs=base_specs, action="train",
+            skill_info=self.skill_ctx.skill_info, specs=base_specs,
+            action=self.skill_ctx.action,
             train_dataset_uri=train_dataset_uri,
             eval_dataset_uri=eval_dataset_uri,
             data_format=data_format,
@@ -461,27 +514,17 @@ class AutoMLRunner:
                 logger.info("Recommendation %d: launching job with %d spec overrides",
                             rec.id, len(rec.specs))
                 merged_specs = self._merge_specs(base_specs, rec.specs)
-                # Pre-generate a job UUID and rewrite any non-remote declared
-                # output spec values to s3://<bucket>/results/<uuid>/<key> so
-                # the script_runner uploads checkpoints/artifacts to S3.
-                pre_job_id = str(uuid.uuid4())
-                self._apply_output_destinations(
-                    script_runner=script_runner, specs=merged_specs,
-                    bucket=self._sdk._creds.get("S3_BUCKET_NAME", ""),
-                    job_id=pre_job_id,
-                )
+                # Output destination is resolved at runtime by script_runner
+                # from TAO_RESULTS_ROOT (mount) / S3_BUCKET_NAME (cloud) env
+                # vars the SDK injects. The agent doesn't pre-rewrite spec
+                # output keys here — that lived in the deleted SDK contract.
                 metric_value, status = self._run_one_job(
-                    network_arch=network_arch, workspace_id=workspace_id,
-                    train_dataset_uri=train_dataset_uri,
-                    eval_dataset_uri=eval_dataset_uri,
-                    base_checkpoint=base_checkpoint, image=resolved_image,
-                    script_runner=script_runner, data_format=data_format,
-                    backend_details=backend_details,
+                    image=resolved_image, action_cfg=action_cfg,
                     specs=merged_specs, rec=rec, metric_name=metric_name,
-                    pre_job_id=pre_job_id,
                     metric_extractor=metric_extractor,
                     eval_fn=eval_fn,
                     workspace_path=workspace_path,
+                    platform_kwargs=platform_kwargs,
                 )
                 # Report to the brain, inverting if explicit direction disagrees
                 # with the brain's implicit metric-name rule.
@@ -525,26 +568,34 @@ class AutoMLRunner:
                      best.id if best else "N/A")
         return result
 
-    def _run_one_job(self, network_arch, workspace_id, train_dataset_uri,
-                     eval_dataset_uri, base_checkpoint, image,
-                     script_runner, data_format, backend_details,
-                     specs, rec, metric_name,
-                     pre_job_id=None,
+    def _run_one_job(self, image, action_cfg, specs, rec, metric_name,
                      metric_extractor=None,
                      eval_fn=None,
-                     workspace_path=None) -> tuple[float | None, str]:
-        """Launch a single training job and wait for it to finish."""
+                     workspace_path=None,
+                     platform_kwargs=None) -> tuple[float | None, str]:
+        """Launch a single training job and wait for it to finish.
+
+        Builds a container command via ``tao_sdk.script_runner.build_entrypoint``
+        (inlines the in-container runner heredoc) and submits via the platform
+        SDK's ``create_job(image, command, **platform_kwargs)``. Output
+        destinations are resolved at runtime in the container from
+        ``TAO_RESULTS_ROOT`` / ``S3_BUCKET_NAME`` env vars the SDK injects.
+        """
+        from tao_sdk.script_runner import build_entrypoint
+
         try:
+            ep = build_entrypoint(
+                command=action_cfg["command"],
+                specs=specs,
+                inputs=action_cfg.get("inputs"),
+                outputs=action_cfg.get("outputs"),
+                config_format=action_cfg.get("config_format", "toml"),
+                upload_excludes=action_cfg.get("upload_excludes", []),
+            )
             job = self._sdk.create_job(
-                network_arch=network_arch, workspace_id=workspace_id,
-                train_dataset_uri=train_dataset_uri,
-                eval_dataset_uri=eval_dataset_uri,
-                base_checkpoint=base_checkpoint, action="train",
-                specs=specs, image=image,
-                script_runner=script_runner,
-                data_format=data_format,
-                backend_details=backend_details,
-                job_id=pre_job_id,
+                image=image,
+                command=ep["command"],
+                **(platform_kwargs or {}),
             )
         except Exception as e:
             logger.error("Failed to create job for rec %d: %s", rec.id, e)
@@ -552,10 +603,11 @@ class AutoMLRunner:
 
         rec.assign_job_id(job.id)
         self._active_jobs[rec.id] = job.id
-        # fix #3: persist in-flight state so a resume can recover it.
+        # Persist in-flight state so a resume can recover it.
         if workspace_path:
             self._persist_active_jobs(workspace_path)
-        logger.info("Rec %d: job %s submitted (backend: %s)", rec.id, job.id, job.backend_job_id)
+        logger.info("Rec %d: job %s submitted (backend: %s)",
+                    rec.id, job.id, getattr(job, "backend_job_id", job.id))
 
         # Caller can plug in a custom extractor; fall back to the built-in.
         extract_fn = metric_extractor or _extract_metric_from_logs
@@ -779,22 +831,10 @@ class AutoMLRunner:
                     rec_id, report_status,
                     f"{metric_value:.6f}" if metric_value is not None else "None")
 
-    @staticmethod
-    def _skill_has_tarball_media(model_config: dict) -> bool:
-        """True if any data_sources entry declares a *.tar.gz suffix."""
-        for action_rules in model_config.get("data_sources", {}).values():
-            if not isinstance(action_rules, dict):
-                continue
-            for rule in action_rules.values():
-                pff = rule.get("path_from_format") if isinstance(rule, dict) else None
-                if not pff:
-                    continue
-                for val in pff.values():
-                    candidates = val if isinstance(val, list) else [val]
-                    if any(isinstance(c, str) and c.endswith(".tar.gz")
-                           for c in candidates):
-                        return True
-        return False
+    # _skill_has_tarball_media was removed: tar/tar.gz extraction is now
+    # handled by script_runner inline (tao-sdk commit 661040b "Port tar/tar.gz
+    # extraction into script_runner"). The runner no longer prepends an
+    # extract command, so the tarball-detection helper has no callers.
 
     @staticmethod
     def _set_nested(target: dict, dotted_key: str, value) -> None:
@@ -818,32 +858,17 @@ class AutoMLRunner:
             cursor = cursor[part]
         return cursor
 
-    @staticmethod
-    def _apply_output_destinations(script_runner, specs, bucket, job_id):
-        """For each declared output spec key that isn't already remote,
-        point it at s3://<bucket>/results/<job_id>/<key_sanitized> so the
-        script_runner uploads it to S3 instead of dropping it on container
-        ephemeral disk.
-        """
-        if not script_runner or not bucket:
-            return
-        outputs = script_runner.get("outputs") or {}
-        if isinstance(outputs, list):
-            outputs = {k: {} for k in outputs}
-        for spec_key in outputs.keys():
-            current = AutoMLRunner._get_nested(specs, spec_key)
-            if isinstance(current, str) and "://" in current:
-                continue  # already remote
-            safe = spec_key.replace(".", "_")
-            remote_uri = f"s3://{bucket}/results/{job_id}/{safe}"
-            AutoMLRunner._set_nested(specs, spec_key, remote_uri)
+    # _apply_output_destinations was removed: output destinations are
+    # resolved at runtime by script_runner from TAO_RESULTS_ROOT (mount) /
+    # S3_BUCKET_NAME (cloud) env vars the SDK injects in create_job. The
+    # runner doesn't pre-rewrite output spec keys here anymore.
 
     @staticmethod
-    def _apply_data_sources(model_config, specs, action,
+    def _apply_data_sources(skill_info, specs, action,
                             train_dataset_uri, eval_dataset_uri, data_format):
         """Resolve skill's data_sources[action] into concrete URIs on specs.
 
-        The skill declares per-spec-key rules:
+        The skill declares per-spec-key rules in ``skill_info.yaml``:
           source:     "train_datasets" | "eval_dataset"
           path:       template (e.g. "{train_dataset_annotation}") — substituted
                       from top-level scalar values in *specs*.
@@ -851,7 +876,7 @@ class AutoMLRunner:
                       a list collapses to the folder URI (script_runner then
                       downloads the full prefix).
         """
-        data_sources = model_config.get("data_sources", {}).get(action, {})
+        data_sources = skill_info.get("data_sources", {}).get(action, {})
         if not data_sources:
             return
 
@@ -913,8 +938,43 @@ class AutoMLRunner:
         return merged
 
 
-def run_automl_plan(plan: dict, creds_file: str = None) -> dict:
-    """Execute an AutoML plan file."""
+_PLATFORMS = ("lepton", "slurm", "kubernetes", "docker", "brev")
+
+
+def _make_sdk(platform: str):
+    """Construct a platform SDK by name. No default — caller must pick.
+
+    Matches platform/tao-sdk/SKILL.md's "It does not select platforms
+    automatically" stance: none of the 5 SDKs is a sensible default
+    (Lepton biases DGX Cloud, SLURM biases on-prem clusters, etc.).
+    """
+    if platform == "lepton":
+        from tao_sdk.platforms.lepton import LeptonSDK
+        return LeptonSDK()
+    if platform == "slurm":
+        from tao_sdk.platforms.slurm import SlurmSDK
+        return SlurmSDK()
+    if platform == "kubernetes":
+        from tao_sdk.platforms.kubernetes import KubernetesSDK
+        return KubernetesSDK()
+    if platform == "docker":
+        from tao_sdk.platforms.docker import DockerSDK
+        return DockerSDK()
+    if platform == "brev":
+        from tao_sdk.platforms.brev import BrevSDK
+        return BrevSDK()
+    raise ValueError(
+        f"Unknown platform {platform!r}. Choose one of: {', '.join(_PLATFORMS)}."
+    )
+
+
+def run_automl_plan(plan: dict, platform: str) -> dict:
+    """Execute an AutoML plan file on the chosen platform.
+
+    The plan JSON's ``params`` block must include ``skill_dir`` (absolute
+    path to a model directory inside tao-skills-external). Per-platform
+    create_job kwargs go under ``params.platform_kwargs``.
+    """
     if not plan.get("ready"):
         issues = plan.get("blocking_issues", ["Unknown issue"])
         print("Plan is not ready to execute:")
@@ -926,11 +986,18 @@ def run_automl_plan(plan: dict, creds_file: str = None) -> dict:
     params = step["params"]
     automl_settings = plan.get("automl_settings", {})
 
-    from tao_sdk.sdk import TaoExecutionSDK
-    sdk = TaoExecutionSDK(creds_file=creds_file)
-    runner = AutoMLRunner(sdk)
+    skill_dir = params.get("skill_dir")
+    if not skill_dir:
+        raise ValueError("plan.steps[0].params.skill_dir is required "
+                         "(absolute path to a model dir in tao-skills-external).")
+    action = params.get("action", "train")
+    platform_kwargs = params.get("platform_kwargs") or {}
+
+    sdk = _make_sdk(platform)
+    runner = AutoMLRunner(sdk=sdk, skill_dir=skill_dir, action=action)
+    global _runner
+    _runner = runner
     result = runner.run(
-        network_arch=params["network_arch"],
         train_dataset_uri=params["train_dataset_uri"],
         eval_dataset_uri=params.get("eval_dataset_uri", ""),
         base_checkpoint=params.get("base_checkpoint", ""),
@@ -940,7 +1007,8 @@ def run_automl_plan(plan: dict, creds_file: str = None) -> dict:
         automl_hyperparameters=plan.get("automl_hyperparameters"),
         custom_param_ranges=plan.get("custom_param_ranges"),
         workspace_path=plan.get("automl_workspace_path", "./automl_workspace"),
-        backend_details=params.get("backend_details"),
+        spec_overrides=params.get("spec_overrides"),
+        **platform_kwargs,
     )
     print(json.dumps(result, indent=2, default=str))
     return result
@@ -962,20 +1030,22 @@ signal.signal(signal.SIGINT, _signal_handler)
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python -m tao_automl.runner automl_plan.json [secrets.json]")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="Execute an AutoML plan against a chosen platform SDK.",
+    )
+    parser.add_argument("plan", help="Path to the AutoML plan JSON.")
+    parser.add_argument(
+        "--platform", required=True, choices=_PLATFORMS,
+        help="Target platform SDK. Required — no default. "
+             "Pick the backend you want to submit jobs to.",
+    )
+    args = parser.parse_args()
+
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    plan_path = sys.argv[1]
-    creds_file = sys.argv[2] if len(sys.argv) > 2 else None
-    with open(plan_path) as f:
+    with open(args.plan) as f:
         plan = json.load(f)
-    global _runner
-    from tao_sdk.sdk import TaoExecutionSDK
-    sdk = TaoExecutionSDK(creds_file=creds_file)
-    _runner = AutoMLRunner(sdk)
-    run_automl_plan(plan, creds_file)
+    run_automl_plan(plan, platform=args.platform)
 
 
 if __name__ == "__main__":
