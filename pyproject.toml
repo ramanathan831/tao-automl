@@ -16,10 +16,20 @@ dependencies = [
     "pandas",
     "omegaconf",
     "requests",
+    "PyYAML>=6.0",
     "nvidia-tao-sdk @ git+https://gitlab-master.nvidia.com/nvidia-tao-toolkit/tao-sdk.git",
 ]
 
 [project.optional-dependencies]
+# Platform extras — match the SDK's extras pattern. Users install only the
+# platform handler they need: pip install 'nvidia-tao-automl[lepton]' pulls
+# nvidia-tao-sdk[lepton] transitively.
+lepton     = ["nvidia-tao-sdk[lepton] @ git+https://gitlab-master.nvidia.com/nvidia-tao-toolkit/tao-sdk.git"]
+slurm      = ["nvidia-tao-sdk[slurm] @ git+https://gitlab-master.nvidia.com/nvidia-tao-toolkit/tao-sdk.git"]
+kubernetes = ["nvidia-tao-sdk[kubernetes] @ git+https://gitlab-master.nvidia.com/nvidia-tao-toolkit/tao-sdk.git"]
+docker     = ["nvidia-tao-sdk[docker] @ git+https://gitlab-master.nvidia.com/nvidia-tao-toolkit/tao-sdk.git"]
+brev       = ["nvidia-tao-sdk[brev] @ git+https://gitlab-master.nvidia.com/nvidia-tao-toolkit/tao-sdk.git"]
+
 llm = [
     "openai>=1.0",
 ]
@@ -27,14 +37,12 @@ wandb = [
     "wandb>=0.15",
 ]
 all = [
-    "openai>=1.0",
-    "wandb>=0.15",
+    "nvidia-tao-automl[lepton,slurm,kubernetes,docker,brev,llm,wandb]",
 ]
 dev = [
+    "nvidia-tao-automl[all]",
     "pytest>=7.0",
     "pytest-cov",
-    "openai>=1.0",
-    "wandb>=0.15",
 ]
 
 [project.urls]
