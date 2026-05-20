@@ -15,8 +15,10 @@ from tao_automl.utils.spec_utils import get_flatten_specs, flatten_properties
 
 logger = logging.getLogger(__name__)
 
-# Networks that do not support AutoML search
-AUTOML_DISABLED_NETWORKS = ["mal"]
+# AutoML enablement is owned by model-level metadata in the skill bank. Keep
+# the standalone runner free of per-network hard disables so every model with a
+# train schema can use its schema-declared search space.
+AUTOML_DISABLED_NETWORKS = []
 
 _VALID_TYPES = [
     "int", "integer",
