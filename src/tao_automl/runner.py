@@ -114,36 +114,47 @@ _DEFAULT_POLL_INTERVAL = 30
 _TERMINAL_STATUSES = {"Complete", "Error", "Canceled"}
 
 
+_COSMOS_RL_SFT_VAL_RE = re.compile(
+    r'\[SFT\]\s+Validation loss:\s*([0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)',
+    re.IGNORECASE,
+)
+
+
 def _extract_metric_from_logs(logs: str, metric_name: str) -> float | None:
     """Extract the final metric value from TAO training logs.
 
     Searches logs in reverse (last occurrence = final value). Handles:
     - Cosmos-RL validation: "[SFT] Validation loss: 0.12 for train step ..."
-      (used when metric_name contains "val" — ASHA promotion metric)
     - Generic: "loss: 0.123" or "best loss: 0.123"
     - Cosmos-RL: "Step: 107/107, Loss: 8.27675, Grad norm: ..."
     - KPI: "kpi: 0.123"
     - Epoch: "Epoch 10 loss: 0.123"
+
+    Returns None if no pattern matches. Many TAO PyTorch-Lightning containers
+    emit metrics via RichProgressBar (ANSI-styled, not regex-friendly) and the
+    parseable values live in ``<results_dir>/train/status.json`` as JSONL —
+    in that case ``_read_metric_from_status_json`` is the right reader and the
+    caller falls back to it.
     """
     if not logs:
         return None
     lines = logs.strip().splitlines()
 
-    # If caller requested a validation metric, ONLY look for cosmos-rl's
-    # per-epoch validation-loss line — don't fall through to train loss.
+    # Cosmos-RL validation line: only triggers if the literal "[SFT] Validation
+    # loss:" marker is present in the logs. We do NOT hijack on the substring
+    # "val" in metric_name (that was a bug: it silently failed for any non-
+    # cosmos model with metric_name like "val_loss" or "val_acc").
     if "val" in metric_name.lower():
-        val_pattern = re.compile(
-            r'\[SFT\]\s+Validation loss:\s*([0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)',
-            re.IGNORECASE,
-        )
         for line in reversed(lines):
-            m = val_pattern.search(line)
+            m = _COSMOS_RL_SFT_VAL_RE.search(line)
             if m:
                 try:
                     return float(m.group(1))
                 except ValueError:
                     continue
-        return None
+        # Fall through to the generic patterns instead of returning None — a
+        # PyTorch-Lightning container emitting "val_loss: 0.12" on stdout
+        # should still match Pattern 2 below.
 
     # Pattern 1: Cosmos-RL step format "Step: N/M, Loss: X.XXXX" (most specific)
     step_pattern = re.compile(
@@ -211,6 +222,71 @@ def _check_execution_status(logs: str) -> str | None:
         if "Execution status: FAIL" in line:
             return "FAIL"
     return None
+
+
+class MetricExtractorError(RuntimeError):
+    """Raised when the metric extractor returns None for N consecutive recs.
+
+    Catches broken extractors fast instead of letting AutoML march on for
+    hours producing useless data. Common cause: ``metric_name`` doesn't match
+    what the container actually emits (e.g., user passes ``val_acc`` but the
+    container writes metrics only to ``<results_dir>/train/status.json``,
+    not to stdout — in which case the right fix is to pass ``eval_fn=`` with
+    a status.json reader).
+    """
+
+
+# Spec keys we treat as per-job output directories. When a user hardcodes
+# any of these to a local (non-URI) path, every rec would write to the same
+# place and overwrite the previous one. ``_auto_suffix_output_dirs`` rewrites
+# these to ``<value>/rec_<id>`` before submit; the SDK happy-path (env-var
+# driven output routing) is unaffected because it kicks in for keys with
+# remote URIs or empty strings.
+_OUTPUT_DIR_KEY_SUFFIXES = ("results_dir", "output_dir", "save_dir")
+
+
+def _iter_dotted_keys(d: dict, prefix: str = ""):
+    """Yield (dotted_key, value) for every leaf in a nested dict."""
+    if not isinstance(d, dict):
+        return
+    for k, v in d.items():
+        full = f"{prefix}.{k}" if prefix else str(k)
+        if isinstance(v, dict):
+            yield from _iter_dotted_keys(v, full)
+        else:
+            yield full, v
+
+
+def _auto_suffix_output_dirs(specs: dict, rec_id, declared_outputs: set) -> list[str]:
+    """In-place: rewrite hardcoded local output-dir values to per-rec subdirs.
+
+    Skips keys that are declared in the skill's ``script_runner["outputs"]``
+    (those are SDK-routed at runtime via env vars). Skips values that are
+    already remote URIs (treats `://` as the URI marker). Returns the list
+    of dotted keys we rewrote, for logging.
+    """
+    rewritten: list[str] = []
+    # Snapshot first; mutating during traversal of a nested dict is fragile.
+    leaves = list(_iter_dotted_keys(specs))
+    for dotted, value in leaves:
+        leaf = dotted.rsplit(".", 1)[-1]
+        if not any(leaf == suffix for suffix in _OUTPUT_DIR_KEY_SUFFIXES):
+            continue
+        if dotted in declared_outputs:
+            continue  # SDK will route this one via env vars
+        if not isinstance(value, str) or not value:
+            continue
+        if "://" in value:
+            continue  # remote URI — user opted into a specific destination
+        new_value = f"{value.rstrip('/')}/rec_{rec_id}"
+        # Walk into specs and set
+        cursor = specs
+        parts = dotted.split(".")
+        for p in parts[:-1]:
+            cursor = cursor[p]
+        cursor[parts[-1]] = new_value
+        rewritten.append(dotted)
+    return rewritten
 
 
 # ---------------------------------------------------------------------------
@@ -328,12 +404,18 @@ class AutoMLRunner:
     ``references/spec_template_<action>.yaml`` from there.
     """
 
+    # Raise MetricExtractorError if this many consecutive recs return None.
+    # Catches broken extractors fast (e.g. wrong metric_name, container only
+    # writes to status.json) instead of letting the brain see all-failure.
+    _MAX_CONSECUTIVE_NONE_METRICS = 3
+
     def __init__(self, sdk, skill_dir, action: str = "train",
                  poll_interval: int = _DEFAULT_POLL_INTERVAL):
         self._sdk = sdk
         self.skill_ctx = SkillContext(skill_dir=Path(skill_dir), action=action)
         self._poll_interval = poll_interval
         self._active_jobs = {}
+        self._consecutive_none_metrics = 0
 
     def run(self, train_dataset_uri, eval_dataset_uri="",
             base_checkpoint="", workspace_id=None, image=None,
@@ -496,6 +578,13 @@ class AutoMLRunner:
                 logger.info("No recommendations available — waiting for results")
                 time.sleep(5)
                 continue
+            # Pre-compute the set of declared-output spec keys so the
+            # results_dir auto-suffix safety net doesn't fight the SDK's
+            # env-var-driven output routing for keys the skill already owns.
+            declared_outputs = set(action_cfg.get("outputs") or [])
+            if isinstance(declared_outputs, dict):
+                declared_outputs = set(declared_outputs.keys())
+
             for rec in recs:
                 if on_recommendation:
                     on_recommendation(rec)
@@ -506,6 +595,18 @@ class AutoMLRunner:
                 # from TAO_RESULTS_ROOT (mount) / S3_BUCKET_NAME (cloud) env
                 # vars the SDK injects. The agent doesn't pre-rewrite spec
                 # output keys here — that lived in the deleted SDK contract.
+                # Safety net: if a user hardcoded a local *.results_dir /
+                # *.output_dir / *.save_dir in the spec, every rec would
+                # write to the same path and overwrite the previous one.
+                # Auto-suffix those with /rec_<id>. SDK-routed declared
+                # outputs and remote URIs are left alone.
+                rewritten = _auto_suffix_output_dirs(
+                    merged_specs, rec.id, declared_outputs)
+                if rewritten:
+                    logger.warning(
+                        "Rec %d: auto-suffixed %d hardcoded output dir(s) "
+                        "with /rec_%d to prevent rec-to-rec overwrite: %s",
+                        rec.id, len(rewritten), rec.id, rewritten)
                 metric_value, status = self._run_one_job(
                     image=resolved_image, action_cfg=action_cfg,
                     specs=merged_specs, rec=rec, metric_name=metric_name,
@@ -514,6 +615,28 @@ class AutoMLRunner:
                     workspace_path=workspace_path,
                     platform_kwargs=platform_kwargs,
                 )
+                # Fail-loud on a broken extractor: if the configured metric
+                # extractor (and eval_fn) both return None for N consecutive
+                # recs, we're not measuring anything — raise instead of
+                # letting the brain see all-failures for hours.
+                if metric_value is None:
+                    self._consecutive_none_metrics += 1
+                    if (self._consecutive_none_metrics
+                            >= self._MAX_CONSECUTIVE_NONE_METRICS):
+                        raise MetricExtractorError(
+                            f"No metric extracted for "
+                            f"{self._consecutive_none_metrics} consecutive "
+                            f"recs (metric_name={metric_name!r}). Likely "
+                            f"causes: (1) the container only emits this "
+                            f"metric via <results_dir>/train/status.json, "
+                            f"not stdout — pass eval_fn= with a status.json "
+                            f"reader; (2) metric_name doesn't match what "
+                            f"the container actually emits; (3) the regex "
+                            f"in _extract_metric_from_logs needs a new "
+                            f"pattern for this model. Inspect the last "
+                            f"job's logs to confirm.")
+                else:
+                    self._consecutive_none_metrics = 0
                 # Report to the brain, inverting if explicit direction disagrees
                 # with the brain's implicit metric-name rule.
                 report_value = metric_value
