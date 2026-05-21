@@ -97,7 +97,7 @@ class SkillContext:
                 f"Available: {sorted(actions.keys())}"
             )
         self.action_cfg = actions[self.action]
-        self.network_arch = self.skill_info.get("network_arch", self.skill_dir.name)
+        self.network_arch = self.skill_info.get("network_arch", self.skill_dir.name).replace("-", "_")
 
         template_path = self.skill_dir / f"references/spec_template_{self.action}.yaml"
         self.default_specs = (
