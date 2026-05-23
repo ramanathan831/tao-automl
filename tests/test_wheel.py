@@ -230,6 +230,72 @@ def test_controller_accepts_resume_recommendations():
         assert resumed[0].resume_from_job_id == "job-previous"
 
 
+def test_hyperband_two_two_one_stop_compare_resume_flow():
+    """Hyperband max_epochs=2/reduction_factor=2/epoch_multiplier=1 should:
+
+    - issue two first-rung trials capped at 1 epoch,
+    - compare their metrics,
+    - promote only the better trial,
+    - resume it from the first-rung job,
+    - run the promoted trial to epoch 2.
+    """
+    from tao_automl import AutoML
+
+    base_specs = {
+        "train": {
+            "epoch": 10,
+            "optm_lr": 1e-6,
+        }
+    }
+
+    with tempfile.TemporaryDirectory() as d:
+        automl = AutoML(
+            workspace=d,
+            network="cosmos-rl",
+            train_specs=base_specs,
+            settings={
+                "algorithm": "hyperband",
+                "metric": "val/avg_loss",
+                "automl_max_epochs": 2,
+                "automl_reduction_factor": 2,
+                "epoch_multiplier": 1,
+            },
+            automl_hyperparameters=["train.optm_lr"],
+            custom_param_ranges={
+                "train.optm_lr": {"valid_min": 5e-7, "valid_max": 2e-6},
+            },
+        )
+
+        first_rung = automl.next_recommendation()
+        assert len(first_rung) == 2
+        assert {rec.id for rec in first_rung} == {0, 1}
+        assert all(rec.specs["train.epoch"] == 1 for rec in first_rung)
+        first_rung_specs = {rec.id: dict(rec.specs) for rec in first_rung}
+
+        first_rung[0].assign_job_id("job-rec0-epoch1")
+        first_rung[1].assign_job_id("job-rec1-epoch1")
+
+        # Lower is better for val/avg_loss, so rec 1 should be promoted.
+        automl.report_result(first_rung[0].id, 0.9, status="success")
+        automl.report_result(first_rung[1].id, 0.4, status="success")
+
+        promoted = automl.next_recommendation()
+        assert len(promoted) == 1
+        assert promoted[0].id == 1
+        assert promoted[0].specs["train.epoch"] == 2
+        assert promoted[0].specs["train.optm_lr"] == first_rung_specs[1]["train.optm_lr"]
+        assert promoted[0].resume_from_job_id == "job-rec1-epoch1"
+
+        promoted[0].assign_job_id("job-rec1-epoch2")
+        automl.report_result(promoted[0].id, 0.3, status="success")
+
+        assert automl.next_recommendation() == []
+        assert automl.is_complete()
+        best = automl.get_best()
+        assert best.id == 1
+        assert best.result == 0.3
+
+
 # ---------------------------------------------------------------
 # 5. AlgorithmParams tests
 # ---------------------------------------------------------------
