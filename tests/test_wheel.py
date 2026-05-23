@@ -200,6 +200,36 @@ def test_controller_failure_skipped_in_best():
         assert ctrl.get_best() is None
 
 
+def test_controller_accepts_resume_recommendations():
+    from tao_automl.controller.controller import Controller
+    from tao_automl.state.state_store import StateStore
+    from tao_automl.types import AutoMLContext, JobStates, ResumeRecommendation
+
+    class ResumeBrain(MockBrain):
+        def generate_recommendations(self, history):
+            if not history:
+                return [{"lr": 0.1}]
+            return [ResumeRecommendation(0, {"lr": 0.1}, "job-previous")]
+
+    with tempfile.TemporaryDirectory() as d:
+        store = StateStore(d)
+        ctx = AutoMLContext(id="resume-test", network="fake")
+        settings = type("P", (), {"automl_max_recommendations": 2})()
+        ctrl = Controller(
+            brain=ResumeBrain(1), context=ctx, state_store=store,
+            settings=settings, metric="loss", algorithm="hyperband",
+        )
+
+        first = ctrl.next_recommendation()
+        assert first[0].id == 0
+        ctrl.report_result(0, 1.0, status="success")
+
+        resumed = ctrl.next_recommendation()
+        assert resumed[0].id == 0
+        assert resumed[0].status == JobStates.pending
+        assert resumed[0].resume_from_job_id == "job-previous"
+
+
 # ---------------------------------------------------------------
 # 5. AlgorithmParams tests
 # ---------------------------------------------------------------

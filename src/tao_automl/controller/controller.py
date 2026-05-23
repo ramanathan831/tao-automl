@@ -23,7 +23,7 @@ Optionally integrates with Weights & Biases (wandb) for experiment tracking.
 import logging
 import os
 
-from tao_automl.types import Recommendation, JobStates
+from tao_automl.types import Recommendation, ResumeRecommendation, JobStates
 
 logger = logging.getLogger(__name__)
 
@@ -105,9 +105,28 @@ class Controller:
             return []
 
         recommendations = []
-        for spec_dict in raw_recs:
-            if not spec_dict:
+        for raw_rec in raw_recs:
+            if not raw_rec:
                 continue
+
+            if isinstance(raw_rec, ResumeRecommendation):
+                rec = self._find_rec(raw_rec.id)
+                if rec is None:
+                    rec = Recommendation(
+                        identifier=int(raw_rec.id),
+                        specs=raw_rec.specs,
+                        metric=self.metric,
+                    )
+                    self.history.append(rec)
+                    self._next_id = max(self._next_id, rec.id + 1)
+                else:
+                    rec.specs = raw_rec.specs
+                rec.status = JobStates.pending
+                rec.resume_from_job_id = raw_rec.resume_from_job_id or raw_rec.job_id
+                recommendations.append(rec)
+                continue
+
+            spec_dict = raw_rec
             rec = Recommendation(
                 identifier=self._next_id,
                 specs=spec_dict,
