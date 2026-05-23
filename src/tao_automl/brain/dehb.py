@@ -13,6 +13,7 @@
 # limitations under the License.
 
 """DEHB (Differential Evolution HyperBand) AutoML algorithm modules"""
+import copy
 import numpy as np
 import math
 import logging
@@ -311,6 +312,9 @@ class DEHB(AutoMLAlgorithmBase):
         if self.sh_iter == 0:
             specs = self._differential_evolution_mutation()
             self.epoch_number = self.ri[self.bracket][self.sh_iter] * self.epoch_multiplier
+            final_epoch = self.ri[self.bracket][-1] * self.epoch_multiplier
+            self.override_num_epochs(final_epoch)
+            specs.update(self._epoch_spec_overrides(self.epoch_number))
             to_return = specs
         else:
             lower = -1 * self.ni.get(self.bracket, [0])[0]
@@ -332,9 +336,13 @@ class DEHB(AutoMLAlgorithmBase):
                     )[0:self.ni[self.bracket][self.sh_iter]]
 
             self.epoch_number = self.ri[self.bracket][self.sh_iter] * self.epoch_multiplier
+            final_epoch = self.ri[self.bracket][-1] * self.epoch_multiplier
+            self.override_num_epochs(final_epoch)
+            specs = copy.deepcopy(self.experiments_considered[self.expt_iter].specs)
+            specs.update(self._epoch_spec_overrides(self.epoch_number))
             resumerec = ResumeRecommendation(
                 self.experiments_considered[self.expt_iter].id,
-                self.experiments_considered[self.expt_iter].specs,
+                specs,
                 self.experiments_considered[self.expt_iter].job_id
             )
             to_return = resumerec

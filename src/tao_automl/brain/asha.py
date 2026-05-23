@@ -13,6 +13,7 @@
 # limitations under the License.
 
 """ASHA (Asynchronous Successive Halving Algorithm) AutoML algorithm modules"""
+import copy
 import numpy as np
 import math
 import logging
@@ -318,6 +319,8 @@ class ASHA(AutoMLAlgorithmBase):
                 if self.max_trials is not None and self.total_configs_started >= self.max_trials:
                     break
                 specs = self._generate_random_parameters()
+                self.epoch_number = self.rungs[0]
+                specs.update(self._epoch_spec_overrides(self.epoch_number))
                 self.config_specs[self.next_config_id] = specs
                 self.config_to_rung[self.next_config_id] = 0
                 self.active_configs.add(self.next_config_id)
@@ -325,7 +328,7 @@ class ASHA(AutoMLAlgorithmBase):
                 self.next_config_id += 1
                 recommendations.append(specs)
             self.track_id = 0
-            return recommendations if recommendations else [self._generate_random_parameters()]
+            return recommendations
 
         active_by_rung = defaultdict(list)
         for rec in history:
@@ -384,7 +387,9 @@ class ASHA(AutoMLAlgorithmBase):
         while len(self.active_configs) + len(new_recommendations) < self.max_concurrent:
             if self.pending_promotions:
                 config_id, epochs = self.pending_promotions.pop(0)
-                specs = self.config_specs[config_id]
+                specs = copy.deepcopy(self.config_specs[config_id])
+                specs.update(self._epoch_spec_overrides(epochs))
+                self.config_specs[config_id] = specs
                 config_job_id = None
                 for rec in reversed(history):
                     if rec.id == config_id:
@@ -398,11 +403,12 @@ class ASHA(AutoMLAlgorithmBase):
 
             elif self.max_trials is None or self.total_configs_started < self.max_trials:
                 specs = self._generate_random_parameters()
+                self.epoch_number = self.rungs[0]
+                specs.update(self._epoch_spec_overrides(self.epoch_number))
                 self.config_specs[self.next_config_id] = specs
                 self.config_to_rung[self.next_config_id] = 0
                 self.active_configs.add(self.next_config_id)
                 self.total_configs_started += 1
-                self.epoch_number = self.rungs[0]
                 self.track_id = self.next_config_id
                 self.next_config_id += 1
                 new_recommendations.append(specs)
