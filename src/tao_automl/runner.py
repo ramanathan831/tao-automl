@@ -627,6 +627,12 @@ class AutoMLRunner:
         best = automl.get_best()
         progress = automl.get_progress()
         history = automl.get_history()
+        if best is None:
+            failed = [r.id for r in history if r.status == "failure"]
+            raise RuntimeError(
+                "AutoML finished without a successful recommendation; "
+                f"failed recommendation ids: {failed}"
+            )
 
         # Unflip values if we inverted them for the brain, so callers see
         # metrics in their original scale regardless of `direction`.
