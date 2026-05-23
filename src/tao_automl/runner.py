@@ -141,8 +141,10 @@ def _extract_metric_from_logs(logs: str, metric_name: str) -> float | None:
         return None
     lines = logs.strip().splitlines()
 
-    # If caller requested a validation metric, ONLY look for cosmos-rl's
-    # per-epoch validation-loss line — don't fall through to train loss.
+    # If caller requested a validation metric, prefer cosmos-rl's per-epoch
+    # validation-loss line, then fall through to the generic metric patterns
+    # below. TAO Core tasks often log plain ``val_loss: ...`` or
+    # ``val_acc: ...`` instead of the cosmos-specific sentence.
     if "val" in metric_name.lower():
         val_pattern = re.compile(
             r'\[SFT\]\s+Validation loss:\s*([0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)',
@@ -155,7 +157,6 @@ def _extract_metric_from_logs(logs: str, metric_name: str) -> float | None:
                     return float(m.group(1))
                 except ValueError:
                     continue
-        return None
 
     # Pattern 1: Cosmos-RL step format "Step: N/M, Loss: X.XXXX" (most specific)
     step_pattern = re.compile(
@@ -172,17 +173,36 @@ def _extract_metric_from_logs(logs: str, metric_name: str) -> float | None:
             except ValueError:
                 continue
 
-    # Pattern 2: direct metric match (case-insensitive)
-    metric_pattern = re.compile(
-        rf'(?:best\s+)?{re.escape(metric_name)}\s*[:=]\s*([0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)',
-        re.IGNORECASE,
-    )
-    for line in reversed(lines):
-        match = metric_pattern.search(line)
-        if match:
+    # Pattern 2: direct metric match (case-insensitive). Lightning progress
+    # output may print metrics as ``train_loss_epoch: 18.901`` or split the
+    # label and value across wrapped terminal lines, so also scan a
+    # whitespace-normalized view of the full log.
+    metric_aliases = [metric_name]
+    for suffix in ("_epoch", "_step"):
+        if not metric_name.endswith(suffix):
+            metric_aliases.append(f"{metric_name}{suffix}")
+    if metric_name.lower().startswith("val_"):
+        metric_aliases.append("Validation " + metric_name[4:].replace("_", " "))
+    normalized_logs = re.sub(r"\s+", " ", logs)
+    for alias in metric_aliases:
+        metric_pattern = re.compile(
+            rf'(?:best\s+)?{re.escape(alias)}\s*[:=]\s*([0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)',
+            re.IGNORECASE,
+        )
+        for line in reversed(lines):
+            match = metric_pattern.search(line)
+            if match:
+                try:
+                    val = float(match.group(1))
+                    if val >= 0:
+                        return val
+                except ValueError:
+                    continue
+        matches = list(metric_pattern.finditer(normalized_logs))
+        for match in reversed(matches):
             try:
                 val = float(match.group(1))
-                if val > 0:  # Skip 0.0 values
+                if val >= 0:
                     return val
             except ValueError:
                 continue
@@ -230,15 +250,28 @@ def _check_execution_status(logs: str) -> str | None:
 # automl_hyperparameters at launch time instead of silently accepting them).
 # ---------------------------------------------------------------------------
 
-def _flatten_keys(d: dict, prefix: str = "") -> set[str]:
+_PATH_PART_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*)(?:\[(\d+)\])?$")
+
+
+def _parse_path_part(part: str) -> tuple[str, int | None]:
+    match = _PATH_PART_RE.match(str(part))
+    if match:
+        return match.group(1), int(match.group(2)) if match.group(2) is not None else None
+    return str(part), None
+
+
+def _flatten_keys(d: Any, prefix: str = "") -> set[str]:
     """Recursively flatten a nested spec dict into dotted keys."""
     keys: set[str] = set()
-    if not isinstance(d, dict):
-        return keys
-    for k, v in d.items():
-        full = f"{prefix}.{k}" if prefix else str(k)
-        keys.add(full)
-        if isinstance(v, dict):
+    if isinstance(d, dict):
+        for k, v in d.items():
+            full = f"{prefix}.{k}" if prefix else str(k)
+            keys.add(full)
+            keys |= _flatten_keys(v, full)
+    elif isinstance(d, list):
+        for idx, v in enumerate(d):
+            full = f"{prefix}[{idx}]" if prefix else f"[{idx}]"
+            keys.add(full)
             keys |= _flatten_keys(v, full)
     return keys
 
@@ -842,10 +875,27 @@ class AutoMLRunner:
         parts = dotted_key.split(".")
         cursor = target
         for part in parts[:-1]:
-            if part not in cursor or not isinstance(cursor[part], dict):
-                cursor[part] = {}
-            cursor = cursor[part]
-        cursor[parts[-1]] = value
+            key, idx = _parse_path_part(part)
+            if key not in cursor:
+                cursor[key] = [] if idx is not None else {}
+            cursor = cursor[key]
+            if idx is not None:
+                if not isinstance(cursor, list):
+                    raise TypeError(f"Spec path {dotted_key!r} expected list at {key!r}")
+                while len(cursor) <= idx:
+                    cursor.append({})
+                if cursor[idx] is None:
+                    cursor[idx] = {}
+                cursor = cursor[idx]
+        last_key, last_idx = _parse_path_part(parts[-1])
+        if last_idx is None:
+            cursor[last_key] = value
+            return
+        if last_key not in cursor or not isinstance(cursor[last_key], list):
+            cursor[last_key] = []
+        while len(cursor[last_key]) <= last_idx:
+            cursor[last_key].append(None)
+        cursor[last_key][last_idx] = value
 
     @staticmethod
     def _get_nested(source: dict, dotted_key: str):
@@ -853,9 +903,14 @@ class AutoMLRunner:
         parts = dotted_key.split(".")
         cursor = source
         for part in parts:
-            if not isinstance(cursor, dict) or part not in cursor:
+            key, idx = _parse_path_part(part)
+            if not isinstance(cursor, dict) or key not in cursor:
                 return None
-            cursor = cursor[part]
+            cursor = cursor[key]
+            if idx is not None:
+                if not isinstance(cursor, list) or idx >= len(cursor):
+                    return None
+                cursor = cursor[idx]
         return cursor
 
     # _apply_output_destinations was removed: output destinations are
@@ -894,6 +949,23 @@ class AutoMLRunner:
                 base_uri = "s3://" + base_uri[len("aws://"):]
             base_uri = base_uri.rstrip("/") + "/"
 
+            mapping = rule.get("mapping")
+            if isinstance(mapping, dict):
+                item = {}
+                for field_name, field_cfg in mapping.items():
+                    field_cfg = field_cfg or {}
+                    path = field_cfg.get("path")
+                    if path:
+                        item[field_name] = base_uri + str(path).lstrip("/")
+                    elif not field_cfg.get("optional"):
+                        item[field_name] = base_uri.rstrip("/")
+                current = AutoMLRunner._get_nested(specs, spec_key)
+                if rule.get("multiple_sources") or isinstance(current, list):
+                    AutoMLRunner._set_nested(specs, spec_key, [item])
+                else:
+                    AutoMLRunner._set_nested(specs, spec_key, item)
+                continue
+
             path_template = rule.get("path")
             if path_template:
                 resolved = path_template
@@ -928,13 +1000,7 @@ class AutoMLRunner:
         import copy
         merged = copy.deepcopy(base_specs)
         for key, value in rec_specs.items():
-            parts = key.split(".")
-            target = merged
-            for part in parts[:-1]:
-                if part not in target or not isinstance(target[part], dict):
-                    target[part] = {}
-                target = target[part]
-            target[parts[-1]] = value
+            AutoMLRunner._set_nested(merged, key, value)
         return merged
 
 
