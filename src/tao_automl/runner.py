@@ -88,6 +88,7 @@ class SkillContext:
     skill_info: dict[str, Any] = field(init=False)
     action_cfg: dict[str, Any] = field(init=False)
     default_specs: dict[str, Any] = field(init=False)
+    valid_spec_keys: set[str] = field(init=False)
     container_image: str = field(init=False)
     network_arch: str = field(init=False)
 
@@ -115,6 +116,15 @@ class SkillContext:
         self.default_specs = (
             yaml.safe_load(template_path.read_text()) if template_path.exists() else {}
         ) or {}
+        schema_path = self.skill_dir / f"schemas/{self.action}.schema.json"
+        if schema_path.exists():
+            with open(schema_path) as f:
+                schema = json.load(f) or {}
+            self.valid_spec_keys = _schema_property_keys(schema) | _flatten_keys(
+                schema.get("default", {})
+            ) | _flatten_keys(self.default_specs)
+        else:
+            self.valid_spec_keys = _flatten_keys(self.default_specs)
 
         # Container image: action-level image overrides win, then model-level.
         # Values may be versions.yaml keys or absolute URIs.
@@ -282,13 +292,38 @@ def _flatten_keys(d: Any, prefix: str = "") -> set[str]:
     return keys
 
 
-def _validate_keys_against_schema(provided_keys, base_specs, kind):
+def _schema_property_keys(schema: Any, prefix: str = "") -> set[str]:
+    """Flatten JSON-schema property names into dotted spec keys.
+
+    The packaged spec template may omit optional fields that are still valid
+    according to ``schemas/<action>.schema.json``. Validate against both so
+    direct optional overrides such as ``custom.vision.fps`` do not require
+    unsafe placeholder defaults in the template.
+    """
+    keys: set[str] = set()
+    if not isinstance(schema, dict):
+        return keys
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        for name, child in properties.items():
+            full = f"{prefix}.{name}" if prefix else str(name)
+            keys.add(full)
+            keys |= _schema_property_keys(child, full)
+    items = schema.get("items")
+    if isinstance(items, dict) and prefix:
+        indexed = f"{prefix}[0]"
+        keys.add(indexed)
+        keys |= _schema_property_keys(items, indexed)
+    return keys
+
+
+def _validate_keys_against_schema(provided_keys, base_specs, kind, schema_keys=None):
     """Raise ValueError on provided keys that look like typos of existing
     schema keys. Accepts genuinely-new keys (logs a warning) so users who
     intentionally add a new spec field aren't blocked.
     """
     import difflib
-    base_keys = _flatten_keys(base_specs)
+    base_keys = set(schema_keys or ()) | _flatten_keys(base_specs)
     unknown = [k for k in provided_keys if k not in base_keys]
     for k in unknown:
         close = difflib.get_close_matches(k, base_keys, n=1, cutoff=0.85)
@@ -499,11 +534,13 @@ class AutoMLRunner:
         #              against the schema before anything expensive runs.
         if spec_overrides:
             _validate_keys_against_schema(
-                list(spec_overrides.keys()), base_specs, "spec_override")
+                list(spec_overrides.keys()), base_specs, "spec_override",
+                self.skill_ctx.valid_spec_keys)
             base_specs = self._merge_specs(base_specs, spec_overrides)
         if automl_hyperparameters:
             _validate_keys_against_schema(
-                list(automl_hyperparameters), base_specs, "automl_hyperparameter")
+                list(automl_hyperparameters), base_specs, "automl_hyperparameter",
+                self.skill_ctx.valid_spec_keys)
 
         # --- fix #1: resolve explicit direction. _invert_metric tells us
         #              whether to negate values before reporting to the brain
