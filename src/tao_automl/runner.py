@@ -116,10 +116,12 @@ class SkillContext:
             yaml.safe_load(template_path.read_text()) if template_path.exists() else {}
         ) or {}
 
-        # Container image: accept either a versions.yaml key or an absolute URI.
+        # Container image: action-level image overrides win, then model-level.
+        # Values may be versions.yaml keys or absolute URIs.
         from tao_sdk.versions import resolve_container_image
         self.container_image = resolve_container_image(
-            self.skill_info.get("container_image", "")
+            self.action_cfg.get("container_image")
+            or self.skill_info.get("container_image", "")
         )
 
 _DEFAULT_POLL_INTERVAL = 30
@@ -182,7 +184,11 @@ def _extract_metric_from_logs(logs: str, metric_name: str) -> float | None:
         if not metric_name.endswith(suffix):
             metric_aliases.append(f"{metric_name}{suffix}")
     if metric_name.lower().startswith("val_"):
-        metric_aliases.append("Validation " + metric_name[4:].replace("_", " "))
+        bare_metric = metric_name[4:]
+        metric_aliases.extend([
+            bare_metric,
+            "Validation " + bare_metric.replace("_", " "),
+        ])
     normalized_logs = re.sub(r"\s+", " ", logs)
     for alias in metric_aliases:
         metric_pattern = re.compile(

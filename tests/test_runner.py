@@ -68,6 +68,21 @@ def test_skill_context_loads_skill_info_and_template(tmp_path):
     assert ctx.default_specs["dataset"]["num_classes"] == 80
 
 
+def test_skill_context_action_container_image_overrides_model_image(tmp_path):
+    from tao_automl.runner import SkillContext
+    skill_dir = _write_fake_skill(tmp_path, action="dataset_convert")
+    info_path = skill_dir / "references/skill_info.yaml"
+    info_path.write_text(
+        info_path.read_text().replace(
+            "    command: fake train -e {config_path}\n",
+            "    container_image: nvcr.io/nvidia/tao/fake-ds:0.1\n"
+            "    command: fake convert -e {config_path}\n",
+        )
+    )
+    ctx = SkillContext(skill_dir=skill_dir, action="dataset_convert")
+    assert ctx.container_image == "nvcr.io/nvidia/tao/fake-ds:0.1"
+
+
 def test_skill_context_no_template_yields_empty_specs(tmp_path):
     """Models without a spec_template_<action>.yaml get default_specs={}.
     Caller is responsible for constructing the spec from skill SKILL.md."""
@@ -89,6 +104,16 @@ def test_skill_context_missing_skill_info_raises(tmp_path):
     from tao_automl.runner import SkillContext
     with pytest.raises(FileNotFoundError, match="skill_info.yaml"):
         SkillContext(skill_dir=tmp_path / "nonexistent", action="train")
+
+
+# ---------------------------------------------------------------------------
+# Metric extraction
+# ---------------------------------------------------------------------------
+
+def test_extract_metric_allows_val_prefix_for_sparse4d_map():
+    from tao_automl.runner import _extract_metric_from_logs
+    logs = "Calculating metrics...\nmAP: 0.0000\nNDS: 0.0000\nExecution status: PASS\n"
+    assert _extract_metric_from_logs(logs, "val_mAP") == 0.0
 
 
 # ---------------------------------------------------------------------------
