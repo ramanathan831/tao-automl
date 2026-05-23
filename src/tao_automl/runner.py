@@ -589,7 +589,14 @@ class AutoMLRunner:
                     on_recommendation(rec)
                 logger.info("Recommendation %d: launching job with %d spec overrides",
                             rec.id, len(rec.specs))
-                merged_specs = self._merge_specs(base_specs, rec.specs)
+                run_base_specs = base_specs
+                try:
+                    stored_specs = automl._state_store.get_job_specs(automl._context.id)
+                    if stored_specs:
+                        run_base_specs = stored_specs
+                except Exception as ex:
+                    logger.debug("Could not read AutoML-updated base specs: %s", ex)
+                merged_specs = self._merge_specs(run_base_specs, rec.specs)
                 # Output destination is resolved at runtime by script_runner
                 # from TAO_RESULTS_ROOT (mount) / S3_BUCKET_NAME (cloud) env
                 # vars the SDK injects. The agent doesn't pre-rewrite spec
