@@ -27,8 +27,11 @@ from tao_automl.utils.spec_utils import get_flatten_specs, flatten_properties
 
 logger = logging.getLogger(__name__)
 
-# Networks that do not support AutoML search
-AUTOML_DISABLED_NETWORKS = ["mal"]
+# Networks that do not support AutoML search. Model-level AutoML capability is
+# declared by the packaged skill/schema metadata, so keep this local override
+# empty unless a container path is known to be non-runnable independent of skill
+# metadata.
+AUTOML_DISABLED_NETWORKS = []
 
 _VALID_TYPES = [
     "int", "integer",

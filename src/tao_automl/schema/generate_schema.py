@@ -22,6 +22,14 @@ from tao_automl.schema import enum_constants
 logger = logging.getLogger(__name__)
 
 
+_CONFIG_MODULE_ALIASES = {
+    "depth_net_mono": "depth_net",
+    "depth_net_stereo": "depth_net",
+    "depth-net-mono": "depth_net",
+    "depth-net-stereo": "depth_net",
+}
+
+
 def generate_schema(neural_network_name, action=""):
     """Generates JSON schema for network"""
     module_network_name = neural_network_name
@@ -31,7 +39,9 @@ def generate_schema(neural_network_name, action=""):
         )
         expConfig = imported_module.ExperimentConfig()
     else:
-        module_network_name = neural_network_name.replace("-", "_")
+        module_network_name = _CONFIG_MODULE_ALIASES.get(
+            neural_network_name, neural_network_name.replace("-", "_")
+        )
         imported_module = dataclass2json_converter.import_module_from_path(
             f"tao_automl.config.{module_network_name}.default_config"
         )
