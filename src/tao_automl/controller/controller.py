@@ -33,8 +33,24 @@ _BRAIN_DONE_ALGORITHMS = frozenset({
     "hybrid", "autoresearch",
 })
 
+# Multi-fidelity algorithms compare low-budget trials to decide promotion, but
+# downstream model handoff should prefer the best trial at the largest observed
+# budget once such trials exist.
+_MULTI_FIDELITY_ALGORITHMS = frozenset({
+    "hyperband", "h", "bohb", "asha", "dehb", "hyperband_es", "hes", "pbt",
+})
+
 # Algorithms whose completion is determined by max recommendations count
 _MAX_REC_ALGORITHMS = frozenset({"bayesian", "b", "bfbo", "llm"})
+
+_BUDGET_KEY_NAMES = frozenset({
+    "num_epochs",
+    "epochs",
+    "n_epochs",
+    "max_iters",
+    "epoch",
+    "max_epochs",
+})
 
 
 class Controller:
@@ -186,6 +202,9 @@ class Controller:
         ]
         if not completed:
             return None
+
+        if self.algorithm in _MULTI_FIDELITY_ALGORITHMS:
+            completed = self._largest_budget_candidates(completed)
 
         lower_is_better = "loss" in self.metric.lower()
         if lower_is_better:
@@ -473,6 +492,40 @@ class Controller:
             if r.id == rec_id:
                 return r
         return None
+
+    @staticmethod
+    def _recommendation_budget(rec):
+        """Return the largest explicit training budget in a recommendation."""
+        budgets = []
+        if rec.early_stop_epoch is not None:
+            budgets.append(rec.early_stop_epoch)
+        for key, value in rec.specs.items():
+            name = str(key).split(".")[-1]
+            if name not in _BUDGET_KEY_NAMES:
+                continue
+            if isinstance(value, bool):
+                continue
+            try:
+                budgets.append(float(value))
+            except (TypeError, ValueError):
+                continue
+        return max(budgets) if budgets else None
+
+    def _largest_budget_candidates(self, completed):
+        """Filter completed recommendations to the largest observed budget."""
+        budgeted = []
+        for rec in completed:
+            budget = self._recommendation_budget(rec)
+            if budget is not None:
+                budgeted.append((budget, rec))
+        if not budgeted:
+            return completed
+        max_budget = max(budget for budget, _rec in budgeted)
+        largest_budget_recs = [
+            rec for budget, rec in budgeted
+            if budget == max_budget
+        ]
+        return largest_budget_recs or completed
 
     def _estimate_total(self):
         """Estimate total number of recommendations for progress reporting."""

@@ -390,6 +390,57 @@ def test_budgeted_algorithms_emit_stop_compare_resume_budgets(algorithm):
         assert automl.get_best().id == 1
 
 
+@pytest.mark.parametrize("algorithm", ["hyperband", "bohb", "asha", "dehb", "hyperband_es"])
+def test_budgeted_algorithms_pick_best_at_largest_budget(algorithm):
+    """Final handoff should not choose an unpromoted lower-fidelity checkpoint."""
+    from tao_automl import AutoML
+
+    settings = {
+        "algorithm": algorithm,
+        "metric": "val/avg_loss",
+        "automl_max_epochs": 2,
+        "automl_reduction_factor": 2,
+        "epoch_multiplier": 1,
+    }
+    if algorithm == "asha":
+        settings.update({
+            "automl_max_concurrent": 2,
+            "automl_max_trials": 2,
+            "automl_min_top_configs": 1,
+        })
+
+    with tempfile.TemporaryDirectory() as d:
+        automl = AutoML(
+            workspace=d,
+            network="cosmos-rl",
+            train_specs={"train": {"epoch": 10, "optm_lr": 1e-6}},
+            settings=settings,
+            automl_hyperparameters=["train.optm_lr"],
+            custom_param_ranges={
+                "train.optm_lr": {"valid_min": 5e-7, "valid_max": 2e-6},
+            },
+        )
+
+        first_rung = sorted(automl.next_recommendation(), key=lambda rec: rec.id)
+        assert len(first_rung) == 2
+        first_rung[0].assign_job_id("job-rec0-epoch1")
+        first_rung[1].assign_job_id("job-rec1-epoch1")
+
+        automl.report_result(first_rung[0].id, 0.4, status="success")
+        automl.report_result(first_rung[1].id, 0.5, status="success")
+
+        promoted = automl.next_recommendation()
+        assert len(promoted) == 1
+        assert promoted[0].id == 0
+        promoted[0].assign_job_id("job-rec0-epoch2")
+        automl.report_result(promoted[0].id, 0.6, status="success")
+
+        assert automl.next_recommendation() == []
+        assert automl.is_complete()
+        assert automl.get_best().id == 0
+        assert automl.get_best().specs["train.epoch"] == 2
+
+
 def test_pbt_two_generation_budget_and_resume_flow():
     """PBT should train a population for one interval, then resume to the next."""
     from tao_automl import AutoML
