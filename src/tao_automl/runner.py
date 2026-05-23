@@ -189,7 +189,7 @@ def _extract_metric_from_logs(logs: str, metric_name: str) -> float | None:
     # output may print metrics as ``train_loss_epoch: 18.901`` or split the
     # label and value across wrapped terminal lines, so also scan a
     # whitespace-normalized view of the full log.
-    metric_aliases = [metric_name]
+    metric_aliases = _metric_aliases(metric_name)
     for suffix in ("_epoch", "_step"):
         if not metric_name.endswith(suffix):
             metric_aliases.append(f"{metric_name}{suffix}")
@@ -246,6 +246,75 @@ def _extract_metric_from_logs(logs: str, metric_name: str) -> float | None:
                 return float(match.group(1))
             except ValueError:
                 continue
+    return None
+
+
+def _metric_aliases(metric_name: str) -> list[str]:
+    """Return common TAO spellings for a metric name.
+
+    Different TAO entrypoints report the same KPI as ``val/loss`` in
+    ``status.json`` or ``val_loss`` in Lightning monitor fields. AutoML callers
+    should not have to know that spelling difference to get a valid metric.
+    """
+    aliases = [metric_name]
+    if "/" in metric_name:
+        aliases.append(metric_name.replace("/", "_"))
+    if "_" in metric_name:
+        aliases.append(metric_name.replace("_", "/"))
+    seen = set()
+    return [alias for alias in aliases if not (alias in seen or seen.add(alias))]
+
+
+def _extract_metric_from_status_file(status_path: Path, metric_name: str) -> float | None:
+    """Read the latest finite KPI value from a TAO line-delimited status file."""
+    if not status_path.exists():
+        return None
+    aliases = _metric_aliases(metric_name)
+    try:
+        lines = status_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        kpi = payload.get("kpi")
+        if not isinstance(kpi, dict):
+            continue
+        for alias in aliases:
+            if alias not in kpi:
+                continue
+            try:
+                value = float(kpi[alias])
+            except (TypeError, ValueError):
+                continue
+            if value == value:
+                return value
+    return None
+
+
+def _extract_metric_from_local_results(job_id: str, metric_name: str,
+                                       platform_kwargs: dict | None) -> float | None:
+    """Fallback for local Docker runs whose metrics are written to status.json.
+
+    The platform SDK mounts a host results directory at ``/results``. When logs
+    do not contain the metric, inspect the mounted job result folder and parse
+    TAO's status artifacts.
+    """
+    for mount in (platform_kwargs or {}).get("mounts", []) or []:
+        if mount.get("container_path") != "/results":
+            continue
+        host_root = mount.get("host_path")
+        if not host_root:
+            continue
+        job_root = Path(host_root) / job_id
+        for status_path in sorted(job_root.rglob("status.json")):
+            metric = _extract_metric_from_status_file(status_path, metric_name)
+            if metric is not None:
+                return metric
     return None
 
 
@@ -786,6 +855,13 @@ class AutoMLRunner:
                             rec.id, eval_metric,
                             f"{cached_metric:.6f}" if cached_metric is not None else "None")
                 metric_value = eval_metric
+        if metric_value is None:
+            metric_value = _extract_metric_from_local_results(
+                job.id, metric_name, platform_kwargs
+            )
+            if metric_value is not None:
+                logger.info("Rec %d: recovered metric=%f from local status artifacts",
+                            rec.id, metric_value)
 
         if metric_value is None:
             logger.warning("Rec %d: job %s completed but no metric could be "
