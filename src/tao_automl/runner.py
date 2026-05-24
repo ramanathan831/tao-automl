@@ -318,6 +318,152 @@ def _extract_metric_from_local_results(job_id: str, metric_name: str,
     return None
 
 
+_RESUME_FILE_EXTENSIONS = (".pth", ".pth.tar", ".pt", ".ckpt", ".hdf5", ".tlt")
+
+
+def _local_results_mount(platform_kwargs: dict | None) -> tuple[Path, str] | None:
+    """Return the host/container results mount pair when a /results bind exists."""
+    for mount in (platform_kwargs or {}).get("mounts", []) or []:
+        if not isinstance(mount, dict):
+            continue
+        container_path = str(mount.get("container_path", "")).rstrip("/")
+        host_path = mount.get("host_path")
+        if container_path == "/results" and host_path:
+            return Path(host_path), container_path
+    return None
+
+
+def _as_container_path(path: Path, host_root: Path, container_root: str) -> str:
+    """Map a host bind-mount path back to the path visible inside the job."""
+    rel = path.relative_to(host_root)
+    return f"{container_root.rstrip('/')}/{rel.as_posix()}"
+
+
+def _checkpoint_epoch(path: Path) -> int:
+    """Best-effort epoch/step number used to choose the latest resume artifact."""
+    text = "/".join(path.parts[-5:])
+    values: list[int] = []
+    for pattern in (
+        r"model_epoch[_-]?(\d+)",
+        r"epoch[_-]?(\d+)",
+        r"step[_-]?(\d+)",
+        r"iter[_-]?(\d+)",
+    ):
+        values.extend(
+            int(m.group(1)) for m in re.finditer(pattern, text, re.IGNORECASE)
+        )
+    return max(values) if values else 0
+
+
+def _find_local_resume_artifact(
+    job_id: str,
+    platform_kwargs: dict | None,
+    prefer_directory: bool,
+) -> str | None:
+    """Find a parent job checkpoint on a shared local /results mount.
+
+    Multi-fidelity algorithms resume promoted trials from the checkpoint
+    produced by a lower-budget job. For local Docker, all trials share the same
+    host bind mount at /results, so the next container needs the container-side
+    path rather than the host path.
+    """
+    mount = _local_results_mount(platform_kwargs)
+    if not mount:
+        return None
+    host_root, container_root = mount
+    job_root = host_root / job_id
+    if not job_root.exists():
+        return None
+
+    candidates: list[tuple[tuple[int, int, float], Path]] = []
+
+    def usable(path: Path) -> bool:
+        norm = path.as_posix()
+        return "/inputs/" not in norm and "/ptm/" not in norm
+
+    for root, dirs, files in os.walk(job_root):
+        root_path = Path(root)
+        dirs[:] = [d for d in dirs if d not in {"inputs", "ptm", "__pycache__"}]
+        if not usable(root_path):
+            continue
+
+        name = root_path.name.lower()
+        if root_path != job_root and (name.startswith("epoch_") or name.startswith("step_")):
+            try:
+                if any(root_path.iterdir()):
+                    norm = root_path.as_posix()
+                    directory_priority = 80
+                    if "/checkpoints/" in norm:
+                        directory_priority = 120
+                    elif "/safetensors/" in norm:
+                        directory_priority = 70
+                    if not prefer_directory:
+                        directory_priority -= 50
+                    candidates.append((
+                        (
+                            directory_priority,
+                            _checkpoint_epoch(root_path),
+                            root_path.stat().st_mtime,
+                        ),
+                        root_path,
+                    ))
+            except OSError:
+                pass
+
+        for filename in files:
+            file_path = root_path / filename
+            if not usable(file_path):
+                continue
+            lower = filename.lower()
+            if not lower.endswith(_RESUME_FILE_EXTENSIONS):
+                continue
+            norm = file_path.as_posix()
+            file_priority = 100
+            if "/checkpoints/" in norm:
+                file_priority = 115
+            if "latest" in lower or "best" in lower:
+                file_priority += 5
+            if prefer_directory:
+                file_priority -= 20
+            try:
+                candidates.append((
+                    (
+                        file_priority,
+                        _checkpoint_epoch(file_path),
+                        file_path.stat().st_mtime,
+                    ),
+                    file_path,
+                ))
+            except OSError:
+                pass
+
+    if not candidates:
+        return None
+    _, selected = max(candidates, key=lambda item: item[0])
+    return _as_container_path(selected, host_root, container_root)
+
+
+def _find_sdk_resume_artifact(sdk, job_id: str) -> str | None:
+    """Fallback checkpoint lookup for SDKs that expose result listings."""
+    try:
+        checkpoints = sdk.get_checkpoints(job_id)
+    except Exception:
+        checkpoints = []
+    if not checkpoints:
+        return None
+    try:
+        results_dir = sdk.get_job_results_dir(job_id).rstrip("/")
+    except Exception:
+        results_dir = ""
+
+    def normalize(path: str) -> str:
+        if "://" in path or path.startswith("/"):
+            return path
+        return f"{results_dir}/{path}" if results_dir else path
+
+    return normalize(sorted(checkpoints)[-1])
+
+
 def _check_execution_status(logs: str) -> str | None:
     """Check if logs contain Execution status: PASS or FAIL."""
     if not logs:
@@ -666,6 +812,9 @@ class AutoMLRunner:
                 except Exception as ex:
                     logger.debug("Could not read AutoML-updated base specs: %s", ex)
                 merged_specs = self._merge_specs(run_base_specs, rec.specs)
+                merged_specs = self._apply_resume_checkpoint(
+                    merged_specs, rec, platform_kwargs
+                )
                 # Output destination is resolved at runtime by script_runner
                 # from TAO_RESULTS_ROOT (mount) / S3_BUCKET_NAME (cloud) env
                 # vars the SDK injects. The agent doesn't pre-rewrite spec
@@ -1044,6 +1193,79 @@ class AutoMLRunner:
                     return None
                 cursor = cursor[idx]
         return cursor
+
+    def _apply_resume_checkpoint(
+        self, specs: dict, rec, platform_kwargs: dict | None
+    ) -> dict:
+        """Inject parent-checkpoint resume params for promoted recommendations.
+
+        Hyperband-family algorithms and PBT return a recommendation with
+        ``resume_from_job_id`` once they promote or exploit a prior trial. The
+        brain knows which trial won, but the runner owns platform paths and
+        skill specs, so the checkpoint handoff belongs here.
+        """
+        parent_job_id = getattr(rec, "resume_from_job_id", None)
+        if not parent_job_id:
+            return specs
+
+        path_key = None
+        for candidate in (
+            "train.resume_training_checkpoint_path",
+            "resume_training_checkpoint_path",
+        ):
+            if (
+                candidate in self.skill_ctx.valid_spec_keys
+                or self._get_nested(specs, candidate) is not None
+            ):
+                path_key = candidate
+                break
+
+        bool_or_path_key = None
+        for candidate in ("train.resume", "resume"):
+            if (
+                candidate in self.skill_ctx.valid_spec_keys
+                or self._get_nested(specs, candidate) is not None
+            ):
+                bool_or_path_key = candidate
+                break
+
+        if not path_key and not bool_or_path_key:
+            logger.warning(
+                "Rec %d requested resume from %s, but no resume spec key was "
+                "found for %s",
+                rec.id, parent_job_id, self.skill_ctx.network_arch,
+            )
+            return specs
+
+        prefer_directory = bool_or_path_key is not None and path_key is None
+        artifact = (
+            _find_local_resume_artifact(parent_job_id, platform_kwargs, prefer_directory)
+            or _find_sdk_resume_artifact(self._sdk, parent_job_id)
+        )
+        if not artifact:
+            logger.warning(
+                "Rec %d requested resume from %s, but no checkpoint artifact "
+                "could be resolved",
+                rec.id, parent_job_id,
+            )
+            return specs
+
+        if path_key:
+            self._set_nested(specs, path_key, artifact)
+            logger.info(
+                "Rec %d will resume from parent job %s via %s=%s",
+                rec.id, parent_job_id, path_key, artifact,
+            )
+        else:
+            # Cosmos-RL's `train.resume` accepts either True or a concrete
+            # checkpoint path. Use the path form so a new output directory can
+            # still be used for the resumed trial.
+            self._set_nested(specs, bool_or_path_key, artifact)
+            logger.info(
+                "Rec %d will resume from parent job %s via %s=%s",
+                rec.id, parent_job_id, bool_or_path_key, artifact,
+            )
+        return specs
 
     # _apply_output_destinations was removed: output destinations are
     # resolved at runtime by script_runner from TAO_RESULTS_ROOT (mount) /

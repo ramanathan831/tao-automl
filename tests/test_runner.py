@@ -225,3 +225,79 @@ def test_merge_specs_does_not_mutate_base():
     base = {"train": {"num_epochs": 12}}
     AutoMLRunner._merge_specs(base, {"train.num_epochs": 5})
     assert base["train"]["num_epochs"] == 12  # base stayed pristine
+
+
+# ---------------------------------------------------------------------------
+# Resume checkpoint handoff
+# ---------------------------------------------------------------------------
+
+def test_apply_resume_checkpoint_sets_training_checkpoint_path(tmp_path):
+    from tao_automl.runner import AutoMLRunner
+
+    skill_dir = _write_fake_skill(tmp_path)
+    template = skill_dir / "references/spec_template_train.yaml"
+    template.write_text(
+        "train:\n"
+        "  num_epochs: 12\n"
+        "  resume_training_checkpoint_path: ''\n"
+        "dataset:\n"
+        "  num_classes: 80\n"
+    )
+
+    results_root = tmp_path / "results"
+    checkpoint = (
+        results_root / "parent-job" / "results_dir" / "train" / "model_epoch_001.pth"
+    )
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_text("checkpoint")
+
+    runner = AutoMLRunner(sdk=MagicMock(), skill_dir=skill_dir, action="train")
+    rec = MagicMock(id=2, resume_from_job_id="parent-job")
+
+    specs = {"train": {"resume_training_checkpoint_path": ""}}
+    updated = runner._apply_resume_checkpoint(
+        specs,
+        rec,
+        {"mounts": [{"host_path": str(results_root), "container_path": "/results"}]},
+    )
+
+    assert (
+        updated["train"]["resume_training_checkpoint_path"]
+        == "/results/parent-job/results_dir/train/model_epoch_001.pth"
+    )
+
+
+def test_apply_resume_checkpoint_sets_cosmos_resume_to_checkpoint_dir(tmp_path):
+    from tao_automl.runner import AutoMLRunner
+
+    skill_dir = _write_fake_skill(tmp_path)
+    template = skill_dir / "references/spec_template_train.yaml"
+    template.write_text("train:\n  resume: false\n  epoch: 2\n")
+
+    results_root = tmp_path / "results"
+    checkpoint_dir = (
+        results_root / "parent-job" / "train_output_dir" / "run1"
+        / "checkpoints" / "epoch_1"
+    )
+    (checkpoint_dir / "policy").mkdir(parents=True)
+    (checkpoint_dir / "policy" / "model_rank_0.pth").write_text("checkpoint")
+    safetensor_dir = (
+        results_root / "parent-job" / "train_output_dir" / "run1"
+        / "safetensors" / "epoch_1"
+    )
+    safetensor_dir.mkdir(parents=True)
+    (safetensor_dir / "adapter_model.safetensors").write_text("adapter")
+
+    runner = AutoMLRunner(sdk=MagicMock(), skill_dir=skill_dir, action="train")
+    rec = MagicMock(id=3, resume_from_job_id="parent-job")
+
+    updated = runner._apply_resume_checkpoint(
+        {"train": {"resume": False, "epoch": 2}},
+        rec,
+        {"mounts": [{"host_path": str(results_root), "container_path": "/results"}]},
+    )
+
+    assert (
+        updated["train"]["resume"]
+        == "/results/parent-job/train_output_dir/run1/checkpoints/epoch_1"
+    )
