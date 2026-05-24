@@ -303,13 +303,10 @@ def test_apply_resume_checkpoint_sets_cosmos_resume_to_checkpoint_dir(tmp_path):
     )
 
 
-def test_apply_resume_environment_enables_ml_recog_trusted_checkpoint_resume(tmp_path):
+def test_apply_resume_environment_enables_trusted_checkpoint_resume(tmp_path):
     from tao_automl.runner import AutoMLRunner
 
     skill_dir = _write_fake_skill(tmp_path)
-    info_path = skill_dir / "references/skill_info.yaml"
-    info_path.write_text(info_path.read_text().replace("fake-net", "ml_recog"))
-
     runner = AutoMLRunner(sdk=MagicMock(), skill_dir=skill_dir, action="train")
     rec = MagicMock(id=4, resume_from_job_id="parent-job")
 

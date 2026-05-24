@@ -1276,8 +1276,6 @@ class AutoMLRunner:
         """Add runtime env needed by model-specific checkpoint resume paths."""
         if not getattr(rec, "resume_from_job_id", None):
             return platform_kwargs
-        if self.skill_ctx.network_arch != "ml_recog":
-            return platform_kwargs
 
         updated = copy.deepcopy(platform_kwargs or {})
         env_vars = dict(updated.get("env_vars") or {})
