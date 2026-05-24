@@ -44,6 +44,10 @@ from tao_automl.utils.math_utils import get_valid_options
 logger = logging.getLogger(__name__)
 
 
+def _metric_is_minimized(metric: str) -> bool:
+    return "loss" in (metric or "").lower()
+
+
 class AutoresearchBrain:
     """Autonomous research brain for TAO AutoML.
 
@@ -84,7 +88,7 @@ class AutoresearchBrain:
         self.llm_client = LLMClient(params=llm_params)
 
         self.tracker = ExperimentTracker(
-            metric_direction="minimize" if metric == "loss" else "maximize"
+            metric_direction="minimize" if _metric_is_minimized(metric) else "maximize"
         )
         self.knowledge_retriever = KnowledgeRetriever(llm_client=self.llm_client)
         self.prescreener = SpecPrescreener(llm_client=self.llm_client)
@@ -92,7 +96,7 @@ class AutoresearchBrain:
         self.analyzer = LLMAnalyzer(llm_client=self.llm_client, analysis_interval=5)
 
         self.external_knowledge: Optional[str] = None
-        self.reverse_sort = metric != "loss"
+        self.reverse_sort = not _metric_is_minimized(metric)
         self.num_epochs_per_experiment = 0
         self.spec_schema: Dict[str, Any] = {}
         self._consecutive_failures = 0

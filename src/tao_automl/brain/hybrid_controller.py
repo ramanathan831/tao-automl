@@ -34,6 +34,10 @@ logger = logging.getLogger(__name__)
 AVAILABLE_ALGORITHMS = ["bayesian", "asha", "bohb", "dehb", "pbt", "hyperband", "llm", "autoresearch"]
 
 
+def _metric_is_minimized(metric: str) -> bool:
+    return "loss" in (metric or "").lower()
+
+
 class HybridStrategist:
     """LLM-powered strategic planner for multi-phase AutoML.
 
@@ -205,7 +209,7 @@ class HybridBrain:
         self.phase_experiment_count = 0
         self.current_phase_start = 0
         self.total_experiment_count = 0
-        self.reverse_sort = metric != "loss"
+        self.reverse_sort = not _metric_is_minimized(metric)
         self.num_epochs_per_experiment = 0
         self._stopped = False
 
