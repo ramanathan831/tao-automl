@@ -441,6 +441,43 @@ def test_budgeted_algorithms_pick_best_at_largest_budget(algorithm):
         assert automl.get_best().specs["train.epoch"] == 2
 
 
+def test_asha_all_failed_first_rung_completes_without_hanging():
+    """ASHA should stop once max_trials is exhausted with no promotable configs."""
+    from tao_automl import AutoML
+
+    with tempfile.TemporaryDirectory() as d:
+        automl = AutoML(
+            workspace=d,
+            network="cosmos-rl",
+            train_specs={"train": {"epoch": 10, "optm_lr": 1e-6}},
+            settings={
+                "algorithm": "asha",
+                "metric": "val/avg_loss",
+                "automl_max_epochs": 2,
+                "automl_reduction_factor": 2,
+                "epoch_multiplier": 1,
+                "automl_max_concurrent": 2,
+                "automl_max_trials": 2,
+                "automl_min_top_configs": 1,
+            },
+            automl_hyperparameters=["train.optm_lr"],
+            custom_param_ranges={
+                "train.optm_lr": {"valid_min": 5e-7, "valid_max": 2e-6},
+            },
+        )
+
+        first_rung = automl.next_recommendation()
+        assert len(first_rung) == 2
+
+        for rec in first_rung:
+            rec.assign_job_id(f"job-rec{rec.id}-epoch1")
+            automl.report_result(rec.id, 0.0, status="failure")
+
+        assert automl.next_recommendation() == []
+        assert automl.is_complete()
+        assert automl.get_best() is None
+
+
 def test_pbt_two_generation_budget_and_resume_flow():
     """PBT should train a population for one interval, then resume to the next."""
     from tao_automl import AutoML

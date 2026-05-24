@@ -378,8 +378,20 @@ class ASHA(AutoMLAlgorithmBase):
 
         max_trials_reached = self.max_trials is not None and self.total_configs_started >= self.max_trials
         enough_final_results = len(self.completed_configs) >= self.min_top_configs
+        exhausted = (
+            max_trials_reached
+            and not self.active_configs
+            and not self.pending_promotions
+        )
 
-        if enough_final_results and (max_trials_reached or self.max_trials is None):
+        if (enough_final_results and (max_trials_reached or self.max_trials is None)) or exhausted:
+            if exhausted and not enough_final_results:
+                logger.warning(
+                    "ASHA exhausted all %d trial(s) with only %d final-rung "
+                    "completion(s); stopping with no further recommendations",
+                    self.total_configs_started,
+                    len(self.completed_configs),
+                )
             self.complete = True
             return []
 
