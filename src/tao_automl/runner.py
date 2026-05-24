@@ -815,6 +815,9 @@ class AutoMLRunner:
                 merged_specs = self._apply_resume_checkpoint(
                     merged_specs, rec, platform_kwargs
                 )
+                job_platform_kwargs = self._apply_resume_environment(
+                    platform_kwargs, rec
+                )
                 # Output destination is resolved at runtime by script_runner
                 # from TAO_RESULTS_ROOT (mount) / S3_BUCKET_NAME (cloud) env
                 # vars the SDK injects. The agent doesn't pre-rewrite spec
@@ -825,7 +828,7 @@ class AutoMLRunner:
                     metric_extractor=metric_extractor,
                     eval_fn=eval_fn,
                     workspace_path=workspace_path,
-                    platform_kwargs=platform_kwargs,
+                    platform_kwargs=job_platform_kwargs,
                 )
                 # Report to the brain, inverting if explicit direction disagrees
                 # with the brain's implicit metric-name rule.
@@ -1266,6 +1269,26 @@ class AutoMLRunner:
                 rec.id, parent_job_id, bool_or_path_key, artifact,
             )
         return specs
+
+    def _apply_resume_environment(
+        self, platform_kwargs: dict | None, rec
+    ) -> dict | None:
+        """Add runtime env needed by model-specific checkpoint resume paths."""
+        if not getattr(rec, "resume_from_job_id", None):
+            return platform_kwargs
+        if self.skill_ctx.network_arch != "ml_recog":
+            return platform_kwargs
+
+        updated = copy.deepcopy(platform_kwargs or {})
+        env_vars = dict(updated.get("env_vars") or {})
+        if env_vars.get("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD") != "1":
+            env_vars["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
+            logger.info(
+                "Rec %d enabling PyTorch trusted-checkpoint resume for %s",
+                rec.id, self.skill_ctx.network_arch,
+            )
+        updated["env_vars"] = env_vars
+        return updated
 
     # _apply_output_destinations was removed: output destinations are
     # resolved at runtime by script_runner from TAO_RESULTS_ROOT (mount) /
