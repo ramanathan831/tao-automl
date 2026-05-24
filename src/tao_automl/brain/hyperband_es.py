@@ -152,23 +152,23 @@ class HyperBandES(HyperBand):
 
     @staticmethod
     def load_state(context, state_store, network, parameters, max_epochs, reduction_factor, epoch_multiplier,
-                   metric="loss", min_epochs_for_prediction=3, confidence_threshold=0.8):
+                   early_stop_threshold=0.8, min_early_stop_epochs=3, metric="loss"):
         """Load the HyperBandES algorithm related variables from brain metadata"""
         json_loaded = state_store.get_brain_info(context.id)
         if not json_loaded:
             return HyperBandES(
                 context, state_store, network, parameters, max_epochs,
                 reduction_factor, epoch_multiplier,
-                early_stop_threshold=confidence_threshold,
-                min_early_stop_epochs=min_epochs_for_prediction,
+                early_stop_threshold=early_stop_threshold,
+                min_early_stop_epochs=min_early_stop_epochs,
                 metric=metric,
             )
 
         brain = HyperBandES(
             context, state_store, network, parameters, max_epochs,
             reduction_factor, epoch_multiplier,
-            early_stop_threshold=confidence_threshold,
-            min_early_stop_epochs=min_epochs_for_prediction,
+            early_stop_threshold=early_stop_threshold,
+            min_early_stop_epochs=min_early_stop_epochs,
             metric=metric,
         )
         brain.bracket = json_loaded["bracket"]
