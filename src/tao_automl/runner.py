@@ -261,6 +261,9 @@ def _metric_aliases(metric_name: str) -> list[str]:
         aliases.append(metric_name.replace("/", "_"))
     if "_" in metric_name:
         aliases.append(metric_name.replace("_", "/"))
+    normalized = metric_name.lower().replace("/", "_")
+    if normalized in {"map", "val_map"}:
+        aliases.append("img_bbox_NuScenes/mAP")
     seen = set()
     return [alias for alias in aliases if not (alias in seen or seen.add(alias))]
 
@@ -462,6 +465,15 @@ def _find_sdk_resume_artifact(sdk, job_id: str) -> str | None:
         return f"{results_dir}/{path}" if results_dir else path
 
     return normalize(sorted(checkpoints)[-1])
+
+
+def _job_has_checkpoint_artifact(sdk, job_id: str,
+                                 platform_kwargs: dict | None) -> bool:
+    """Return whether a completed job produced a usable checkpoint artifact."""
+    return bool(
+        _find_local_resume_artifact(job_id, platform_kwargs, prefer_directory=False)
+        or _find_sdk_resume_artifact(sdk, job_id)
+    )
 
 
 def _check_execution_status(logs: str) -> str | None:
@@ -777,6 +789,13 @@ class AutoMLRunner:
                      metric_name, _effective_dir,
                      " (values will be inverted for the brain)" if invert_metric else "")
 
+        # Unflip values if we inverted them for the brain, so callers see
+        # metrics in their original scale regardless of `direction`.
+        def _unflip(v):
+            if v is None:
+                return None
+            return -v if invert_metric else v
+
         # --- fix #3: if resuming, recover any jobs that were in flight when
         #              the previous orchestrator died. Poll each to terminal,
         #              report to the brain, then continue.
@@ -822,6 +841,12 @@ class AutoMLRunner:
                 # from TAO_RESULTS_ROOT (mount) / S3_BUCKET_NAME (cloud) env
                 # vars the SDK injects. The agent doesn't pre-rewrite spec
                 # output keys here — that lived in the deleted SDK contract.
+                previous_metric = None
+                if getattr(rec, "resume_from_job_id", None):
+                    try:
+                        previous_metric = _unflip(float(rec.result))
+                    except (TypeError, ValueError):
+                        previous_metric = None
                 metric_value, status = self._run_one_job(
                     image=resolved_image, action_cfg=action_cfg,
                     specs=merged_specs, rec=rec, metric_name=metric_name,
@@ -830,6 +855,23 @@ class AutoMLRunner:
                     workspace_path=workspace_path,
                     platform_kwargs=job_platform_kwargs,
                 )
+                if (
+                    status == "metric_missing"
+                    and previous_metric is not None
+                    and getattr(rec, "job_id", None)
+                    and _job_has_checkpoint_artifact(
+                        self._sdk, rec.job_id, job_platform_kwargs
+                    )
+                ):
+                    logger.warning(
+                        "Rec %d: promoted job %s produced a checkpoint but no "
+                        "fresh metric; carrying forward prior metric=%f",
+                        rec.id, rec.job_id, previous_metric,
+                    )
+                    metric_value = previous_metric
+                    status = "success"
+                elif status == "metric_missing":
+                    status = "failure"
                 # Report to the brain, inverting if explicit direction disagrees
                 # with the brain's implicit metric-name rule.
                 report_value = metric_value
@@ -854,13 +896,6 @@ class AutoMLRunner:
                 "AutoML finished without a successful recommendation; "
                 f"failed recommendation ids: {failed}"
             )
-
-        # Unflip values if we inverted them for the brain, so callers see
-        # metrics in their original scale regardless of `direction`.
-        def _unflip(v):
-            if v is None:
-                return None
-            return -v if invert_metric else v
 
         result = {
             "best": {
@@ -1020,7 +1055,7 @@ class AutoMLRunner:
                            "extracted (neither metric_extractor nor eval_fn "
                            "produced a value for '%s')",
                            rec.id, job.id, metric_name)
-            return None, "failure"
+            return None, "metric_missing"
 
         logger.info("Rec %d: job %s succeeded, metric=%f", rec.id, job.id, metric_value)
         return metric_value, "success"

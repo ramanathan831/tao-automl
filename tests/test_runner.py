@@ -116,6 +116,81 @@ def test_extract_metric_allows_val_prefix_for_sparse4d_map():
     assert _extract_metric_from_logs(logs, "val_mAP") == 0.0
 
 
+def test_extract_metric_reads_sparse4d_status_kpi_alias(tmp_path):
+    from tao_automl.runner import _extract_metric_from_status_file
+
+    status_path = tmp_path / "status.json"
+    status_path.write_text(
+        '{"status": "RUNNING", "kpi": {"img_bbox_NuScenes/mAP": 0.125}}\n'
+    )
+
+    assert _extract_metric_from_status_file(status_path, "val_mAP") == 0.125
+
+
+def test_promoted_metric_missing_checkpoint_carries_forward_prior_metric(
+    tmp_path, monkeypatch
+):
+    from tao_automl.runner import AutoMLRunner
+    from tao_automl.types import JobStates, Recommendation
+
+    skill_dir = _write_fake_skill(tmp_path)
+    results_root = tmp_path / "results"
+    for job_id in ("parent-job", "child-job"):
+        ckpt_dir = results_root / job_id / "results_dir" / "train"
+        ckpt_dir.mkdir(parents=True)
+        (ckpt_dir / "model_latest.pth").write_text("checkpoint")
+
+    class FakeAutoML:
+        def __init__(self, *args, **kwargs):
+            self.rec = Recommendation(0, {"train.num_epochs": 2}, "val_mAP")
+            self.rec.resume_from_job_id = "parent-job"
+            self.rec.result = 0.42
+            self.complete = False
+
+        def is_complete(self):
+            return self.complete
+
+        def next_recommendation(self):
+            return [self.rec]
+
+        def report_result(self, rec_id, metric_value, best_epoch=None, status="success"):
+            self.rec.update_result(metric_value)
+            self.rec.update_status(status)
+            self.complete = True
+
+        def get_best(self):
+            return self.rec if self.rec.status == JobStates.success else None
+
+        def get_progress(self):
+            return {"completed": 1, "best_metric": self.rec.result}
+
+        def get_history(self):
+            return [self.rec]
+
+    def fake_run_one_job(self, *args, **kwargs):
+        kwargs["rec"].assign_job_id("child-job")
+        return None, "metric_missing"
+
+    monkeypatch.setattr("tao_automl.AutoML", FakeAutoML)
+    monkeypatch.setattr(AutoMLRunner, "_run_one_job", fake_run_one_job)
+
+    runner = AutoMLRunner(sdk=MagicMock(), skill_dir=skill_dir, action="train")
+    result = runner.run(
+        image="nvcr.io/test:1",
+        automl_settings={
+            "algorithm": "dehb",
+            "metric": "val_mAP",
+            "direction": "maximize",
+        },
+        automl_hyperparameters=["train.optim.lr"],
+        workspace_path=str(tmp_path / "workspace"),
+        mounts=[{"host_path": str(results_root), "container_path": "/results"}],
+    )
+
+    assert result["best"]["metric_value"] == 0.42
+    assert result["history"][0]["status"] == JobStates.success
+
+
 # ---------------------------------------------------------------------------
 # _make_sdk — platform selection
 # ---------------------------------------------------------------------------
