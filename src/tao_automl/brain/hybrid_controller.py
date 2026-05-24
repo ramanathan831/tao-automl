@@ -188,6 +188,7 @@ class HybridBrain:
         parameters: List[Dict[str, Any]],
         llm_params: Optional[Dict[str, Any]] = None,
         metric: str = "kpi",
+        max_experiments: int = 50,
     ):
         """Initialize the HybridBrain."""
         self.context = context
@@ -196,17 +197,30 @@ class HybridBrain:
         self.all_parameters = parameters
         self.metric = metric
         self.llm_params = llm_params
+        self.max_experiments = max_experiments
 
         self.strategist = HybridStrategist(llm_params=llm_params)
         self.current_plan: Optional[Dict[str, Any]] = None
         self.current_sub_brain = None
         self.phase_experiment_count = 0
+        self.current_phase_start = 0
+        self.total_experiment_count = 0
         self.reverse_sort = metric != "loss"
         self.num_epochs_per_experiment = 0
         self._stopped = False
 
     def generate_recommendations(self, history):
         """Generate recommendations by delegating to the current phase's sub-brain."""
+        self._sync_counts(history)
+        if self.total_experiment_count >= self.max_experiments:
+            logger.info(
+                "Hybrid experiment budget exhausted (%d/%d). Ending search.",
+                self.total_experiment_count,
+                self.max_experiments,
+            )
+            self._stopped = True
+            return []
+
         if self._stopped:
             return []
 
@@ -214,18 +228,25 @@ class HybridBrain:
             self._advance_phase(history)
             if self._stopped:
                 return []
+            self._sync_counts(history)
 
         if self.current_sub_brain is None:
             return []
 
-        phase_start = len(history) - self.phase_experiment_count
-        phase_history = history[max(0, phase_start):]
+        phase_history = history[self.current_phase_start:]
 
         return self.current_sub_brain.generate_recommendations(phase_history)
 
     def done(self):
         """Return True when the hybrid brain has stopped."""
         return self._stopped
+
+    def _sync_counts(self, history):
+        """Synchronize phase counters from the controller history."""
+        self.total_experiment_count = len(history)
+        self.phase_experiment_count = max(
+            0, len(history) - max(0, self.current_phase_start)
+        )
 
     def _phase_budget_exhausted(self) -> bool:
         if self.current_plan is None:
@@ -236,7 +257,7 @@ class HybridBrain:
         """Record current phase results (if any) and plan the next phase."""
         if self.current_plan and self.current_plan.get("action") != "stop":
             phase_results = []
-            for rec in history[-self.phase_experiment_count:] if self.phase_experiment_count > 0 else []:
+            for rec in history[self.current_phase_start:]:
                 if rec.status in [JobStates.success, JobStates.failure]:
                     phase_results.append({
                         "config": rec.specs if hasattr(rec, 'specs') else {},
@@ -275,6 +296,7 @@ class HybridBrain:
             return
 
         self.current_plan = plan
+        self.current_phase_start = len(history)
         self.phase_experiment_count = 0
 
         self._create_sub_brain(plan)
@@ -323,15 +345,24 @@ class HybridBrain:
             "strategist": self.strategist.to_dict(),
             "current_plan": self.current_plan,
             "phase_experiment_count": self.phase_experiment_count,
+            "current_phase_start": self.current_phase_start,
+            "total_experiment_count": self.total_experiment_count,
+            "max_experiments": self.max_experiments,
             "stopped": self._stopped,
         }
         self.state_store.save_brain_info(self.context.id, state)
 
     @staticmethod
-    def load_state(context, state_store, network, parameters, llm_params=None, metric="kpi"):
+    def load_state(
+        context, state_store, network, parameters,
+        llm_params=None, metric="kpi", max_experiments=50,
+    ):
         """Load hybrid brain state."""
         state = state_store.get_brain_info(context.id)
-        brain = HybridBrain(context, state_store, network, parameters, llm_params, metric)
+        brain = HybridBrain(
+            context, state_store, network, parameters,
+            llm_params, metric, max_experiments,
+        )
 
         if state:
             strategist_data = state.get("strategist")
@@ -339,6 +370,9 @@ class HybridBrain:
                 brain.strategist = HybridStrategist.from_dict(strategist_data, llm_params)
             brain.current_plan = state.get("current_plan")
             brain.phase_experiment_count = state.get("phase_experiment_count", 0)
+            brain.current_phase_start = state.get("current_phase_start", 0)
+            brain.total_experiment_count = state.get("total_experiment_count", 0)
+            brain.max_experiments = state.get("max_experiments", max_experiments)
             brain._stopped = state.get("stopped", False)
             if brain.current_plan and not brain._stopped:
                 brain._create_sub_brain(brain.current_plan)

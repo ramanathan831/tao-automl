@@ -274,6 +274,7 @@ class BrainFactory:
                 "parameters": parameters,
                 "llm_params": params.get_llm_params(),
                 "metric": metric,
+                "max_experiments": int(params.automl_max_experiments),
             }
         elif algo_lower in AlgorithmType.AUTORESEARCH:
             brain_class = AutoresearchBrain
