@@ -252,7 +252,8 @@ class BrainFactory:
                 "reduction_factor": int(params.automl_reduction_factor),
                 "epoch_multiplier": int(params.epoch_multiplier),
                 "early_stop_threshold": float(params.automl_early_stop_threshold),
-                "min_early_stop_epochs": int(params.automl_min_early_stop_epochs)
+                "min_early_stop_epochs": int(params.automl_min_early_stop_epochs),
+                "metric": metric
             }
         elif algo_lower in AlgorithmType.LLM:
             brain_class = LLMBrain

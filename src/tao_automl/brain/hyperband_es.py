@@ -27,9 +27,12 @@ class HyperBandES(HyperBand):
     """HyperBand with Early Stopping via Learning Curve Prediction"""
 
     def __init__(self, context, state_store, network, parameters, max_epochs, reduction_factor, epoch_multiplier,
-                 early_stop_threshold=0.8, min_early_stop_epochs=3):
+                 early_stop_threshold=0.8, min_early_stop_epochs=3, metric="loss"):
         """Initialize the HyperBand ES algorithm class"""
-        super().__init__(context, state_store, network, parameters, max_epochs, reduction_factor, epoch_multiplier)
+        super().__init__(
+            context, state_store, network, parameters, max_epochs,
+            reduction_factor, epoch_multiplier, metric=metric,
+        )
 
         self.min_epochs_for_prediction = int(min_early_stop_epochs)
         self.confidence_threshold = float(early_stop_threshold)
@@ -39,7 +42,7 @@ class HyperBandES(HyperBand):
 
         logger.info(
             f"HyperBandES initialized with early_stop_threshold={early_stop_threshold}, "
-            f"min_early_stop_epochs={min_early_stop_epochs}"
+            f"min_early_stop_epochs={min_early_stop_epochs}, metric={metric}"
         )
 
     @staticmethod
@@ -154,13 +157,19 @@ class HyperBandES(HyperBand):
         json_loaded = state_store.get_brain_info(context.id)
         if not json_loaded:
             return HyperBandES(
-                context, state_store, network, parameters, max_epochs, reduction_factor, epoch_multiplier,
-                min_epochs_for_prediction, confidence_threshold
+                context, state_store, network, parameters, max_epochs,
+                reduction_factor, epoch_multiplier,
+                early_stop_threshold=confidence_threshold,
+                min_early_stop_epochs=min_epochs_for_prediction,
+                metric=metric,
             )
 
         brain = HyperBandES(
-            context, state_store, network, parameters, max_epochs, reduction_factor, epoch_multiplier,
-            min_epochs_for_prediction, confidence_threshold
+            context, state_store, network, parameters, max_epochs,
+            reduction_factor, epoch_multiplier,
+            early_stop_threshold=confidence_threshold,
+            min_early_stop_epochs=min_epochs_for_prediction,
+            metric=metric,
         )
         brain.bracket = json_loaded["bracket"]
         brain.sh_iter = json_loaded["sh_iter"]

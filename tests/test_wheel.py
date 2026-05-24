@@ -478,6 +478,44 @@ def test_asha_all_failed_first_rung_completes_without_hanging():
         assert automl.get_best() is None
 
 
+def test_hyperband_es_uses_metric_direction_for_promotion():
+    """HyperBandES must not treat maximize metrics as losses."""
+    from tao_automl import AutoML
+
+    with tempfile.TemporaryDirectory() as d:
+        automl = AutoML(
+            workspace=d,
+            network="cosmos-rl",
+            train_specs={"train": {"epoch": 10, "optm_lr": 1e-6}},
+            settings={
+                "algorithm": "hyperband_es",
+                "metric": "val_mAP",
+                "automl_max_epochs": 2,
+                "automl_reduction_factor": 2,
+                "epoch_multiplier": 1,
+                "automl_early_stop_threshold": 0.0,
+                "automl_min_early_stop_epochs": 1,
+            },
+            automl_hyperparameters=["train.optm_lr"],
+            custom_param_ranges={
+                "train.optm_lr": {"valid_min": 5e-7, "valid_max": 2e-6},
+            },
+        )
+
+        first_rung = sorted(automl.next_recommendation(), key=lambda rec: rec.id)
+        assert len(first_rung) == 2
+        first_rung[0].assign_job_id("job-rec0-epoch1")
+        first_rung[1].assign_job_id("job-rec1-epoch1")
+
+        automl.report_result(first_rung[0].id, 0.1, status="success")
+        automl.report_result(first_rung[1].id, 0.9, status="success")
+
+        promoted = automl.next_recommendation()
+        assert len(promoted) == 1
+        assert promoted[0].id == 1
+        assert promoted[0].resume_from_job_id == "job-rec1-epoch1"
+
+
 def test_pbt_two_generation_budget_and_resume_flow():
     """PBT should train a population for one interval, then resume to the next."""
     from tao_automl import AutoML
