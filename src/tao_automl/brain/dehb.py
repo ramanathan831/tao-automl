@@ -383,7 +383,7 @@ class DEHB(AutoMLAlgorithmBase):
 
         # Update DE population
         for rec in history:
-            if rec.status == JobStates.success and rec.result != 0.0:
+            if rec.status == JobStates.success and rec.result is not None:
                 config_vector = self._normalize_config_to_vector(rec.specs)
                 is_duplicate = any(np.allclose(config_vector, p) for p in self.population)
                 if not is_duplicate:

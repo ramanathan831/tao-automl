@@ -516,6 +516,42 @@ def test_hyperband_es_uses_metric_direction_for_promotion():
         assert promoted[0].resume_from_job_id == "job-rec1-epoch1"
 
 
+def test_dehb_keeps_successful_zero_metric_in_population():
+    """A valid 0.0 metric should still seed DEHB's DE population."""
+    from tao_automl import AutoML
+
+    with tempfile.TemporaryDirectory() as d:
+        automl = AutoML(
+            workspace=d,
+            network="dino",
+            train_specs={"train": {"num_epochs": 10, "optim": {"lr": 1e-5}}},
+            settings={
+                "algorithm": "dehb",
+                "metric": "val_mAP50",
+                "automl_max_epochs": 4,
+                "automl_reduction_factor": 2,
+                "epoch_multiplier": 1,
+                "automl_mutation_factor": 0.5,
+                "automl_crossover_prob": 0.5,
+            },
+            automl_hyperparameters=["train.optim.lr"],
+            custom_param_ranges={
+                "train.optim.lr": {"valid_min": 1e-6, "valid_max": 1e-4},
+            },
+        )
+
+        first_rung = sorted(automl.next_recommendation(), key=lambda rec: rec.id)
+        assert len(first_rung) == 4
+
+        for rec in first_rung:
+            rec.assign_job_id(f"job-rec{rec.id}-epoch1")
+            automl.report_result(rec.id, 0.0, status="success")
+
+        promoted = automl.next_recommendation()
+        assert len(promoted) == 2
+        assert len(automl._controller.brain.population) == 4
+
+
 def test_pbt_two_generation_budget_and_resume_flow():
     """PBT should train a population for one interval, then resume to the next."""
     from tao_automl import AutoML
