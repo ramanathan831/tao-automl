@@ -139,6 +139,8 @@ class Controller:
                     rec.specs = raw_rec.specs
                 rec.status = JobStates.pending
                 rec.resume_from_job_id = raw_rec.resume_from_job_id or raw_rec.job_id
+                rec.resume_from_epoch = getattr(raw_rec, "resume_from_epoch", None)
+                rec.resume_from_step = getattr(raw_rec, "resume_from_step", None)
                 recommendations.append(rec)
                 continue
 
@@ -468,6 +470,8 @@ class Controller:
                 rec.result = float(rec_dict.get("result", 0.0))
                 rec.best_epoch_number = rec_dict.get("best_epoch_number", "")
                 rec.resume_from_job_id = rec_dict.get("resume_from_job_id")
+                rec.resume_from_epoch = rec_dict.get("resume_from_epoch")
+                rec.resume_from_step = rec_dict.get("resume_from_step")
                 rec.early_stop_epoch = rec_dict.get("early_stop_epoch")
                 rec.created_on = rec_dict.get("created_on", "")
                 rec.last_modified = rec_dict.get("last_modified", "")
@@ -548,6 +552,8 @@ class Controller:
             "best_epoch_number": rec.best_epoch_number,
             "metric": rec.metric,
             "resume_from_job_id": rec.resume_from_job_id,
+            "resume_from_epoch": rec.resume_from_epoch,
+            "resume_from_step": rec.resume_from_step,
             "early_stop_epoch": rec.early_stop_epoch,
             "created_on": rec.created_on,
             "last_modified": rec.last_modified,

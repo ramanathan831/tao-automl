@@ -332,16 +332,24 @@ class PBT(AutoMLAlgorithmBase):
 
                 self.population[member_id]["specs"] = new_specs
                 self.population[member_id]["result"] = 0.0
+                resume_from_epoch = self.population[source_id].get("epochs")
                 new_specs.update(
                     self._training_budget_spec_overrides(
                         num_epochs=self.epoch_number,
                         interval=self.eval_interval,
                     )
                 )
-                resume_rec = ResumeRecommendation(member_id, new_specs, member_job_id, resume_from_job_id=source_job_id)
+                resume_rec = ResumeRecommendation(
+                    member_id,
+                    new_specs,
+                    member_job_id,
+                    resume_from_job_id=source_job_id,
+                    resume_from_epoch=resume_from_epoch,
+                )
                 recommendations.append(resume_rec)
             else:
                 specs = copy.deepcopy(self.population[member_id]["specs"])
+                resume_from_epoch = self.population[member_id].get("epochs")
                 specs.update(
                     self._training_budget_spec_overrides(
                         num_epochs=self.epoch_number,
@@ -349,7 +357,12 @@ class PBT(AutoMLAlgorithmBase):
                     )
                 )
                 self.population[member_id]["specs"] = specs
-                resume_rec = ResumeRecommendation(member_id, specs, member_job_id, resume_from_job_id=None)
+                resume_rec = ResumeRecommendation(
+                    member_id,
+                    specs,
+                    member_job_id,
+                    resume_from_epoch=resume_from_epoch,
+                )
                 recommendations.append(resume_rec)
 
         self.track_id = list(self.population.keys())[0]

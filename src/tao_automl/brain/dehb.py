@@ -337,13 +337,18 @@ class DEHB(AutoMLAlgorithmBase):
 
             self.epoch_number = self.ri[self.bracket][self.sh_iter] * self.epoch_multiplier
             final_epoch = self.ri[self.bracket][-1] * self.epoch_multiplier
+            resume_from_epoch = (
+                self.ri[self.bracket][self.sh_iter - 1] * self.epoch_multiplier
+                if self.sh_iter > 0 else 0
+            )
             self.override_num_epochs(final_epoch)
             specs = copy.deepcopy(self.experiments_considered[self.expt_iter].specs)
             specs.update(self._epoch_spec_overrides(self.epoch_number))
             resumerec = ResumeRecommendation(
                 self.experiments_considered[self.expt_iter].id,
                 specs,
-                self.experiments_considered[self.expt_iter].job_id
+                self.experiments_considered[self.expt_iter].job_id,
+                resume_from_epoch=resume_from_epoch,
             )
             to_return = resumerec
         self.expt_iter += 1

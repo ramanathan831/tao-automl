@@ -369,7 +369,7 @@ class ASHA(AutoMLAlgorithmBase):
                             self.promoted_from_rung[rung_epochs].add(config_id)
                             self.rung_promotions[rung_epochs] += 1
                             self.config_to_rung[config_id] = next_rung_idx
-                            self.pending_promotions.append((config_id, next_epochs))
+                            self.pending_promotions.append((config_id, rung_epochs, next_epochs))
 
                             if self.rung_promotions[rung_epochs] >= quota:
                                 break
@@ -398,7 +398,13 @@ class ASHA(AutoMLAlgorithmBase):
         new_recommendations = []
         while len(self.active_configs) + len(new_recommendations) < self.max_concurrent:
             if self.pending_promotions:
-                config_id, epochs = self.pending_promotions.pop(0)
+                promotion = self.pending_promotions.pop(0)
+                if len(promotion) == 3:
+                    config_id, resume_from_epoch, epochs = promotion
+                else:
+                    config_id, epochs = promotion
+                    previous_idx = max(self.config_to_rung.get(config_id, 1) - 1, 0)
+                    resume_from_epoch = self.rungs[previous_idx]
                 specs = copy.deepcopy(self.config_specs[config_id])
                 specs.update(self._epoch_spec_overrides(epochs))
                 self.config_specs[config_id] = specs
@@ -409,7 +415,12 @@ class ASHA(AutoMLAlgorithmBase):
                         break
                 self.active_configs.add(config_id)
                 self.epoch_number = epochs
-                resume_rec = ResumeRecommendation(config_id, specs, config_job_id)
+                resume_rec = ResumeRecommendation(
+                    config_id,
+                    specs,
+                    config_job_id,
+                    resume_from_epoch=resume_from_epoch,
+                )
                 self.track_id = config_id
                 new_recommendations.append(resume_rec)
 

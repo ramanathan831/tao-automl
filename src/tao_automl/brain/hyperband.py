@@ -432,7 +432,8 @@ class HyperBand(AutoMLAlgorithmBase):
             resumerec = ResumeRecommendation(
                 self.experiments_considered[self.expt_iter].id,
                 specs,
-                self.experiments_considered[self.expt_iter].job_id
+                self.experiments_considered[self.expt_iter].job_id,
+                resume_from_epoch=resume_from_epoch,
             )
             to_return = resumerec
         self.expt_iter += 1

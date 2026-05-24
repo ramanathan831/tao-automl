@@ -127,6 +127,36 @@ def test_extract_metric_reads_sparse4d_status_kpi_alias(tmp_path):
     assert _extract_metric_from_status_file(status_path, "val_mAP") == 0.125
 
 
+def test_llm_config_accepts_provider_aliases():
+    from tao_automl.brain.llm_client import LLMConfig
+
+    config = LLMConfig.from_params({
+        "base_url": "https://inference-api.nvidia.com",
+        "model": "gcp/google/gemini-3.1-pro-preview",
+        "api_key": "secret",
+    })
+
+    assert config.endpoint == "https://inference-api.nvidia.com"
+    assert config.model == "gcp/google/gemini-3.1-pro-preview"
+    assert config.api_key == "secret"
+
+
+def test_algorithm_params_pass_provider_aliases_to_llm_client():
+    from tao_automl.brain.factory import AlgorithmParams
+
+    params = AlgorithmParams.from_dict({
+        "base_url": "https://inference-api.nvidia.com",
+        "model": "gcp/google/gemini-3.1-pro-preview",
+        "api_key": "secret",
+    })
+
+    assert params.get_llm_params() == {
+        "llm_endpoint": "https://inference-api.nvidia.com",
+        "llm_model": "gcp/google/gemini-3.1-pro-preview",
+        "llm_api_key": "secret",
+    }
+
+
 def test_promoted_metric_missing_checkpoint_carries_forward_prior_metric(
     tmp_path, monkeypatch
 ):
@@ -325,9 +355,11 @@ def test_apply_resume_checkpoint_sets_training_checkpoint_path(tmp_path):
     )
     checkpoint.parent.mkdir(parents=True)
     checkpoint.write_text("checkpoint")
+    latest = checkpoint.parent / "classifier_model_latest.pth"
+    latest.write_text("latest")
 
     runner = AutoMLRunner(sdk=MagicMock(), skill_dir=skill_dir, action="train")
-    rec = MagicMock(id=2, resume_from_job_id="parent-job")
+    rec = MagicMock(id=2, resume_from_job_id="parent-job", resume_from_epoch=1)
 
     specs = {"train": {"resume_training_checkpoint_path": ""}}
     updated = runner._apply_resume_checkpoint(
@@ -340,6 +372,33 @@ def test_apply_resume_checkpoint_sets_training_checkpoint_path(tmp_path):
         updated["train"]["resume_training_checkpoint_path"]
         == "/results/parent-job/results_dir/train/model_epoch_001.pth"
     )
+    assert rec.resume_checkpoint_path.endswith("model_epoch_001.pth")
+
+
+def test_apply_resume_checkpoint_does_not_use_latest_for_requested_epoch(tmp_path):
+    from tao_automl.runner import AutoMLRunner
+
+    skill_dir = _write_fake_skill(tmp_path)
+    (skill_dir / "references/spec_template_train.yaml").write_text(
+        "train:\n"
+        "  resume_training_checkpoint_path: ''\n"
+    )
+
+    results_root = tmp_path / "results"
+    checkpoint_dir = results_root / "parent-job" / "results_dir" / "train"
+    checkpoint_dir.mkdir(parents=True)
+    (checkpoint_dir / "model_latest.pth").write_text("latest")
+
+    runner = AutoMLRunner(sdk=MagicMock(), skill_dir=skill_dir, action="train")
+    rec = MagicMock(id=2, resume_from_job_id="parent-job", resume_from_epoch=1)
+
+    updated = runner._apply_resume_checkpoint(
+        {"train": {"resume_training_checkpoint_path": ""}},
+        rec,
+        {"mounts": [{"host_path": str(results_root), "container_path": "/results"}]},
+    )
+
+    assert updated["train"]["resume_training_checkpoint_path"] == ""
 
 
 def test_apply_resume_checkpoint_sets_cosmos_resume_to_checkpoint_dir(tmp_path):
@@ -364,7 +423,7 @@ def test_apply_resume_checkpoint_sets_cosmos_resume_to_checkpoint_dir(tmp_path):
     (safetensor_dir / "adapter_model.safetensors").write_text("adapter")
 
     runner = AutoMLRunner(sdk=MagicMock(), skill_dir=skill_dir, action="train")
-    rec = MagicMock(id=3, resume_from_job_id="parent-job")
+    rec = MagicMock(id=3, resume_from_job_id="parent-job", resume_from_epoch=1)
 
     updated = runner._apply_resume_checkpoint(
         {"train": {"resume": False, "epoch": 2}},

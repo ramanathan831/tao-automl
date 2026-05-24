@@ -61,6 +61,11 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from tao_sdk.checkpoints import (
+    build_checkpoint_candidate,
+    checkpoint_epoch as sdk_checkpoint_epoch,
+    select_checkpoint_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -342,26 +347,32 @@ def _as_container_path(path: Path, host_root: Path, container_root: str) -> str:
     return f"{container_root.rstrip('/')}/{rel.as_posix()}"
 
 
+def _optional_int(value) -> int | None:
+    """Convert real numeric metadata to int; ignore mock/missing values."""
+    if value is None or isinstance(value, bool):
+        return None
+    if not isinstance(value, (int, float, str)):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _checkpoint_epoch(path: Path) -> int:
-    """Best-effort epoch/step number used to choose the latest resume artifact."""
-    text = "/".join(path.parts[-5:])
-    values: list[int] = []
-    for pattern in (
-        r"model_epoch[_-]?(\d+)",
-        r"epoch[_-]?(\d+)",
-        r"step[_-]?(\d+)",
-        r"iter[_-]?(\d+)",
-    ):
-        values.extend(
-            int(m.group(1)) for m in re.finditer(pattern, text, re.IGNORECASE)
-        )
-    return max(values) if values else 0
+    """Best-effort epoch number used by older report/budget helpers."""
+    return sdk_checkpoint_epoch(path) or 0
 
 
 def _find_local_resume_artifact(
     job_id: str,
     platform_kwargs: dict | None,
     prefer_directory: bool,
+    *,
+    model_name: str,
+    epoch: int | None = None,
+    step: int | None = None,
+    action: str = "resume",
 ) -> str | None:
     """Find a parent job checkpoint on a shared local /results mount.
 
@@ -378,7 +389,7 @@ def _find_local_resume_artifact(
     if not job_root.exists():
         return None
 
-    candidates: list[tuple[tuple[int, int, float], Path]] = []
+    candidates = []
 
     def usable(path: Path) -> bool:
         norm = path.as_posix()
@@ -394,22 +405,13 @@ def _find_local_resume_artifact(
         if root_path != job_root and (name.startswith("epoch_") or name.startswith("step_")):
             try:
                 if any(root_path.iterdir()):
-                    norm = root_path.as_posix()
-                    directory_priority = 80
-                    if "/checkpoints/" in norm:
-                        directory_priority = 120
-                    elif "/safetensors/" in norm:
-                        directory_priority = 70
-                    if not prefer_directory:
-                        directory_priority -= 50
-                    candidates.append((
-                        (
-                            directory_priority,
-                            _checkpoint_epoch(root_path),
-                            root_path.stat().st_mtime,
-                        ),
-                        root_path,
-                    ))
+                    candidates.append(
+                        build_checkpoint_candidate(
+                            root_path,
+                            is_dir=True,
+                            mtime=root_path.stat().st_mtime,
+                        )
+                    )
             except OSError:
                 pass
 
@@ -420,33 +422,44 @@ def _find_local_resume_artifact(
             lower = filename.lower()
             if not lower.endswith(_RESUME_FILE_EXTENSIONS):
                 continue
-            norm = file_path.as_posix()
-            file_priority = 100
-            if "/checkpoints/" in norm:
-                file_priority = 115
-            if "latest" in lower or "best" in lower:
-                file_priority += 5
-            if prefer_directory:
-                file_priority -= 20
             try:
-                candidates.append((
-                    (
-                        file_priority,
-                        _checkpoint_epoch(file_path),
-                        file_path.stat().st_mtime,
-                    ),
-                    file_path,
-                ))
+                candidates.append(
+                    build_checkpoint_candidate(
+                        file_path,
+                        is_dir=False,
+                        mtime=file_path.stat().st_mtime,
+                    )
+                )
             except OSError:
                 pass
 
     if not candidates:
         return None
-    _, selected = max(candidates, key=lambda item: item[0])
+    selected = select_checkpoint_path(
+        candidates,
+        model_name=model_name,
+        epoch=epoch,
+        step=step,
+        action=action,
+        prefer_directory=prefer_directory,
+        allow_latest=epoch is None and step is None,
+    )
+    if selected is None:
+        return None
+    selected = Path(selected)
     return _as_container_path(selected, host_root, container_root)
 
 
-def _find_sdk_resume_artifact(sdk, job_id: str) -> str | None:
+def _find_sdk_resume_artifact(
+    sdk,
+    job_id: str,
+    *,
+    model_name: str,
+    epoch: int | None = None,
+    step: int | None = None,
+    action: str = "resume",
+    prefer_directory: bool = False,
+) -> str | None:
     """Fallback checkpoint lookup for SDKs that expose result listings."""
     try:
         checkpoints = sdk.get_checkpoints(job_id)
@@ -464,15 +477,30 @@ def _find_sdk_resume_artifact(sdk, job_id: str) -> str | None:
             return path
         return f"{results_dir}/{path}" if results_dir else path
 
-    return normalize(sorted(checkpoints)[-1])
+    candidates = [build_checkpoint_candidate(normalize(path)) for path in checkpoints]
+    return select_checkpoint_path(
+        candidates,
+        model_name=model_name,
+        epoch=epoch,
+        step=step,
+        action=action,
+        prefer_directory=prefer_directory,
+        allow_latest=epoch is None and step is None,
+    )
 
 
 def _job_has_checkpoint_artifact(sdk, job_id: str,
                                  platform_kwargs: dict | None) -> bool:
     """Return whether a completed job produced a usable checkpoint artifact."""
     return bool(
-        _find_local_resume_artifact(job_id, platform_kwargs, prefer_directory=False)
-        or _find_sdk_resume_artifact(sdk, job_id)
+        _find_local_resume_artifact(
+            job_id,
+            platform_kwargs,
+            prefer_directory=False,
+            model_name="",
+            action="best",
+        )
+        or _find_sdk_resume_artifact(sdk, job_id, model_name="", action="best")
     )
 
 
@@ -1276,23 +1304,43 @@ class AutoMLRunner:
             return specs
 
         prefer_directory = bool_or_path_key is not None and path_key is None
+        resume_epoch = _optional_int(getattr(rec, "resume_from_epoch", None))
+        resume_step = _optional_int(getattr(rec, "resume_from_step", None))
         artifact = (
-            _find_local_resume_artifact(parent_job_id, platform_kwargs, prefer_directory)
-            or _find_sdk_resume_artifact(self._sdk, parent_job_id)
+            _find_local_resume_artifact(
+                parent_job_id,
+                platform_kwargs,
+                prefer_directory,
+                model_name=self.skill_ctx.network_arch,
+                epoch=resume_epoch,
+                step=resume_step,
+                action="resume",
+            )
+            or _find_sdk_resume_artifact(
+                self._sdk,
+                parent_job_id,
+                model_name=self.skill_ctx.network_arch,
+                epoch=resume_epoch,
+                step=resume_step,
+                action="resume",
+                prefer_directory=prefer_directory,
+            )
         )
         if not artifact:
             logger.warning(
                 "Rec %d requested resume from %s, but no checkpoint artifact "
-                "could be resolved",
-                rec.id, parent_job_id,
+                "could be resolved for epoch=%s step=%s",
+                rec.id, parent_job_id, resume_epoch, resume_step,
             )
             return specs
+        rec.resume_checkpoint_path = artifact
 
         if path_key:
             self._set_nested(specs, path_key, artifact)
             logger.info(
-                "Rec %d will resume from parent job %s via %s=%s",
-                rec.id, parent_job_id, path_key, artifact,
+                "Rec %d will resume from parent job %s via %s=%s "
+                "(epoch=%s step=%s)",
+                rec.id, parent_job_id, path_key, artifact, resume_epoch, resume_step,
             )
         else:
             # Cosmos-RL's `train.resume` accepts either True or a concrete
@@ -1300,8 +1348,10 @@ class AutoMLRunner:
             # still be used for the resumed trial.
             self._set_nested(specs, bool_or_path_key, artifact)
             logger.info(
-                "Rec %d will resume from parent job %s via %s=%s",
+                "Rec %d will resume from parent job %s via %s=%s "
+                "(epoch=%s step=%s)",
                 rec.id, parent_job_id, bool_or_path_key, artifact,
+                resume_epoch, resume_step,
             )
         return specs
 
