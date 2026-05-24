@@ -118,6 +118,8 @@ class Controller:
         raw_recs = self.brain.generate_recommendations(self.history)
 
         if not raw_recs:
+            self.brain.save_state()
+            self.save_state()
             return []
 
         recommendations = []

@@ -96,6 +96,7 @@ class AutoresearchBrain:
         self.analyzer = LLMAnalyzer(llm_client=self.llm_client, analysis_interval=5)
 
         self.external_knowledge: Optional[str] = None
+        self._initialized = False
         self.reverse_sort = not _metric_is_minimized(metric)
         self.num_epochs_per_experiment = 0
         self.spec_schema: Dict[str, Any] = {}
@@ -113,9 +114,18 @@ class AutoresearchBrain:
         )
         if self.external_knowledge:
             logger.info("Retrieved external knowledge for %s", self.network)
+        self._initialized = True
+
+    def _ensure_initialized(self):
+        """Initialize from the persisted base train spec exactly once."""
+        if self._initialized:
+            return
+        base_spec = self.state_store.get_job_specs(self.context.id) or {}
+        self.initialize(base_spec)
 
     def generate_recommendations(self, history):
         """Generate next spec modification using LLM reasoning."""
+        self._ensure_initialized()
         self._sync_from_controller(history)
 
         if history and history[-1].status not in [JobStates.success, JobStates.failure]:
@@ -447,6 +457,7 @@ class AutoresearchBrain:
         state = {
             "tracker": self.tracker.to_dict(),
             "external_knowledge": self.external_knowledge,
+            "initialized": self._initialized,
             "consecutive_failures": self._consecutive_failures,
             "llm_usage": self.llm_client.get_usage_summary(),
             "analyses": self.analyzer.format_for_metadata(),
@@ -470,6 +481,7 @@ class AutoresearchBrain:
             if tracker_data:
                 brain.tracker = ExperimentTracker.from_dict(tracker_data)
             brain.external_knowledge = state.get("external_knowledge")
+            brain._initialized = state.get("initialized", bool(brain.tracker.best_spec))
             brain._consecutive_failures = state.get("consecutive_failures", 0)
             logger.info(
                 "Loaded autoresearch state: %d experiments, best_metric=%s",
