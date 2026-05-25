@@ -299,6 +299,27 @@ class HybridBrain:
             self.current_plan = plan
             return
 
+        remaining_budget = max(0, self.max_experiments - len(history))
+        if remaining_budget <= 0:
+            logger.info(
+                "Hybrid experiment budget exhausted before next phase (%d/%d).",
+                len(history),
+                self.max_experiments,
+            )
+            self._stopped = True
+            self.current_plan = plan
+            return
+
+        requested_trials = plan.get("trials", remaining_budget)
+        capped_trials = min(requested_trials, remaining_budget)
+        if capped_trials != requested_trials:
+            logger.info(
+                "Capping Hybrid phase trials from %d to remaining budget %d",
+                requested_trials,
+                capped_trials,
+            )
+        plan["trials"] = capped_trials
+
         self.current_plan = plan
         self.current_phase_start = len(history)
         self.phase_experiment_count = 0
