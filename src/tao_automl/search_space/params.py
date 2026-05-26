@@ -1,17 +1,5 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """AutoML search space parameter extraction module.
 
 Determines which hyperparameters should be included in the AutoML search space
@@ -27,10 +15,9 @@ from tao_automl.utils.spec_utils import get_flatten_specs, flatten_properties
 
 logger = logging.getLogger(__name__)
 
-# Networks that do not support AutoML search. Model-level AutoML capability is
-# declared by the packaged skill/schema metadata, so keep this local override
-# empty unless a container path is known to be non-runnable independent of skill
-# metadata.
+# AutoML enablement is owned by model-level metadata in the skill bank. Keep
+# the standalone runner free of per-network hard disables so every model with a
+# train schema can use its schema-declared search space.
 AUTOML_DISABLED_NETWORKS = []
 
 _VALID_TYPES = [
