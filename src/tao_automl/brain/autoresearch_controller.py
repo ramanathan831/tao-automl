@@ -36,6 +36,18 @@ def _metric_is_minimized(metric: str) -> bool:
     return "loss" in (metric or "").lower()
 
 
+def _finite_numeric_bound(bound: Any) -> Optional[float]:
+    if bound in (None, "", "inf", "-inf"):
+        return None
+    try:
+        value = float(bound)
+    except (ValueError, TypeError, OverflowError):
+        return None
+    if not np.isfinite(value):
+        return None
+    return value
+
+
 class AutoresearchBrain:
     """Autonomous research brain for TAO AutoML.
 
@@ -308,27 +320,27 @@ class AutoresearchBrain:
             if dtype == "float":
                 try:
                     value = float(value)
-                    if v_min not in (None, '', "", "inf", "-inf"):
-                        hard_min = float(v_min)
-                        if not np.isinf(hard_min) and value < hard_min:
-                            value = hard_min
-                    if v_max not in (None, '', "", "inf", "-inf"):
-                        hard_max = float(v_max)
-                        if not np.isinf(hard_max) and value > hard_max:
-                            value = hard_max
+                    hard_min = _finite_numeric_bound(v_min)
+                    if hard_min is not None and value < hard_min:
+                        value = hard_min
+                    hard_max = _finite_numeric_bound(v_max)
+                    if hard_max is not None and value > hard_max:
+                        value = hard_max
                 except (ValueError, TypeError):
                     continue
 
             elif dtype in ("int", "integer"):
                 try:
                     value = int(round(float(value)))
-                    if v_min not in (None, '', ""):
-                        value = max(int(v_min), value)
-                    if v_max not in (None, '', "", "inf"):
-                        hard_max = int(v_max)
-                        if value > hard_max:
-                            value = hard_max
-                except (ValueError, TypeError):
+                    hard_min = _finite_numeric_bound(v_min)
+                    if hard_min is not None:
+                        value = max(int(np.ceil(hard_min)), value)
+                    hard_max = _finite_numeric_bound(v_max)
+                    if hard_max is not None:
+                        hard_max_int = int(np.floor(hard_max))
+                        if value > hard_max_int:
+                            value = hard_max_int
+                except (ValueError, TypeError, OverflowError):
                     continue
 
             elif dtype in ("categorical", "ordered"):
