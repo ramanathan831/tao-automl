@@ -91,6 +91,12 @@ class DEHB(AutoMLAlgorithmBase):
         """Convert a configuration dict to normalized vector [0, 1]^d"""
         vector = []
         for param in self.parameters:
+            param = copy.deepcopy(param)
+            param_name = param["parameter"]
+            if self.custom_ranges and param_name in self.custom_ranges:
+                for override_key, override_value in self.custom_ranges[param_name].items():
+                    if override_value is not None:
+                        param[override_key] = override_value
             param_name = param["parameter"]
             value = specs.get(param_name)
             param_type = param.get("value_type")
@@ -112,7 +118,12 @@ class DEHB(AutoMLAlgorithmBase):
         """Convert normalized vector to configuration dict"""
         specs = {}
         for i, param in enumerate(self.parameters):
+            param = copy.deepcopy(param)
             param_name = param["parameter"]
+            if self.custom_ranges and param_name in self.custom_ranges:
+                for override_key, override_value in self.custom_ranges[param_name].items():
+                    if override_value is not None:
+                        param[override_key] = override_value
             normalized_value = np.clip(vector[i], 0.0, 1.0)
 
             param_type = param.get("value_type")

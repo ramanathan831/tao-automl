@@ -254,8 +254,6 @@ class AutoMLAlgorithmBase:
     def generate_automl_param_rec_value(self, parameter_config):
         """Generate a random value for the parameter passed"""
         parameter_name = parameter_config.get("parameter")
-        data_type = parameter_config.get("value_type")
-        default_value = parameter_config.get("default_value", None)
 
         # Apply custom overrides if provided
         if self.custom_ranges and parameter_name in self.custom_ranges:
@@ -272,6 +270,8 @@ class AutoMLAlgorithmBase:
                         )
 
         # Get potentially overridden values
+        data_type = parameter_config.get("value_type")
+        default_value = parameter_config.get("default_value", None)
         math_cond = parameter_config.get("math_cond", None)
         parent_param = parameter_config.get("parent_param", None)
 

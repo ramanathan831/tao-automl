@@ -115,7 +115,12 @@ class PBT(AutoMLAlgorithmBase):
 
     def _perturb_parameter(self, param_config, current_value):
         """Perturb a parameter value using resample or perturb strategy"""
+        param_config = copy.deepcopy(param_config)
         param_name = param_config.get("parameter")
+        if self.custom_ranges and param_name in self.custom_ranges:
+            for override_key, override_value in self.custom_ranges[param_name].items():
+                if override_value is not None:
+                    param_config[override_key] = override_value
         data_type = param_config.get("value_type")
 
         if np.random.rand() < 0.2:
