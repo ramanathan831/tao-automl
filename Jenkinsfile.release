@@ -415,12 +415,21 @@ pipeline {
                                     script {
                                         sh "rm -rf dist/*.whl || true"
 
-                                        // Re-patch to FINAL_VER and rebuild
+                                        // Re-patch to FINAL_VER and rebuild.
+                                        // Also re-pin nvidia-tao-sdk[all] from the RC version
+                                        // (==${TAO_SDK_VERSION}, set by the earlier install step)
+                                        // to ==${FINAL_VER}, so the published final wheel ships
+                                        // with the final SDK pin (e.g. ==7.0.0) instead of the RC
+                                        // pin (e.g. ==7.0.0rc21).
                                         sh """
                                             sed -i 's/^version = \\".*\\"/version = \\"${FINAL_VER}\\"/' pyproject.toml
                                             sed -i 's/__version__ = \\".*\\"/__version__ = \\"${FINAL_VER}\\"/' src/tao_automl/__init__.py
+                                            sed -i.bak -E \
+                                                "s|\\"nvidia-tao-sdk[^\\"]*\\"|\\"nvidia-tao-sdk[all]==${FINAL_VER}\\"|" \
+                                                pyproject.toml
                                             grep '^version' pyproject.toml
                                             grep '__version__' src/tao_automl/__init__.py
+                                            grep nvidia-tao-sdk pyproject.toml
                                             python -m build --wheel
                                             ls -la dist/
                                         """
