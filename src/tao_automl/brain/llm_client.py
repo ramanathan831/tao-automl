@@ -141,10 +141,10 @@ class LLMClient:
             try:
                 from openai import OpenAI
                 logger.info(
-                    "Initializing OpenAI client: endpoint=%s, model=%s, api_key=%s, timeout=%d",
+                    "Initializing OpenAI client: endpoint=%s, model=%s, api_key_present=%s, timeout=%d",
                     self.config.endpoint,
                     self.config.model,
-                    ("***" + self.config.api_key[-6:]) if len(self.config.api_key) > 6 else "(unset)",
+                    bool(self.config.api_key),
                     self.config.timeout,
                 )
                 self._client = OpenAI(

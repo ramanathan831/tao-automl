@@ -170,11 +170,14 @@ def build_hybrid_strategy_prompt(
     """Build prompt for the hybrid strategist to plan the next phase."""
     history_summary = _summarize_history(full_history, metric_name)
     param_names = [p.get("parameter", "") for p in available_parameters]
+    parameter_summary = _format_parameter_schema(available_parameters)
 
     user_content = f"""## Network: {network}
 ## Metric: {metric_name} ({metric_direction})
 ## Available algorithms: {', '.join(available_algorithms)}
 ## Available parameters: {', '.join(param_names)}
+## Parameter constraints
+{parameter_summary}
 ## Total experiments run: {len(full_history)}
 
 ## History Summary
@@ -190,6 +193,10 @@ Plan the next optimization phase. Return JSON with:
    "single_trial" (test one specific config) or "stop" (search has converged)
 2. **"algorithm"**: Which algorithm to use (from available list)
 3. **"parameters"**: Which parameters to focus on (subset of available)
+   - Keep dependent parameters together. If a parameter lists `depends_on`,
+     include both that parameter and the dependency in the same phase.
+   - If choosing a parent parameter, include any available child parameters
+     that depend on it so the generated train spec remains valid.
 4. **"trials"**: How many experiments to run in this phase
 5. **"algorithm_params"**: Algorithm-specific settings (e.g., automl_max_recommendations)
 6. **"reasoning"**: Why this strategy

@@ -267,6 +267,10 @@ def _metric_aliases(metric_name: str) -> list[str]:
     normalized = metric_name.lower().replace("/", "_")
     if normalized in {"map", "val_map"}:
         aliases.append("img_bbox_NuScenes/mAP")
+    if normalized == "train_loss_epoch":
+        aliases.append("train_loss")
+    if normalized == "train_loss":
+        aliases.append("train_loss_epoch")
     seen = set()
     return [alias for alias in aliases if not (alias in seen or seen.add(alias))]
 
@@ -907,10 +911,27 @@ class AutoMLRunner:
                         metric_extractor=metric_extractor, eval_fn=eval_fn,
                         workspace_path=workspace_path, invert_metric=invert_metric,
                         on_result=on_result,
+                        platform_kwargs=platform_kwargs,
                     )
 
         while not automl.is_complete():
             recs = automl.next_recommendation()
+            progress = automl.get_progress()
+            max_recommendations = automl_settings.get("automl_max_recommendations")
+            if max_recommendations is not None:
+                remaining = int(max_recommendations) - int(progress.get("completed", 0))
+                if remaining <= 0:
+                    logger.info(
+                        "AutoML recommendation budget reached (%d/%d); stopping launch loop",
+                        progress.get("completed", 0), int(max_recommendations),
+                    )
+                    break
+                if len(recs) > remaining:
+                    logger.info(
+                        "Capping recommendations from %d to remaining budget %d",
+                        len(recs), remaining,
+                    )
+                    recs = recs[:remaining]
             if not recs:
                 logger.info("No recommendations available — waiting for results")
                 time.sleep(5)
@@ -1167,6 +1188,7 @@ class AutoMLRunner:
         # fix #4: if an eval_fn is provided, run it post-training and let its
         # return override the log-extracted metric. Errors are isolated.
         metric_value = cached_metric
+        eval_metric_used = False
         if eval_fn is not None:
             try:
                 eval_metric = eval_fn(rec, job.id)
@@ -1180,13 +1202,21 @@ class AutoMLRunner:
                             rec.id, eval_metric,
                             f"{cached_metric:.6f}" if cached_metric is not None else "None")
                 metric_value = eval_metric
-        if metric_value is None:
-            metric_value = _extract_metric_from_local_results(
-                job.id, metric_name, platform_kwargs
-            )
-            if metric_value is not None:
+                eval_metric_used = True
+        local_metric = _extract_metric_from_local_results(
+            job.id, metric_name, platform_kwargs
+        )
+        if local_metric is not None and not eval_metric_used:
+            if metric_value is None:
                 logger.info("Rec %d: recovered metric=%f from local status artifacts",
-                            rec.id, metric_value)
+                            rec.id, local_metric)
+            elif local_metric != metric_value:
+                logger.info(
+                    "Rec %d: using local status metric=%f instead of "
+                    "log-extracted metric=%f",
+                    rec.id, local_metric, metric_value,
+                )
+            metric_value = local_metric
 
         if metric_value is None:
             logger.warning("Rec %d: job %s completed but no metric could be "
@@ -1212,7 +1242,7 @@ class AutoMLRunner:
 
     def _recover_pending_job(self, entry, automl, metric_name,
                               metric_extractor, eval_fn, workspace_path,
-                              invert_metric, on_result) -> None:
+                              invert_metric, on_result, platform_kwargs=None) -> None:
         """Poll an in-flight job (recovered on resume), extract its result,
         and report it to the brain. Mirrors the tail of _run_one_job.
         """
@@ -1293,6 +1323,7 @@ class AutoMLRunner:
             report_status = "failure"
         else:
             metric_value = cached_metric
+            eval_metric_used = False
             if eval_fn is not None:
                 try:
                     em = eval_fn(rec, job_id)
@@ -1302,6 +1333,24 @@ class AutoMLRunner:
                     em = None
                 if em is not None:
                     metric_value = em
+                    eval_metric_used = True
+            local_metric = _extract_metric_from_local_results(
+                job_id, metric_name, platform_kwargs
+            )
+            if local_metric is not None and not eval_metric_used:
+                if metric_value is None:
+                    logger.info(
+                        "Resume: rec %d recovered metric=%f from local status "
+                        "artifacts",
+                        rec_id, local_metric,
+                    )
+                elif local_metric != metric_value:
+                    logger.info(
+                        "Resume: rec %d using local status metric=%f instead "
+                        "of log-extracted metric=%f",
+                        rec_id, local_metric, metric_value,
+                    )
+                metric_value = local_metric
             report_status = "success" if metric_value is not None else "failure"
 
         report_value = metric_value

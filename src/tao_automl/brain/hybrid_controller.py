@@ -115,6 +115,7 @@ class HybridStrategist:
     ) -> Dict[str, Any]:
         """Validate and sanitize the strategist's plan."""
         available_names = {p["parameter"] for p in available_parameters}
+        available_lookup = {p["parameter"]: p for p in available_parameters}
 
         action = plan.get("action", "sweep")
         if action not in ("sweep", "single_trial", "stop"):
@@ -134,7 +135,10 @@ class HybridStrategist:
             params = [p.strip() for p in params.split(",")]
         valid_params = [p for p in params if p in available_names]
         if not valid_params:
-            valid_params = list(available_names)[:5]
+            valid_params = [p["parameter"] for p in available_parameters[:5]]
+        valid_params = self._expand_parameter_dependencies(
+            valid_params, available_parameters, available_lookup, available_names
+        )
         plan["parameters"] = valid_params
 
         trials = plan.get("trials", 5)
@@ -143,6 +147,38 @@ class HybridStrategist:
         plan["trials"] = min(trials, 50)
 
         return plan
+
+    @staticmethod
+    def _expand_parameter_dependencies(
+        params: List[str],
+        available_parameters: List[Dict[str, Any]],
+        available_lookup: Dict[str, Dict[str, Any]],
+        available_names: set[str],
+    ) -> List[str]:
+        """Keep dependent parameters together inside a Hybrid phase.
+
+        The strategist can choose a focused subset, but sub-brains only sample
+        parameters present in that subset. If the plan includes a parent such as
+        ``model.num_queries`` without its dependent ``model.num_select``, the
+        train spec keeps the stale default for the dependent parameter and can
+        become invalid. Expand the subset both ways while preserving schema order.
+        """
+        selected = set(params)
+        changed = True
+        while changed:
+            changed = False
+            for name in list(selected):
+                depends_on = available_lookup.get(name, {}).get("depends_on")
+                if depends_on in available_names and depends_on not in selected:
+                    selected.add(depends_on)
+                    changed = True
+            for item in available_parameters:
+                name = item.get("parameter")
+                depends_on = item.get("depends_on")
+                if depends_on in selected and name in available_names and name not in selected:
+                    selected.add(name)
+                    changed = True
+        return [p["parameter"] for p in available_parameters if p["parameter"] in selected]
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize state."""
