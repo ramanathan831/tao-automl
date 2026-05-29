@@ -49,6 +49,11 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from tao_sdk.checkpoints import (
+    build_checkpoint_candidate,
+    checkpoint_epoch as sdk_checkpoint_epoch,
+    select_checkpoint_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +81,7 @@ class SkillContext:
     skill_info: dict[str, Any] = field(init=False)
     action_cfg: dict[str, Any] = field(init=False)
     default_specs: dict[str, Any] = field(init=False)
+    valid_spec_keys: set[str] = field(init=False)
     container_image: str = field(init=False)
     network_arch: str = field(init=False)
 
@@ -97,17 +103,28 @@ class SkillContext:
                 f"Available: {sorted(actions.keys())}"
             )
         self.action_cfg = actions[self.action]
-        self.network_arch = self.skill_info.get("network_arch", self.skill_dir.name).replace("-", "_")
+        self.network_arch = self.skill_info.get("network_arch", self.skill_dir.name)
 
         template_path = self.skill_dir / f"references/spec_template_{self.action}.yaml"
         self.default_specs = (
             yaml.safe_load(template_path.read_text()) if template_path.exists() else {}
         ) or {}
+        schema_path = self.skill_dir / f"schemas/{self.action}.schema.json"
+        if schema_path.exists():
+            with open(schema_path) as f:
+                schema = json.load(f) or {}
+            self.valid_spec_keys = _schema_property_keys(schema) | _flatten_keys(
+                schema.get("default", {})
+            ) | _flatten_keys(self.default_specs)
+        else:
+            self.valid_spec_keys = _flatten_keys(self.default_specs)
 
-        # Container image: accept either a versions.yaml key or an absolute URI.
+        # Container image: action-level image overrides win, then model-level.
+        # Values may be versions.yaml keys or absolute URIs.
         from tao_sdk.versions import resolve_container_image
         self.container_image = resolve_container_image(
-            self.skill_info.get("container_image", "")
+            self.action_cfg.get("container_image")
+            or self.skill_info.get("container_image", "")
         )
 
 _DEFAULT_POLL_INTERVAL = 30
@@ -171,17 +188,40 @@ def _extract_metric_from_logs(logs: str, metric_name: str) -> float | None:
             except ValueError:
                 continue
 
-    # Pattern 2: direct metric match (case-insensitive)
-    metric_pattern = re.compile(
-        rf'(?:best\s+)?{re.escape(metric_name)}\s*[:=]\s*([0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)',
-        re.IGNORECASE,
-    )
-    for line in reversed(lines):
-        match = metric_pattern.search(line)
-        if match:
+    # Pattern 2: direct metric match (case-insensitive). Lightning progress
+    # output may print metrics as ``train_loss_epoch: 18.901`` or split the
+    # label and value across wrapped terminal lines, so also scan a
+    # whitespace-normalized view of the full log.
+    metric_aliases = _metric_aliases(metric_name)
+    for suffix in ("_epoch", "_step"):
+        if not metric_name.endswith(suffix):
+            metric_aliases.append(f"{metric_name}{suffix}")
+    if metric_name.lower().startswith("val_"):
+        bare_metric = metric_name[4:]
+        metric_aliases.extend([
+            bare_metric,
+            "Validation " + bare_metric.replace("_", " "),
+        ])
+    normalized_logs = re.sub(r"\s+", " ", logs)
+    for alias in metric_aliases:
+        metric_pattern = re.compile(
+            rf'(?:best\s+)?{re.escape(alias)}\s*[:=]\s*([0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)',
+            re.IGNORECASE,
+        )
+        for line in reversed(lines):
+            match = metric_pattern.search(line)
+            if match:
+                try:
+                    val = float(match.group(1))
+                    if val >= 0:
+                        return val
+                except ValueError:
+                    continue
+        matches = list(metric_pattern.finditer(normalized_logs))
+        for match in reversed(matches):
             try:
                 val = float(match.group(1))
-                if val > 0:  # Skip 0.0 values
+                if val >= 0:
                     return val
             except ValueError:
                 continue
@@ -210,6 +250,260 @@ def _extract_metric_from_logs(logs: str, metric_name: str) -> float | None:
             except ValueError:
                 continue
     return None
+
+
+def _metric_aliases(metric_name: str) -> list[str]:
+    """Return common TAO spellings for a metric name.
+
+    Different TAO entrypoints report the same KPI as ``val/loss`` in
+    ``status.json`` or ``val_loss`` in Lightning monitor fields. AutoML callers
+    should not have to know that spelling difference to get a valid metric.
+    """
+    aliases = [metric_name]
+    if "/" in metric_name:
+        aliases.append(metric_name.replace("/", "_"))
+    if "_" in metric_name:
+        aliases.append(metric_name.replace("_", "/"))
+    normalized = metric_name.lower().replace("/", "_")
+    if normalized in {"map", "val_map"}:
+        aliases.append("img_bbox_NuScenes/mAP")
+    if normalized == "train_loss_epoch":
+        aliases.append("train_loss")
+    if normalized == "train_loss":
+        aliases.append("train_loss_epoch")
+    seen = set()
+    return [alias for alias in aliases if not (alias in seen or seen.add(alias))]
+
+
+def _extract_metric_from_status_file(status_path: Path, metric_name: str) -> float | None:
+    """Read the latest finite KPI value from a TAO line-delimited status file."""
+    if not status_path.exists():
+        return None
+    aliases = _metric_aliases(metric_name)
+    try:
+        lines = status_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        kpi = payload.get("kpi")
+        if not isinstance(kpi, dict):
+            continue
+        for alias in aliases:
+            if alias not in kpi:
+                continue
+            try:
+                value = float(kpi[alias])
+            except (TypeError, ValueError):
+                continue
+            if value == value:
+                return value
+    return None
+
+
+def _extract_metric_from_local_results(job_id: str, metric_name: str,
+                                       platform_kwargs: dict | None) -> float | None:
+    """Fallback for local Docker runs whose metrics are written to status.json.
+
+    The platform SDK mounts a host results directory at ``/results``. When logs
+    do not contain the metric, inspect the mounted job result folder and parse
+    TAO's status artifacts.
+    """
+    for mount in (platform_kwargs or {}).get("mounts", []) or []:
+        if mount.get("container_path") != "/results":
+            continue
+        host_root = mount.get("host_path")
+        if not host_root:
+            continue
+        job_root = Path(host_root) / job_id
+        for status_path in sorted(job_root.rglob("status.json")):
+            metric = _extract_metric_from_status_file(status_path, metric_name)
+            if metric is not None:
+                return metric
+    return None
+
+
+_RESUME_FILE_EXTENSIONS = (".pth", ".pth.tar", ".pt", ".ckpt", ".hdf5", ".tlt")
+
+
+def _local_results_mount(platform_kwargs: dict | None) -> tuple[Path, str] | None:
+    """Return the host/container results mount pair when a /results bind exists."""
+    for mount in (platform_kwargs or {}).get("mounts", []) or []:
+        if not isinstance(mount, dict):
+            continue
+        container_path = str(mount.get("container_path", "")).rstrip("/")
+        host_path = mount.get("host_path")
+        if container_path == "/results" and host_path:
+            return Path(host_path), container_path
+    return None
+
+
+def _as_container_path(path: Path, host_root: Path, container_root: str) -> str:
+    """Map a host bind-mount path back to the path visible inside the job."""
+    rel = path.relative_to(host_root)
+    return f"{container_root.rstrip('/')}/{rel.as_posix()}"
+
+
+def _optional_int(value) -> int | None:
+    """Convert real numeric metadata to int; ignore mock/missing values."""
+    if value is None or isinstance(value, bool):
+        return None
+    if not isinstance(value, (int, float, str)):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _checkpoint_epoch(path: Path) -> int:
+    """Best-effort epoch number used by older report/budget helpers."""
+    return sdk_checkpoint_epoch(path) or 0
+
+
+def _find_local_resume_artifact(
+    job_id: str,
+    platform_kwargs: dict | None,
+    prefer_directory: bool,
+    *,
+    model_name: str,
+    epoch: int | None = None,
+    step: int | None = None,
+    action: str = "resume",
+) -> str | None:
+    """Find a parent job checkpoint on a shared local /results mount.
+
+    Multi-fidelity algorithms resume promoted trials from the checkpoint
+    produced by a lower-budget job. For local Docker, all trials share the same
+    host bind mount at /results, so the next container needs the container-side
+    path rather than the host path.
+    """
+    mount = _local_results_mount(platform_kwargs)
+    if not mount:
+        return None
+    host_root, container_root = mount
+    job_root = host_root / job_id
+    if not job_root.exists():
+        return None
+
+    candidates = []
+
+    def usable(path: Path) -> bool:
+        norm = path.as_posix()
+        return "/inputs/" not in norm and "/ptm/" not in norm
+
+    for root, dirs, files in os.walk(job_root):
+        root_path = Path(root)
+        dirs[:] = [d for d in dirs if d not in {"inputs", "ptm", "__pycache__"}]
+        if not usable(root_path):
+            continue
+
+        name = root_path.name.lower()
+        if root_path != job_root and (name.startswith("epoch_") or name.startswith("step_")):
+            try:
+                if any(root_path.iterdir()):
+                    candidates.append(
+                        build_checkpoint_candidate(
+                            root_path,
+                            is_dir=True,
+                            mtime=root_path.stat().st_mtime,
+                        )
+                    )
+            except OSError:
+                pass
+
+        for filename in files:
+            file_path = root_path / filename
+            if not usable(file_path):
+                continue
+            lower = filename.lower()
+            if not lower.endswith(_RESUME_FILE_EXTENSIONS):
+                continue
+            try:
+                candidates.append(
+                    build_checkpoint_candidate(
+                        file_path,
+                        is_dir=False,
+                        mtime=file_path.stat().st_mtime,
+                    )
+                )
+            except OSError:
+                pass
+
+    if not candidates:
+        return None
+    selected = select_checkpoint_path(
+        candidates,
+        model_name=model_name,
+        epoch=epoch,
+        step=step,
+        action=action,
+        prefer_directory=prefer_directory,
+        allow_latest=epoch is None and step is None,
+    )
+    if selected is None:
+        return None
+    selected = Path(selected)
+    return _as_container_path(selected, host_root, container_root)
+
+
+def _find_sdk_resume_artifact(
+    sdk,
+    job_id: str,
+    *,
+    model_name: str,
+    epoch: int | None = None,
+    step: int | None = None,
+    action: str = "resume",
+    prefer_directory: bool = False,
+) -> str | None:
+    """Fallback checkpoint lookup for SDKs that expose result listings."""
+    try:
+        checkpoints = sdk.get_checkpoints(job_id)
+    except Exception:
+        checkpoints = []
+    if not checkpoints:
+        return None
+    try:
+        results_dir = sdk.get_job_results_dir(job_id).rstrip("/")
+    except Exception:
+        results_dir = ""
+
+    def normalize(path: str) -> str:
+        if "://" in path or path.startswith("/"):
+            return path
+        return f"{results_dir}/{path}" if results_dir else path
+
+    candidates = [build_checkpoint_candidate(normalize(path)) for path in checkpoints]
+    return select_checkpoint_path(
+        candidates,
+        model_name=model_name,
+        epoch=epoch,
+        step=step,
+        action=action,
+        prefer_directory=prefer_directory,
+        allow_latest=epoch is None and step is None,
+    )
+
+
+def _job_has_checkpoint_artifact(sdk, job_id: str,
+                                 platform_kwargs: dict | None) -> bool:
+    """Return whether a completed job produced a usable checkpoint artifact."""
+    return bool(
+        _find_local_resume_artifact(
+            job_id,
+            platform_kwargs,
+            prefer_directory=False,
+            model_name="",
+            action="best",
+        )
+        or _find_sdk_resume_artifact(sdk, job_id, model_name="", action="best")
+    )
 
 
 def _check_execution_status(logs: str) -> str | None:
@@ -294,26 +588,64 @@ def _auto_suffix_output_dirs(specs: dict, rec_id, declared_outputs: set) -> list
 # automl_hyperparameters at launch time instead of silently accepting them).
 # ---------------------------------------------------------------------------
 
-def _flatten_keys(d: dict, prefix: str = "") -> set[str]:
+_PATH_PART_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*)(?:\[(\d+)\])?$")
+
+
+def _parse_path_part(part: str) -> tuple[str, int | None]:
+    match = _PATH_PART_RE.match(str(part))
+    if match:
+        return match.group(1), int(match.group(2)) if match.group(2) is not None else None
+    return str(part), None
+
+
+def _flatten_keys(d: Any, prefix: str = "") -> set[str]:
     """Recursively flatten a nested spec dict into dotted keys."""
     keys: set[str] = set()
-    if not isinstance(d, dict):
-        return keys
-    for k, v in d.items():
-        full = f"{prefix}.{k}" if prefix else str(k)
-        keys.add(full)
-        if isinstance(v, dict):
+    if isinstance(d, dict):
+        for k, v in d.items():
+            full = f"{prefix}.{k}" if prefix else str(k)
+            keys.add(full)
+            keys |= _flatten_keys(v, full)
+    elif isinstance(d, list):
+        for idx, v in enumerate(d):
+            full = f"{prefix}[{idx}]" if prefix else f"[{idx}]"
+            keys.add(full)
             keys |= _flatten_keys(v, full)
     return keys
 
 
-def _validate_keys_against_schema(provided_keys, base_specs, kind):
+def _schema_property_keys(schema: Any, prefix: str = "") -> set[str]:
+    """Flatten JSON-schema property names into dotted spec keys.
+
+    The packaged spec template may omit optional fields that are still valid
+    according to ``schemas/<action>.schema.json``. Validate against both so
+    direct optional overrides such as ``custom.vision.fps`` do not require
+    unsafe placeholder defaults in the template.
+    """
+    keys: set[str] = set()
+    if not isinstance(schema, dict):
+        return keys
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        for name, child in properties.items():
+            full = f"{prefix}.{name}" if prefix else str(name)
+            keys.add(full)
+            keys |= _schema_property_keys(child, full)
+    items = schema.get("items")
+    if isinstance(items, dict) and prefix:
+        indexed = f"{prefix}[0]"
+        keys.add(indexed)
+        keys |= _schema_property_keys(items, indexed)
+    return keys
+
+
+def _validate_keys_against_schema(provided_keys, base_specs, kind, schema_keys=None):
     """Raise ValueError on provided keys that look like typos of existing
     schema keys. Accepts genuinely-new keys (logs a warning) so users who
     intentionally add a new spec field aren't blocked.
     """
     import difflib
-    base_keys = _flatten_keys(base_specs)
+    base_keys = set(schema_keys or ()) | _flatten_keys(base_specs)
     unknown = [k for k in provided_keys if k not in base_keys]
     for k in unknown:
         close = difflib.get_close_matches(k, base_keys, n=1, cutoff=0.85)
@@ -417,7 +749,7 @@ class AutoMLRunner:
         self._active_jobs = {}
         self._consecutive_none_metrics = 0
 
-    def run(self, train_dataset_uri, eval_dataset_uri="",
+    def run(self, train_dataset_uri="", eval_dataset_uri="",
             base_checkpoint="", workspace_id=None, image=None,
             automl_settings=None,
             automl_hyperparameters=None, custom_param_ranges=None,
@@ -530,11 +862,13 @@ class AutoMLRunner:
         #              against the schema before anything expensive runs.
         if spec_overrides:
             _validate_keys_against_schema(
-                list(spec_overrides.keys()), base_specs, "spec_override")
+                list(spec_overrides.keys()), base_specs, "spec_override",
+                self.skill_ctx.valid_spec_keys)
             base_specs = self._merge_specs(base_specs, spec_overrides)
         if automl_hyperparameters:
             _validate_keys_against_schema(
-                list(automl_hyperparameters), base_specs, "automl_hyperparameter")
+                list(automl_hyperparameters), base_specs, "automl_hyperparameter",
+                self.skill_ctx.valid_spec_keys)
 
         # --- fix #1: resolve explicit direction. _invert_metric tells us
         #              whether to negate values before reporting to the brain
@@ -556,6 +890,13 @@ class AutoMLRunner:
                      metric_name, _effective_dir,
                      " (values will be inverted for the brain)" if invert_metric else "")
 
+        # Unflip values if we inverted them for the brain, so callers see
+        # metrics in their original scale regardless of `direction`.
+        def _unflip(v):
+            if v is None:
+                return None
+            return -v if invert_metric else v
+
         # --- fix #3: if resuming, recover any jobs that were in flight when
         #              the previous orchestrator died. Poll each to terminal,
         #              report to the brain, then continue.
@@ -570,10 +911,27 @@ class AutoMLRunner:
                         metric_extractor=metric_extractor, eval_fn=eval_fn,
                         workspace_path=workspace_path, invert_metric=invert_metric,
                         on_result=on_result,
+                        platform_kwargs=platform_kwargs,
                     )
 
         while not automl.is_complete():
             recs = automl.next_recommendation()
+            progress = automl.get_progress()
+            max_recommendations = automl_settings.get("automl_max_recommendations")
+            if max_recommendations is not None:
+                remaining = int(max_recommendations) - int(progress.get("completed", 0))
+                if remaining <= 0:
+                    logger.info(
+                        "AutoML recommendation budget reached (%d/%d); stopping launch loop",
+                        progress.get("completed", 0), int(max_recommendations),
+                    )
+                    break
+                if len(recs) > remaining:
+                    logger.info(
+                        "Capping recommendations from %d to remaining budget %d",
+                        len(recs), remaining,
+                    )
+                    recs = recs[:remaining]
             if not recs:
                 logger.info("No recommendations available — waiting for results")
                 time.sleep(5)
@@ -590,11 +948,30 @@ class AutoMLRunner:
                     on_recommendation(rec)
                 logger.info("Recommendation %d: launching job with %d spec overrides",
                             rec.id, len(rec.specs))
-                merged_specs = self._merge_specs(base_specs, rec.specs)
+                run_base_specs = base_specs
+                try:
+                    stored_specs = automl._state_store.get_job_specs(automl._context.id)
+                    if stored_specs:
+                        run_base_specs = stored_specs
+                except Exception as ex:
+                    logger.debug("Could not read AutoML-updated base specs: %s", ex)
+                merged_specs = self._merge_specs(run_base_specs, rec.specs)
+                merged_specs = self._apply_resume_checkpoint(
+                    merged_specs, rec, platform_kwargs
+                )
+                job_platform_kwargs = self._apply_resume_environment(
+                    platform_kwargs, rec
+                )
                 # Output destination is resolved at runtime by script_runner
                 # from TAO_RESULTS_ROOT (mount) / S3_BUCKET_NAME (cloud) env
                 # vars the SDK injects. The agent doesn't pre-rewrite spec
                 # output keys here — that lived in the deleted SDK contract.
+                previous_metric = None
+                if getattr(rec, "resume_from_job_id", None):
+                    try:
+                        previous_metric = _unflip(float(rec.result))
+                    except (TypeError, ValueError):
+                        previous_metric = None
                 # Safety net: if a user hardcoded a local *.results_dir /
                 # *.output_dir / *.save_dir in the spec, every rec would
                 # write to the same path and overwrite the previous one.
@@ -613,8 +990,25 @@ class AutoMLRunner:
                     metric_extractor=metric_extractor,
                     eval_fn=eval_fn,
                     workspace_path=workspace_path,
-                    platform_kwargs=platform_kwargs,
+                    platform_kwargs=job_platform_kwargs,
                 )
+                if (
+                    status == "metric_missing"
+                    and previous_metric is not None
+                    and getattr(rec, "job_id", None)
+                    and _job_has_checkpoint_artifact(
+                        self._sdk, rec.job_id, job_platform_kwargs
+                    )
+                ):
+                    logger.warning(
+                        "Rec %d: promoted job %s produced a checkpoint but no "
+                        "fresh metric; carrying forward prior metric=%f",
+                        rec.id, rec.job_id, previous_metric,
+                    )
+                    metric_value = previous_metric
+                    status = "success"
+                elif status == "metric_missing":
+                    status = "failure"
                 # Fail-loud on a broken extractor: if the configured metric
                 # extractor (and eval_fn) both return None for N consecutive
                 # recs, we're not measuring anything — raise instead of
@@ -655,13 +1049,12 @@ class AutoMLRunner:
         best = automl.get_best()
         progress = automl.get_progress()
         history = automl.get_history()
-
-        # Unflip values if we inverted them for the brain, so callers see
-        # metrics in their original scale regardless of `direction`.
-        def _unflip(v):
-            if v is None:
-                return None
-            return -v if invert_metric else v
+        if best is None:
+            failed = [r.id for r in history if r.status == "failure"]
+            raise RuntimeError(
+                "AutoML finished without a successful recommendation; "
+                f"failed recommendation ids: {failed}"
+            )
 
         result = {
             "best": {
@@ -795,6 +1188,7 @@ class AutoMLRunner:
         # fix #4: if an eval_fn is provided, run it post-training and let its
         # return override the log-extracted metric. Errors are isolated.
         metric_value = cached_metric
+        eval_metric_used = False
         if eval_fn is not None:
             try:
                 eval_metric = eval_fn(rec, job.id)
@@ -808,13 +1202,28 @@ class AutoMLRunner:
                             rec.id, eval_metric,
                             f"{cached_metric:.6f}" if cached_metric is not None else "None")
                 metric_value = eval_metric
+                eval_metric_used = True
+        local_metric = _extract_metric_from_local_results(
+            job.id, metric_name, platform_kwargs
+        )
+        if local_metric is not None and not eval_metric_used:
+            if metric_value is None:
+                logger.info("Rec %d: recovered metric=%f from local status artifacts",
+                            rec.id, local_metric)
+            elif local_metric != metric_value:
+                logger.info(
+                    "Rec %d: using local status metric=%f instead of "
+                    "log-extracted metric=%f",
+                    rec.id, local_metric, metric_value,
+                )
+            metric_value = local_metric
 
         if metric_value is None:
             logger.warning("Rec %d: job %s completed but no metric could be "
                            "extracted (neither metric_extractor nor eval_fn "
                            "produced a value for '%s')",
                            rec.id, job.id, metric_name)
-            return None, "failure"
+            return None, "metric_missing"
 
         logger.info("Rec %d: job %s succeeded, metric=%f", rec.id, job.id, metric_value)
         return metric_value, "success"
@@ -833,7 +1242,7 @@ class AutoMLRunner:
 
     def _recover_pending_job(self, entry, automl, metric_name,
                               metric_extractor, eval_fn, workspace_path,
-                              invert_metric, on_result) -> None:
+                              invert_metric, on_result, platform_kwargs=None) -> None:
         """Poll an in-flight job (recovered on resume), extract its result,
         and report it to the brain. Mirrors the tail of _run_one_job.
         """
@@ -914,6 +1323,7 @@ class AutoMLRunner:
             report_status = "failure"
         else:
             metric_value = cached_metric
+            eval_metric_used = False
             if eval_fn is not None:
                 try:
                     em = eval_fn(rec, job_id)
@@ -923,6 +1333,24 @@ class AutoMLRunner:
                     em = None
                 if em is not None:
                     metric_value = em
+                    eval_metric_used = True
+            local_metric = _extract_metric_from_local_results(
+                job_id, metric_name, platform_kwargs
+            )
+            if local_metric is not None and not eval_metric_used:
+                if metric_value is None:
+                    logger.info(
+                        "Resume: rec %d recovered metric=%f from local status "
+                        "artifacts",
+                        rec_id, local_metric,
+                    )
+                elif local_metric != metric_value:
+                    logger.info(
+                        "Resume: rec %d using local status metric=%f instead "
+                        "of log-extracted metric=%f",
+                        rec_id, local_metric, metric_value,
+                    )
+                metric_value = local_metric
             report_status = "success" if metric_value is not None else "failure"
 
         report_value = metric_value
@@ -953,10 +1381,27 @@ class AutoMLRunner:
         parts = dotted_key.split(".")
         cursor = target
         for part in parts[:-1]:
-            if part not in cursor or not isinstance(cursor[part], dict):
-                cursor[part] = {}
-            cursor = cursor[part]
-        cursor[parts[-1]] = value
+            key, idx = _parse_path_part(part)
+            if key not in cursor:
+                cursor[key] = [] if idx is not None else {}
+            cursor = cursor[key]
+            if idx is not None:
+                if not isinstance(cursor, list):
+                    raise TypeError(f"Spec path {dotted_key!r} expected list at {key!r}")
+                while len(cursor) <= idx:
+                    cursor.append({})
+                if cursor[idx] is None:
+                    cursor[idx] = {}
+                cursor = cursor[idx]
+        last_key, last_idx = _parse_path_part(parts[-1])
+        if last_idx is None:
+            cursor[last_key] = value
+            return
+        if last_key not in cursor or not isinstance(cursor[last_key], list):
+            cursor[last_key] = []
+        while len(cursor[last_key]) <= last_idx:
+            cursor[last_key].append(None)
+        cursor[last_key][last_idx] = value
 
     @staticmethod
     def _get_nested(source: dict, dotted_key: str):
@@ -964,10 +1409,128 @@ class AutoMLRunner:
         parts = dotted_key.split(".")
         cursor = source
         for part in parts:
-            if not isinstance(cursor, dict) or part not in cursor:
+            key, idx = _parse_path_part(part)
+            if not isinstance(cursor, dict) or key not in cursor:
                 return None
-            cursor = cursor[part]
+            cursor = cursor[key]
+            if idx is not None:
+                if not isinstance(cursor, list) or idx >= len(cursor):
+                    return None
+                cursor = cursor[idx]
         return cursor
+
+    def _apply_resume_checkpoint(
+        self, specs: dict, rec, platform_kwargs: dict | None
+    ) -> dict:
+        """Inject parent-checkpoint resume params for promoted recommendations.
+
+        Hyperband-family algorithms and PBT return a recommendation with
+        ``resume_from_job_id`` once they promote or exploit a prior trial. The
+        brain knows which trial won, but the runner owns platform paths and
+        skill specs, so the checkpoint handoff belongs here.
+        """
+        parent_job_id = getattr(rec, "resume_from_job_id", None)
+        if not parent_job_id:
+            return specs
+
+        path_key = None
+        for candidate in (
+            "train.resume_training_checkpoint_path",
+            "resume_training_checkpoint_path",
+        ):
+            if (
+                candidate in self.skill_ctx.valid_spec_keys
+                or self._get_nested(specs, candidate) is not None
+            ):
+                path_key = candidate
+                break
+
+        bool_or_path_key = None
+        for candidate in ("train.resume", "resume"):
+            if (
+                candidate in self.skill_ctx.valid_spec_keys
+                or self._get_nested(specs, candidate) is not None
+            ):
+                bool_or_path_key = candidate
+                break
+
+        if not path_key and not bool_or_path_key:
+            logger.warning(
+                "Rec %d requested resume from %s, but no resume spec key was "
+                "found for %s",
+                rec.id, parent_job_id, self.skill_ctx.network_arch,
+            )
+            return specs
+
+        prefer_directory = bool_or_path_key is not None and path_key is None
+        resume_epoch = _optional_int(getattr(rec, "resume_from_epoch", None))
+        resume_step = _optional_int(getattr(rec, "resume_from_step", None))
+        artifact = (
+            _find_local_resume_artifact(
+                parent_job_id,
+                platform_kwargs,
+                prefer_directory,
+                model_name=self.skill_ctx.network_arch,
+                epoch=resume_epoch,
+                step=resume_step,
+                action="resume",
+            )
+            or _find_sdk_resume_artifact(
+                self._sdk,
+                parent_job_id,
+                model_name=self.skill_ctx.network_arch,
+                epoch=resume_epoch,
+                step=resume_step,
+                action="resume",
+                prefer_directory=prefer_directory,
+            )
+        )
+        if not artifact:
+            logger.warning(
+                "Rec %d requested resume from %s, but no checkpoint artifact "
+                "could be resolved for epoch=%s step=%s",
+                rec.id, parent_job_id, resume_epoch, resume_step,
+            )
+            return specs
+        rec.resume_checkpoint_path = artifact
+
+        if path_key:
+            self._set_nested(specs, path_key, artifact)
+            logger.info(
+                "Rec %d will resume from parent job %s via %s=%s "
+                "(epoch=%s step=%s)",
+                rec.id, parent_job_id, path_key, artifact, resume_epoch, resume_step,
+            )
+        else:
+            # Cosmos-RL's `train.resume` accepts either True or a concrete
+            # checkpoint path. Use the path form so a new output directory can
+            # still be used for the resumed trial.
+            self._set_nested(specs, bool_or_path_key, artifact)
+            logger.info(
+                "Rec %d will resume from parent job %s via %s=%s "
+                "(epoch=%s step=%s)",
+                rec.id, parent_job_id, bool_or_path_key, artifact,
+                resume_epoch, resume_step,
+            )
+        return specs
+
+    def _apply_resume_environment(
+        self, platform_kwargs: dict | None, rec
+    ) -> dict | None:
+        """Add runtime env needed by model-specific checkpoint resume paths."""
+        if not getattr(rec, "resume_from_job_id", None):
+            return platform_kwargs
+
+        updated = copy.deepcopy(platform_kwargs or {})
+        env_vars = dict(updated.get("env_vars") or {})
+        if env_vars.get("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD") != "1":
+            env_vars["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
+            logger.info(
+                "Rec %d enabling PyTorch trusted-checkpoint resume for %s",
+                rec.id, self.skill_ctx.network_arch,
+            )
+        updated["env_vars"] = env_vars
+        return updated
 
     # _apply_output_destinations was removed: output destinations are
     # resolved at runtime by script_runner from TAO_RESULTS_ROOT (mount) /
@@ -1005,6 +1568,23 @@ class AutoMLRunner:
                 base_uri = "s3://" + base_uri[len("aws://"):]
             base_uri = base_uri.rstrip("/") + "/"
 
+            mapping = rule.get("mapping")
+            if isinstance(mapping, dict):
+                item = {}
+                for field_name, field_cfg in mapping.items():
+                    field_cfg = field_cfg or {}
+                    path = field_cfg.get("path")
+                    if path:
+                        item[field_name] = base_uri + str(path).lstrip("/")
+                    elif not field_cfg.get("optional"):
+                        item[field_name] = base_uri.rstrip("/")
+                current = AutoMLRunner._get_nested(specs, spec_key)
+                if rule.get("multiple_sources") or isinstance(current, list):
+                    AutoMLRunner._set_nested(specs, spec_key, [item])
+                else:
+                    AutoMLRunner._set_nested(specs, spec_key, item)
+                continue
+
             path_template = rule.get("path")
             if path_template:
                 resolved = path_template
@@ -1039,13 +1619,7 @@ class AutoMLRunner:
         import copy
         merged = copy.deepcopy(base_specs)
         for key, value in rec_specs.items():
-            parts = key.split(".")
-            target = merged
-            for part in parts[:-1]:
-                if part not in target or not isinstance(target[part], dict):
-                    target[part] = {}
-                target = target[part]
-            target[parts[-1]] = value
+            AutoMLRunner._set_nested(merged, key, value)
         return merged
 
 
