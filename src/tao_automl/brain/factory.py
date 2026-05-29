@@ -91,9 +91,9 @@ class AlgorithmParams:
             automl_min_points_in_model=params_dict.get("automl_min_points_in_model", 10),
             automl_max_trials=params_dict.get("automl_max_trials", None),
             automl_min_top_configs=params_dict.get("automl_min_top_configs", 5),
-            llm_endpoint=params_dict.get("llm_endpoint", ""),
-            llm_model=params_dict.get("llm_model", ""),
-            llm_api_key=params_dict.get("llm_api_key", ""),
+            llm_endpoint=params_dict.get("llm_endpoint", params_dict.get("base_url", "")),
+            llm_model=params_dict.get("llm_model", params_dict.get("model", "")),
+            llm_api_key=params_dict.get("llm_api_key", params_dict.get("api_key", "")),
             llm_temperature=float(params_dict.get("llm_temperature", 0.7)),
             llm_max_tokens=int(params_dict.get("llm_max_tokens", 4096)),
             automl_max_experiments=int(params_dict.get("automl_max_experiments", 50)),
@@ -240,7 +240,8 @@ class BrainFactory:
                 "reduction_factor": int(params.automl_reduction_factor),
                 "epoch_multiplier": int(params.epoch_multiplier),
                 "early_stop_threshold": float(params.automl_early_stop_threshold),
-                "min_early_stop_epochs": int(params.automl_min_early_stop_epochs)
+                "min_early_stop_epochs": int(params.automl_min_early_stop_epochs),
+                "metric": metric
             }
         elif algo_lower in AlgorithmType.LLM:
             brain_class = LLMBrain
@@ -261,6 +262,7 @@ class BrainFactory:
                 "parameters": parameters,
                 "llm_params": params.get_llm_params(),
                 "metric": metric,
+                "max_experiments": int(params.automl_max_experiments),
             }
         elif algo_lower in AlgorithmType.AUTORESEARCH:
             brain_class = AutoresearchBrain
