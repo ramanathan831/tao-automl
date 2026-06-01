@@ -124,6 +124,49 @@ def test_extract_metric_reads_sparse4d_status_kpi_alias(tmp_path):
     assert _extract_metric_from_status_file(status_path, "val_mAP") == 0.125
 
 
+def test_execution_status_can_ignore_fatal_cleanup_patterns():
+    from tao_automl.runner import _check_execution_status
+
+    logs = "Saved best score to best_score.json\nRendezvousConnectionError\n"
+
+    assert _check_execution_status(logs) == "FAIL"
+    assert _check_execution_status(logs, include_fatal_patterns=False) is None
+
+
+def test_execution_status_detects_nccl_watchdog_as_hard_failure():
+    from tao_automl.runner import _check_execution_status, _has_hard_failure_pattern
+
+    logs = (
+        "Watchdog caught collective operation timeout: "
+        "WorkNCCL(SeqNum=33271, OpType=ALLREDUCE)\n"
+    )
+
+    assert _check_execution_status(logs) == "FAIL"
+    assert _has_hard_failure_pattern(logs)
+
+
+def test_extract_metric_reads_cosmos_best_score_json(tmp_path):
+    from tao_automl.runner import _extract_metric_from_local_results
+
+    best_score = (
+        tmp_path / "results" / "job-1" / "train_output_dir" / "best"
+        / "best_score.json"
+    )
+    best_score.parent.mkdir(parents=True)
+    best_score.write_text(
+        '{"best_score": 0.8927091135965706, "metric": "val_loss"}\n'
+    )
+
+    metric = _extract_metric_from_local_results(
+        "job-1",
+        "val/avg_loss",
+        {"mounts": [{"host_path": str(tmp_path / "results"),
+                     "container_path": "/results"}]},
+    )
+
+    assert metric == pytest.approx(0.8927091135965706)
+
+
 def test_llm_config_accepts_provider_aliases():
     from tao_automl.brain.llm_client import LLMConfig
 
@@ -152,6 +195,15 @@ def test_algorithm_params_pass_provider_aliases_to_llm_client():
         "llm_model": "gcp/google/gemini-3.1-pro-preview",
         "llm_api_key": "secret",
     }
+
+
+def test_algorithm_params_parse_hybrid_range_narrowing_flag():
+    from tao_automl.brain.factory import AlgorithmParams
+
+    assert AlgorithmParams.from_dict({
+        "hybrid_enable_llm_range_narrowing": "true",
+    }).hybrid_enable_llm_range_narrowing
+    assert not AlgorithmParams.from_dict({}).hybrid_enable_llm_range_narrowing
 
 
 def test_promoted_metric_missing_checkpoint_carries_forward_prior_metric(
@@ -294,6 +346,113 @@ def test_run_one_job_calls_build_entrypoint_with_action_cfg(tmp_path):
         assert legacy not in create_kwargs, f"legacy kwarg {legacy!r} leaked"
 
 
+def test_run_one_job_allows_completed_metric_with_cleanup_rendezvous(tmp_path):
+    from tao_automl.runner import AutoMLRunner
+
+    skill_dir = _write_fake_skill(tmp_path)
+    fake_sdk = MagicMock()
+    fake_sdk.create_job.return_value = MagicMock(id="job-xyz", backend_job_id="be-xyz")
+    fake_sdk.get_job_status.return_value = MagicMock(status="Complete")
+    fake_sdk.get_job_logs.return_value = (
+        "[cosmos] Validation rank 0: avg_loss=0.951012, samples=6\n"
+        "Saved best score to best_score.json: 0.9510115849549504\n"
+        "torch.distributed.elastic.rendezvous.api.RendezvousConnectionError\n"
+        "torch.distributed.DistNetworkError: Failed to recv, got 0 bytes.\n"
+    )
+
+    runner = AutoMLRunner(sdk=fake_sdk, skill_dir=skill_dir, action="train")
+    runner._poll_interval = 0
+    rec = MagicMock(id=7)
+
+    with patch(
+        "tao_sdk.script_runner.build_entrypoint",
+        return_value={"command": "BAKED_HEREDOC_COMMAND", "args_template": ""},
+    ):
+        metric, status = runner._run_one_job(
+            image="nvcr.io/test:1",
+            action_cfg=runner.skill_ctx.action_cfg,
+            specs={"train": {"num_epochs": 1}},
+            rec=rec,
+            metric_name="val/avg_loss",
+            workspace_path=str(tmp_path),
+            platform_kwargs={},
+        )
+
+    assert metric == pytest.approx(0.951012)
+    assert status == "success"
+    fake_sdk.cancel_job.assert_not_called()
+
+
+def test_run_one_job_cancels_hard_failure_and_recovers_remote_best_score(tmp_path):
+    from tao_automl.runner import AutoMLRunner
+
+    skill_dir = _write_fake_skill(tmp_path)
+    fake_sdk = MagicMock()
+    fake_sdk.create_job.return_value = MagicMock(id="job-hard", backend_job_id="be-hard")
+    fake_sdk.get_job_logs.return_value = (
+        "Watchdog caught collective operation timeout: "
+        "WorkNCCL(SeqNum=33271, OpType=ALLREDUCE)\n"
+    )
+    fake_sdk.read_job_result_file.return_value = (
+        '{"best_score": 0.8927091135965706, "metric": "val_loss"}\n'
+    )
+
+    runner = AutoMLRunner(sdk=fake_sdk, skill_dir=skill_dir, action="train")
+    runner._poll_interval = 0
+    rec = MagicMock(id=8)
+
+    with patch(
+        "tao_sdk.script_runner.build_entrypoint",
+        return_value={"command": "BAKED_HEREDOC_COMMAND", "args_template": ""},
+    ):
+        metric, status = runner._run_one_job(
+            image="nvcr.io/test:1",
+            action_cfg=runner.skill_ctx.action_cfg,
+            specs={"train": {"num_epochs": 10}},
+            rec=rec,
+            metric_name="val/avg_loss",
+            workspace_path=str(tmp_path),
+            platform_kwargs={},
+        )
+
+    assert metric == pytest.approx(0.8927091135965706)
+    assert status == "failure"
+    fake_sdk.cancel_job.assert_called_once_with("job-hard")
+
+
+def test_run_one_job_preserves_metric_when_slurm_reports_canceled(tmp_path):
+    from tao_automl.runner import AutoMLRunner
+
+    skill_dir = _write_fake_skill(tmp_path)
+    fake_sdk = MagicMock()
+    fake_sdk.create_job.return_value = MagicMock(id="job-canceled", backend_job_id="be")
+    fake_sdk.get_job_status.return_value = MagicMock(status="Canceled")
+    fake_sdk.get_job_logs.return_value = (
+        "[SFT] Validation loss: 0.751 for train step 8/10, epoch 4\n"
+    )
+
+    runner = AutoMLRunner(sdk=fake_sdk, skill_dir=skill_dir, action="train")
+    runner._poll_interval = 0
+    rec = MagicMock(id=9)
+
+    with patch(
+        "tao_sdk.script_runner.build_entrypoint",
+        return_value={"command": "BAKED_HEREDOC_COMMAND", "args_template": ""},
+    ):
+        metric, status = runner._run_one_job(
+            image="nvcr.io/test:1",
+            action_cfg=runner.skill_ctx.action_cfg,
+            specs={"train": {"num_epochs": 10}},
+            rec=rec,
+            metric_name="val_loss",
+            workspace_path=str(tmp_path),
+            platform_kwargs={},
+        )
+
+    assert metric == pytest.approx(0.751)
+    assert status == "failure"
+
+
 def test_runner_init_replaces_skillbank_with_skillcontext(tmp_path):
     """AutoMLRunner.__init__ no longer takes (sdk, poll_interval) only —
     skill_dir + action are now required."""
@@ -396,6 +555,8 @@ def test_apply_resume_checkpoint_does_not_use_latest_for_requested_epoch(tmp_pat
     )
 
     assert updated["train"]["resume_training_checkpoint_path"] == ""
+    assert rec.resume_checkpoint_missing is True
+    assert rec.resume_checkpoint_path is None
 
 
 def test_apply_resume_checkpoint_sets_cosmos_resume_to_checkpoint_dir(tmp_path):
@@ -439,7 +600,11 @@ def test_apply_resume_environment_enables_trusted_checkpoint_resume(tmp_path):
 
     skill_dir = _write_fake_skill(tmp_path)
     runner = AutoMLRunner(sdk=MagicMock(), skill_dir=skill_dir, action="train")
-    rec = MagicMock(id=4, resume_from_job_id="parent-job")
+    rec = MagicMock(
+        id=4,
+        resume_from_job_id="parent-job",
+        resume_checkpoint_path="/results/parent-job/train/checkpoint.pth",
+    )
 
     updated = runner._apply_resume_environment(
         {"env_vars": {"WANDB_MODE": "disabled"}},
@@ -456,6 +621,21 @@ def test_apply_resume_environment_does_not_mutate_non_resume_kwargs(tmp_path):
     skill_dir = _write_fake_skill(tmp_path)
     runner = AutoMLRunner(sdk=MagicMock(), skill_dir=skill_dir, action="train")
     rec = MagicMock(id=5, resume_from_job_id=None)
+    platform_kwargs = {"env_vars": {"WANDB_MODE": "disabled"}}
+
+    assert runner._apply_resume_environment(platform_kwargs, rec) is platform_kwargs
+
+
+def test_apply_resume_environment_ignores_missing_checkpoint_path(tmp_path):
+    from tao_automl.runner import AutoMLRunner
+
+    skill_dir = _write_fake_skill(tmp_path)
+    runner = AutoMLRunner(sdk=MagicMock(), skill_dir=skill_dir, action="train")
+    rec = MagicMock(
+        id=6,
+        resume_from_job_id="parent-job",
+        resume_checkpoint_path=None,
+    )
     platform_kwargs = {"env_vars": {"WANDB_MODE": "disabled"}}
 
     assert runner._apply_resume_environment(platform_kwargs, rec) is platform_kwargs
