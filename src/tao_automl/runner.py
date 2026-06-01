@@ -136,6 +136,23 @@ _COSMOS_RL_SFT_VAL_RE = re.compile(
     re.IGNORECASE,
 )
 
+_CLEANUP_FATAL_PATTERNS = (
+    "RendezvousTimeoutError",
+    "RendezvousConnectionError",
+    "DistNetworkError",
+    "C10d store has failed",
+    "Connection was likely closed. Did the remote server shutdown or crash?",
+)
+
+_HARD_FATAL_PATTERNS = (
+    "failed with return code",
+    "Process group watchdog thread terminated",
+    "Watchdog caught collective operation timeout",
+    "torch.distributed.elastic.multiprocessing.errors.ChildFailedError",
+    "Signal 6 (SIGABRT)",
+    "Process 1 failed with return code",
+)
+
 
 def _extract_metric_from_logs(logs: str, metric_name: str) -> float | None:
     """Extract the final metric value from TAO training logs.
@@ -271,6 +288,8 @@ def _metric_aliases(metric_name: str) -> list[str]:
         aliases.append("train_loss")
     if normalized == "train_loss":
         aliases.append("train_loss_epoch")
+    if normalized in {"avg_loss", "val_avg_loss"}:
+        aliases.append("avg_loss")
     seen = set()
     return [alias for alias in aliases if not (alias in seen or seen.add(alias))]
 
@@ -306,26 +325,171 @@ def _extract_metric_from_status_file(status_path: Path, metric_name: str) -> flo
     return None
 
 
+def _extract_metric_from_best_score_payload(
+    payload: str | dict[str, Any],
+    metric_name: str,
+) -> float | None:
+    """Read TAO/Cosmos best-score artifacts.
+
+    Cosmos-RL writes ``train_output_dir/best/best_score.json`` as a compact
+    JSON object after validation. It is more reliable than log scraping when a
+    later distributed failure truncates the useful log tail.
+    """
+    try:
+        data = json.loads(payload) if isinstance(payload, str) else payload
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    aliases = set(_metric_aliases(metric_name))
+    aliases.update(alias.replace("/", "_") for alias in list(aliases))
+    metric_label = data.get("metric")
+    if isinstance(metric_label, str):
+        aliases.add(metric_label)
+        aliases.add(metric_label.replace("/", "_"))
+
+    for key in ("best_score", "best_metric", "metric_value", "score", "value"):
+        if key not in data:
+            continue
+        try:
+            value = float(data[key])
+        except (TypeError, ValueError):
+            continue
+        if value == value:
+            return value
+
+    for key in aliases:
+        if key not in data:
+            continue
+        try:
+            value = float(data[key])
+        except (TypeError, ValueError):
+            continue
+        if value == value:
+            return value
+    return None
+
+
+def _extract_metric_from_best_score_file(
+    best_score_path: Path,
+    metric_name: str,
+) -> float | None:
+    if not best_score_path.exists():
+        return None
+    try:
+        return _extract_metric_from_best_score_payload(
+            best_score_path.read_text(encoding="utf-8"),
+            metric_name,
+        )
+    except OSError:
+        return None
+
+
 def _extract_metric_from_local_results(job_id: str, metric_name: str,
                                        platform_kwargs: dict | None) -> float | None:
-    """Fallback for local Docker runs whose metrics are written to status.json.
+    """Fallback for local runs whose metrics are written to result artifacts.
 
     The platform SDK mounts a host results directory at ``/results``. When logs
     do not contain the metric, inspect the mounted job result folder and parse
-    TAO's status artifacts.
+    TAO's structured status/best-score artifacts.
     """
     for mount in (platform_kwargs or {}).get("mounts", []) or []:
+        if not isinstance(mount, dict):
+            continue
         if mount.get("container_path") != "/results":
             continue
         host_root = mount.get("host_path")
         if not host_root:
             continue
         job_root = Path(host_root) / job_id
+        for best_score_path in sorted(job_root.rglob("best_score.json")):
+            metric = _extract_metric_from_best_score_file(
+                best_score_path, metric_name
+            )
+            if metric is not None:
+                return metric
         for status_path in sorted(job_root.rglob("status.json")):
             metric = _extract_metric_from_status_file(status_path, metric_name)
             if metric is not None:
                 return metric
     return None
+
+
+def _extract_metric_from_sdk_results(sdk, job_id: str,
+                                     metric_name: str) -> float | None:
+    """Recover metrics from SDK-managed result artifacts.
+
+    Slurm jobs write results on Lustre, which may not be mounted on the local
+    AutoML controller host. Newer SDKs expose ``read_job_result_file`` for that
+    case; local platforms can still be handled by reading ``get_job_results_dir``.
+    """
+    candidates = (
+        "train_output_dir/best/best_score.json",
+        "results_dir/best/best_score.json",
+        "best/best_score.json",
+    )
+
+    read_remote = getattr(sdk, "read_job_result_file", None)
+    if callable(read_remote):
+        for relative_path in candidates:
+            try:
+                payload = read_remote(job_id, relative_path)
+            except Exception:
+                payload = ""
+            if not payload:
+                continue
+            metric = _extract_metric_from_best_score_payload(payload, metric_name)
+            if metric is not None:
+                return metric
+
+    try:
+        results_dir = sdk.get_job_results_dir(job_id)
+    except Exception:
+        results_dir = ""
+    results_path = _uri_to_local_path(results_dir)
+    if results_path and results_path.exists():
+        for best_score_path in sorted(results_path.rglob("best_score.json")):
+            metric = _extract_metric_from_best_score_file(
+                best_score_path, metric_name
+            )
+            if metric is not None:
+                return metric
+        for status_path in sorted(results_path.rglob("status.json")):
+            metric = _extract_metric_from_status_file(status_path, metric_name)
+            if metric is not None:
+                return metric
+    return None
+
+
+def _recover_metric_from_artifacts(
+    sdk,
+    job_id: str,
+    metric_name: str,
+    platform_kwargs: dict | None,
+) -> float | None:
+    local_metric = _extract_metric_from_local_results(
+        job_id, metric_name, platform_kwargs
+    )
+    if local_metric is not None:
+        return local_metric
+    return _extract_metric_from_sdk_results(sdk, job_id, metric_name)
+
+
+def _uri_to_local_path(uri: str) -> Path | None:
+    if not uri:
+        return None
+    if uri.startswith("lustre://"):
+        uri = uri.removeprefix("lustre://")
+        if not uri.startswith("/"):
+            uri = "/" + uri
+    elif uri.startswith("slurm://"):
+        uri = uri.removeprefix("slurm://")
+        if not uri.startswith("/"):
+            uri = "/" + uri
+    elif "://" in uri:
+        return None
+    return Path(uri)
 
 
 _RESUME_FILE_EXTENSIONS = (".pth", ".pth.tar", ".pt", ".ckpt", ".hdf5", ".tlt")
@@ -506,7 +670,11 @@ def _job_has_checkpoint_artifact(sdk, job_id: str,
     )
 
 
-def _check_execution_status(logs: str) -> str | None:
+def _check_execution_status(
+    logs: str,
+    *,
+    include_fatal_patterns: bool = True,
+) -> str | None:
     """Check if logs contain Execution status: PASS or FAIL."""
     if not logs:
         return None
@@ -515,7 +683,16 @@ def _check_execution_status(logs: str) -> str | None:
             return "PASS"
         if "Execution status: FAIL" in line:
             return "FAIL"
+    if not include_fatal_patterns:
+        return None
+    fatal_patterns = _CLEANUP_FATAL_PATTERNS + _HARD_FATAL_PATTERNS
+    if any(pattern in logs for pattern in fatal_patterns):
+        return "FAIL"
     return None
+
+
+def _has_hard_failure_pattern(logs: str) -> bool:
+    return bool(logs and any(pattern in logs for pattern in _HARD_FATAL_PATTERNS))
 
 
 class MetricExtractorError(RuntimeError):
@@ -959,6 +1136,20 @@ class AutoMLRunner:
                 merged_specs = self._apply_resume_checkpoint(
                     merged_specs, rec, platform_kwargs
                 )
+                if getattr(rec, "resume_checkpoint_missing", False):
+                    logger.warning(
+                        "Recommendation %d: skipping launch because promoted "
+                        "parent checkpoint is missing",
+                        rec.id,
+                    )
+                    automl.report_result(
+                        rec_id=rec.id,
+                        metric_value=0.0,
+                        status="failure",
+                    )
+                    if on_result:
+                        on_result(rec, None, "failure")
+                    continue
                 job_platform_kwargs = self._apply_resume_environment(
                     platform_kwargs, rec
                 )
@@ -1121,6 +1312,7 @@ class AutoMLRunner:
         cached_metric = None
         cached_exec_status = None
         all_logs = ""
+        job_status = None
 
         while True:
             time.sleep(self._poll_interval)
@@ -1138,11 +1330,53 @@ class AutoMLRunner:
                         m = None
                     if m is not None:
                         cached_metric = m
-                    es = _check_execution_status(logs)
+                    es = _check_execution_status(
+                        logs, include_fatal_patterns=False
+                    )
+                    hard_failure = _has_hard_failure_pattern(logs)
+                    if not es and (cached_metric is None or hard_failure):
+                        es = _check_execution_status(logs)
+                        if es == "FAIL":
+                            artifact_metric = _recover_metric_from_artifacts(
+                                self._sdk, job.id, metric_name, platform_kwargs
+                            )
+                            if artifact_metric is not None:
+                                cached_metric = artifact_metric
+                                if not hard_failure:
+                                    es = None
+                                    logger.info(
+                                        "Rec %d: ignoring cleanup failure text "
+                                        "after recovering metric=%f from result "
+                                        "artifacts",
+                                        rec.id, artifact_metric,
+                                    )
+                                else:
+                                    logger.warning(
+                                        "Rec %d: recovered metric=%f from result "
+                                        "artifacts before canceling hard failed job",
+                                        rec.id, artifact_metric,
+                                    )
                     if es:
                         cached_exec_status = es
+                        if es == "FAIL":
+                            logger.warning(
+                                "Rec %d: job %s logs show execution failure; "
+                                "canceling backend job",
+                                rec.id, job.id,
+                            )
+                            try:
+                                self._sdk.cancel_job(job.id)
+                            except Exception as ex:
+                                logger.warning(
+                                    "Failed to cancel failed job %s for rec %d: %s",
+                                    job.id, rec.id, ex,
+                                )
+                            break
             except Exception:
                 pass
+
+            if cached_exec_status == "FAIL":
+                break
 
             try:
                 job_status = self._sdk.get_job_status(job.id)
@@ -1165,14 +1399,37 @@ class AutoMLRunner:
                     m = None
                 if m is not None:
                     cached_metric = m
-                es = _check_execution_status(final_logs)
+                es = _check_execution_status(
+                    final_logs,
+                    include_fatal_patterns=(
+                        cached_metric is None
+                        or _has_hard_failure_pattern(final_logs)
+                    ),
+                )
                 if es:
                     cached_exec_status = es
         except Exception:
             pass
 
-        exec_status = cached_exec_status or _check_execution_status(all_logs)
-        status = job_status.status
+        if cached_metric is None:
+            artifact_metric = _recover_metric_from_artifacts(
+                self._sdk, job.id, metric_name, platform_kwargs
+            )
+            if artifact_metric is not None:
+                cached_metric = artifact_metric
+                logger.info(
+                    "Rec %d: recovered metric=%f from result artifacts "
+                    "before final status classification",
+                    rec.id, artifact_metric,
+                )
+
+        exec_status = cached_exec_status or _check_execution_status(
+            all_logs,
+            include_fatal_patterns=(
+                cached_metric is None or _has_hard_failure_pattern(all_logs)
+            ),
+        )
+        status = job_status.status if job_status is not None else "Error"
 
         # fix #3: job has reached terminal state — clear it from active_jobs.json.
         self._active_jobs.pop(rec.id, None)
@@ -1183,7 +1440,7 @@ class AutoMLRunner:
             logger.warning("Rec %d: job %s failed", rec.id, job.id)
             return cached_metric, "failure"
         if status == "Canceled":
-            return None, "failure"
+            return cached_metric, "failure"
 
         # fix #4: if an eval_fn is provided, run it post-training and let its
         # return override the log-extracted metric. Errors are isolated.
@@ -1264,6 +1521,7 @@ class AutoMLRunner:
         cached_metric = None
         cached_exec_status = None
         all_logs = ""
+        job_status = None
 
         # Poll until terminal.
         while True:
@@ -1280,11 +1538,54 @@ class AutoMLRunner:
                         m = None
                     if m is not None:
                         cached_metric = m
-                    es = _check_execution_status(logs)
+                    es = _check_execution_status(
+                        logs, include_fatal_patterns=False
+                    )
+                    hard_failure = _has_hard_failure_pattern(logs)
+                    if not es and (cached_metric is None or hard_failure):
+                        es = _check_execution_status(logs)
+                        if es == "FAIL":
+                            artifact_metric = _recover_metric_from_artifacts(
+                                self._sdk, job_id, metric_name, platform_kwargs
+                            )
+                            if artifact_metric is not None:
+                                cached_metric = artifact_metric
+                                if not hard_failure:
+                                    es = None
+                                    logger.info(
+                                        "Resume: rec %d ignoring cleanup "
+                                        "failure text after recovering metric=%f "
+                                        "from result artifacts",
+                                        rec_id, artifact_metric,
+                                    )
+                                else:
+                                    logger.warning(
+                                        "Resume: rec %d recovered metric=%f from "
+                                        "result artifacts before canceling hard "
+                                        "failed job",
+                                        rec_id, artifact_metric,
+                                    )
                     if es:
                         cached_exec_status = es
+                        if es == "FAIL":
+                            logger.warning(
+                                "Resume: rec %d job %s logs show execution "
+                                "failure; canceling backend job",
+                                rec_id, job_id,
+                            )
+                            try:
+                                self._sdk.cancel_job(job_id)
+                            except Exception as ex:
+                                logger.warning(
+                                    "Resume: failed to cancel failed job %s for "
+                                    "rec %d: %s",
+                                    job_id, rec_id, ex,
+                                )
+                            break
             except Exception:
                 pass
+            if cached_exec_status == "FAIL":
+                break
             try:
                 job_status = self._sdk.get_job_status(job_id)
             except Exception as e:
@@ -1304,14 +1605,37 @@ class AutoMLRunner:
                     m = None
                 if m is not None:
                     cached_metric = m
-                es = _check_execution_status(final_logs)
+                es = _check_execution_status(
+                    final_logs,
+                    include_fatal_patterns=(
+                        cached_metric is None
+                        or _has_hard_failure_pattern(final_logs)
+                    ),
+                )
                 if es:
                     cached_exec_status = es
         except Exception:
             pass
 
-        exec_status = cached_exec_status or _check_execution_status(all_logs)
-        status = job_status.status
+        if cached_metric is None:
+            artifact_metric = _recover_metric_from_artifacts(
+                self._sdk, job_id, metric_name, platform_kwargs
+            )
+            if artifact_metric is not None:
+                cached_metric = artifact_metric
+                logger.info(
+                    "Resume: rec %d recovered metric=%f from result "
+                    "artifacts before final status classification",
+                    rec_id, artifact_metric,
+                )
+
+        exec_status = cached_exec_status or _check_execution_status(
+            all_logs,
+            include_fatal_patterns=(
+                cached_metric is None or _has_hard_failure_pattern(all_logs)
+            ),
+        )
+        status = job_status.status if job_status is not None else "Error"
         self._active_jobs.pop(rec_id, None)
         self._persist_active_jobs(workspace_path)
 
@@ -1319,7 +1643,7 @@ class AutoMLRunner:
             metric_value = cached_metric
             report_status = "failure"
         elif status == "Canceled":
-            metric_value = None
+            metric_value = cached_metric
             report_status = "failure"
         else:
             metric_value = cached_metric
@@ -1486,12 +1810,15 @@ class AutoMLRunner:
             )
         )
         if not artifact:
+            rec.resume_checkpoint_path = None
+            rec.resume_checkpoint_missing = True
             logger.warning(
                 "Rec %d requested resume from %s, but no checkpoint artifact "
                 "could be resolved for epoch=%s step=%s",
                 rec.id, parent_job_id, resume_epoch, resume_step,
             )
             return specs
+        rec.resume_checkpoint_missing = False
         rec.resume_checkpoint_path = artifact
 
         if path_key:
@@ -1519,6 +1846,8 @@ class AutoMLRunner:
     ) -> dict | None:
         """Add runtime env needed by model-specific checkpoint resume paths."""
         if not getattr(rec, "resume_from_job_id", None):
+            return platform_kwargs
+        if not getattr(rec, "resume_checkpoint_path", None):
             return platform_kwargs
 
         updated = copy.deepcopy(platform_kwargs or {})

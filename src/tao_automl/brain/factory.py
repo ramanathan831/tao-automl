@@ -20,6 +20,15 @@ from tao_automl.brain.autoresearch_controller import AutoresearchBrain
 logger = logging.getLogger(__name__)
 
 
+def _as_bool(value: Any) -> bool:
+    """Parse bool-like values from runner settings."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "y", "on")
+    return bool(value)
+
+
 # Constants for algorithm names
 class AlgorithmType:
     """Constants for AutoML algorithm types"""
@@ -68,6 +77,7 @@ class AlgorithmParams:
     llm_max_tokens: int = 4096
     automl_max_experiments: int = 50  # autoresearch budget
     research_program: Optional[str] = None
+    hybrid_enable_llm_range_narrowing: bool = False
 
     @classmethod
     def from_dict(cls, params_dict: Dict[str, Any]) -> 'AlgorithmParams':
@@ -98,6 +108,12 @@ class AlgorithmParams:
             llm_max_tokens=int(params_dict.get("llm_max_tokens", 4096)),
             automl_max_experiments=int(params_dict.get("automl_max_experiments", 50)),
             research_program=params_dict.get("research_program"),
+            hybrid_enable_llm_range_narrowing=_as_bool(
+                params_dict.get(
+                    "hybrid_enable_llm_range_narrowing",
+                    params_dict.get("enable_llm_range_narrowing", False),
+                )
+            ),
         )
 
     def get_llm_params(self) -> Dict[str, Any]:
@@ -263,6 +279,7 @@ class BrainFactory:
                 "llm_params": params.get_llm_params(),
                 "metric": metric,
                 "max_experiments": int(params.automl_max_experiments),
+                "enable_llm_range_narrowing": params.hybrid_enable_llm_range_narrowing,
             }
         elif algo_lower in AlgorithmType.AUTORESEARCH:
             brain_class = AutoresearchBrain
