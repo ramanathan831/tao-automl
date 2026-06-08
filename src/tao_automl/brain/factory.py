@@ -29,6 +29,19 @@ def _as_bool(value: Any) -> bool:
     return bool(value)
 
 
+def _bracket_max_epochs(params: "AlgorithmParams") -> int:
+    """Return a positive scheduler budget for bracket-based algorithms."""
+    max_epochs = int(params.automl_max_epochs)
+    if max_epochs < 1:
+        logger.warning(
+            "Raising automl_max_epochs from %s to 1 so bracket-based AutoML "
+            "has a positive scheduler budget.",
+            max_epochs,
+        )
+        return 1
+    return max_epochs
+
+
 # Constants for algorithm names
 class AlgorithmType:
     """Constants for AutoML algorithm types"""
@@ -167,7 +180,7 @@ class BrainFactory:
                 "state_store": state_store,
                 "network": network,
                 "parameters": parameters,
-                "max_epochs": int(params.automl_max_epochs),
+                "max_epochs": _bracket_max_epochs(params),
                 "reduction_factor": int(params.automl_reduction_factor),
                 "epoch_multiplier": int(params.epoch_multiplier),
                 "metric": metric
@@ -187,7 +200,7 @@ class BrainFactory:
                 "state_store": state_store,
                 "network": network,
                 "parameters": parameters,
-                "max_epochs": int(params.automl_max_epochs),
+                "max_epochs": _bracket_max_epochs(params),
                 "reduction_factor": int(params.automl_reduction_factor),
                 "epoch_multiplier": int(params.epoch_multiplier),
                 "kde_samples": int(params.automl_kde_samples),
@@ -238,7 +251,7 @@ class BrainFactory:
                 "state_store": state_store,
                 "network": network,
                 "parameters": parameters,
-                "max_epochs": int(params.automl_max_epochs),
+                "max_epochs": _bracket_max_epochs(params),
                 "reduction_factor": int(params.automl_reduction_factor),
                 "epoch_multiplier": int(params.epoch_multiplier),
                 "mutation_factor": float(params.automl_mutation_factor),
@@ -252,7 +265,7 @@ class BrainFactory:
                 "state_store": state_store,
                 "network": network,
                 "parameters": parameters,
-                "max_epochs": int(params.automl_max_epochs),
+                "max_epochs": _bracket_max_epochs(params),
                 "reduction_factor": int(params.automl_reduction_factor),
                 "epoch_multiplier": int(params.epoch_multiplier),
                 "early_stop_threshold": float(params.automl_early_stop_threshold),

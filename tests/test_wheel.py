@@ -392,6 +392,34 @@ def test_budgeted_algorithms_emit_stop_compare_resume_budgets(algorithm):
         assert automl.get_best().id == 1
 
 
+@pytest.mark.parametrize("algorithm", ["hyperband", "bohb", "dehb", "hyperband_es"])
+def test_bracket_algorithms_accept_one_epoch_scheduler_budget(algorithm):
+    """Bracket algorithms should not fail when given a tiny smoke-test budget."""
+    from tao_automl import AutoML
+
+    with tempfile.TemporaryDirectory() as d:
+        automl = AutoML(
+            workspace=d,
+            network="cosmos-rl",
+            train_specs={"train": {"epoch": 10, "optm_lr": 1e-6}},
+            settings={
+                "algorithm": algorithm,
+                "metric": "val/avg_loss",
+                "automl_max_epochs": 1,
+                "automl_reduction_factor": 3,
+                "epoch_multiplier": 1,
+            },
+            automl_hyperparameters=["train.optm_lr"],
+            custom_param_ranges={
+                "train.optm_lr": {"valid_min": 5e-7, "valid_max": 2e-6},
+            },
+        )
+
+        first_rung = automl.next_recommendation()
+        assert first_rung
+        assert all(rec.specs["train.epoch"] == 1 for rec in first_rung)
+
+
 @pytest.mark.parametrize("algorithm", ["hyperband", "bohb", "asha", "dehb", "hyperband_es"])
 def test_budgeted_algorithms_pick_best_at_largest_budget(algorithm):
     """Final handoff should not choose an unpromoted lower-fidelity checkpoint."""

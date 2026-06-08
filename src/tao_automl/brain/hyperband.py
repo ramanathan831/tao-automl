@@ -71,6 +71,12 @@ class HyperBand(AutoMLAlgorithmBase):
             f"Hyperband bracket calculation: max_epochs={max_epochs}, "
             f"reduction_factor={reduction_factor}, smax={smax}"
         )
+        if smax == 0:
+            self.ni["0"] = [1]
+            self.ri["0"] = [max(1, int(max_epochs))]
+            logger.info(f"  Bracket 0 final: ni={self.ni['0']}, ri={self.ri['0']}")
+            logger.info(f"All brackets: ni={self.ni}, ri={self.ri}")
+            return
         for itr, s in enumerate(range(smax, 0, -1)):
             self.ni[str(itr)] = []
             self.ri[str(itr)] = []

@@ -124,6 +124,119 @@ def test_extract_metric_reads_sparse4d_status_kpi_alias(tmp_path):
     assert _extract_metric_from_status_file(status_path, "val_mAP") == 0.125
 
 
+def test_extract_metric_reads_dino_status_kpis(tmp_path):
+    from tao_automl.runner import _extract_metric_from_status_file
+
+    status_path = tmp_path / "status.json"
+    status_path.write_text(
+        '{"status":"RUNNING","message":"Eval metrics generated.",'
+        '"kpi":{"val_mAP":"0.0106","val_mAP50":"0.0364","val_loss":18.37}}\n'
+    )
+
+    assert _extract_metric_from_status_file(status_path, "val_loss") == pytest.approx(18.37)
+    assert _extract_metric_from_status_file(status_path, "val_mAP") == pytest.approx(0.0106)
+    assert _extract_metric_from_status_file(status_path, "val_mAP50") == pytest.approx(0.0364)
+
+
+def test_extract_metric_reads_best_status_value_by_direction(tmp_path):
+    from tao_automl.runner import _extract_metric_from_status_file
+
+    status_path = tmp_path / "status.json"
+    status_path.write_text(
+        '{"status":"RUNNING","kpi":{"val_mAP":0.20,"val_loss":2.0}}\n'
+        '{"status":"RUNNING","kpi":{"val_mAP":0.15,"val_loss":1.0}}\n'
+        '{"status":"RUNNING","kpi":{"val_mAP":0.18,"val_loss":1.2}}\n'
+    )
+
+    assert _extract_metric_from_status_file(status_path, "val_mAP") == pytest.approx(0.20)
+    assert _extract_metric_from_status_file(status_path, "val_loss") == pytest.approx(1.0)
+
+
+def test_extract_metric_reads_dino_message_only_status(tmp_path):
+    from tao_automl.runner import _extract_metric_from_status_file
+
+    status_path = tmp_path / "status.json"
+    status_path.write_text(
+        '{"status":"RUNNING","message":"\\n Validation mAP : 0.12\\n"}\n'
+        '{"status":"RUNNING","message":"\\n Validation mAP50 : 0.34\\n"}\n'
+    )
+
+    assert _extract_metric_from_status_file(status_path, "val_mAP") == pytest.approx(0.12)
+    assert _extract_metric_from_status_file(status_path, "val_mAP50") == pytest.approx(0.34)
+
+
+def test_status_payload_treats_reached_budget_as_training_complete():
+    from tao_automl.runner import _status_payload_has_training_complete
+
+    payload = (
+        '{"epoch":1989,"step":79600,"max_epoch":1999,"max_step":80000,'
+        '"status":"RUNNING","message":"Training loop in progress",'
+        '"kpi":{"val_miou":0.951249897480011}}\n'
+        '{"epoch":1999,"step":80000,"max_epoch":1999,"max_step":80000,'
+        '"status":"RUNNING","message":"Training loop in progress",'
+        '"kpi":{"val_miou":0.9512068927288055}}\n'
+    )
+
+    assert _status_payload_has_training_complete(payload)
+
+
+def test_recover_metric_reads_remote_slurm_status_json():
+    from tao_automl.runner import _extract_metric_from_sdk_results
+
+    class SDK:
+        def read_job_result_file(self, job_id, relative_path):
+            assert job_id == "job-1"
+            if relative_path == "results_dir/train/status.json":
+                return (
+                    '{"status":"RUNNING","message":"Eval metrics generated.",'
+                    '"kpi":{"val_loss":17.05}}\n'
+                )
+            return ""
+
+        def get_job_results_dir(self, job_id):
+            return "lustre:///results/job-1"
+
+    assert _extract_metric_from_sdk_results(SDK(), "job-1", "val_loss") == pytest.approx(17.05)
+
+
+def test_extract_metric_reads_nested_status_metrics(tmp_path):
+    from tao_automl.runner import _extract_metric_from_status_file
+
+    status_path = tmp_path / "status.json"
+    status_path.write_text(
+        '{"status":"RUNNING","metrics":{"validation":{"val_avg_loss":"0.4242"}}}\n'
+    )
+
+    assert _extract_metric_from_status_file(
+        status_path, "val/avg_loss"
+    ) == pytest.approx(0.4242)
+
+
+def test_recover_metric_scans_remote_slurm_result_artifacts():
+    from tao_automl.runner import _extract_metric_from_sdk_results
+
+    class Handler:
+        def list_remote_files(self, results_dir):
+            assert results_dir == "lustre:///results/job-1"
+            return ["/results/job-1/train_output_dir/eval/metrics.json"]
+
+    class SDK:
+        _handler = Handler()
+
+        def read_job_result_file(self, job_id, relative_path):
+            assert job_id == "job-1"
+            if relative_path == "train_output_dir/eval/metrics.json":
+                return '{"scores":[{"metric_name":"val/avg_loss","value":0.515}]}\n'
+            return ""
+
+        def get_job_results_dir(self, job_id):
+            return "lustre:///results/job-1"
+
+    assert _extract_metric_from_sdk_results(
+        SDK(), "job-1", "val/avg_loss"
+    ) == pytest.approx(0.515)
+
+
 def test_execution_status_can_ignore_fatal_cleanup_patterns():
     from tao_automl.runner import _check_execution_status
 
@@ -267,7 +380,11 @@ def test_promoted_metric_missing_checkpoint_carries_forward_prior_metric(
     )
 
     assert result["best"]["metric_value"] == 0.42
+    assert result["metric"] == "val_mAP"
+    assert result["direction"] == "maximize"
     assert result["history"][0]["status"] == JobStates.success
+    assert result["history"][0]["job_id"] == "child-job"
+    assert result["history"][0]["specs"] == {"train.num_epochs": 2}
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +463,37 @@ def test_run_one_job_calls_build_entrypoint_with_action_cfg(tmp_path):
         assert legacy not in create_kwargs, f"legacy kwarg {legacy!r} leaked"
 
 
+def test_dino_recommendation_constraints_cap_num_select():
+    from tao_automl.runner import AutoMLRunner
+
+    rec_specs = {
+        "model.num_queries": 100,
+        "model.num_select": 300,
+    }
+    base_specs = {
+        "model": {"num_queries": 300, "num_select": 300},
+        "dataset": {"num_classes": 5},
+    }
+
+    AutoMLRunner._apply_recommendation_constraints("dino", base_specs, rec_specs)
+
+    assert rec_specs["model.num_select"] == 100
+
+
+def test_dino_recommendation_constraints_cap_base_num_select_when_queries_change():
+    from tao_automl.runner import AutoMLRunner
+
+    rec_specs = {"model.num_queries": 100}
+    base_specs = {
+        "model": {"num_queries": 300, "num_select": 300},
+        "dataset": {"num_classes": 5},
+    }
+
+    AutoMLRunner._apply_recommendation_constraints("dino", base_specs, rec_specs)
+
+    assert rec_specs["model.num_select"] == 100
+
+
 def test_run_one_job_allows_completed_metric_with_cleanup_rendezvous(tmp_path):
     from tao_automl.runner import AutoMLRunner
 
@@ -418,6 +566,105 @@ def test_run_one_job_cancels_hard_failure_and_recovers_remote_best_score(tmp_pat
     assert metric == pytest.approx(0.8927091135965706)
     assert status == "failure"
     fake_sdk.cancel_job.assert_called_once_with("job-hard")
+
+
+def test_run_one_job_accepts_completed_status_artifact_after_wrapper_failure(tmp_path):
+    from tao_automl.runner import AutoMLRunner
+
+    skill_dir = _write_fake_skill(tmp_path)
+    fake_sdk = MagicMock()
+    fake_sdk.create_job.return_value = MagicMock(
+        id="job-complete-artifact",
+        backend_job_id="be-complete-artifact",
+    )
+    fake_sdk.get_job_status.return_value = MagicMock(status="Error")
+    fake_sdk.get_job_logs.return_value = "failed with return code 1\n"
+
+    def read_result_file(job_id, relative_path):
+        if relative_path == "results_dir/train/status.json":
+            return (
+                '{"status":"RUNNING","message":"Eval metrics generated.",'
+                '"kpi":{"val_miou":0.9512}}\n'
+                '{"status":"RUNNING","message":"Training loop complete.",'
+                '"kpi":{"train_loss":-1.5}}\n'
+                '{"status":"RUNNING","message":"Train finished successfully.",'
+                '"kpi":{"train_loss":-1.5}}\n'
+            )
+        return ""
+
+    fake_sdk.read_job_result_file.side_effect = read_result_file
+
+    runner = AutoMLRunner(sdk=fake_sdk, skill_dir=skill_dir, action="train")
+    runner._poll_interval = 0
+    rec = MagicMock(id=10)
+
+    with patch(
+        "tao_sdk.script_runner.build_entrypoint",
+        return_value={"command": "BAKED_HEREDOC_COMMAND", "args_template": ""},
+    ):
+        metric, status = runner._run_one_job(
+            image="nvcr.io/test:1",
+            action_cfg=runner.skill_ctx.action_cfg,
+            specs={"train": {"num_epochs": 10}},
+            rec=rec,
+            metric_name="val_miou",
+            workspace_path=str(tmp_path),
+            platform_kwargs={},
+        )
+
+    assert metric == pytest.approx(0.9512)
+    assert status == "success"
+    fake_sdk.cancel_job.assert_not_called()
+
+
+def test_run_one_job_accepts_budget_reached_status_artifact_after_wrapper_failure(tmp_path):
+    from tao_automl.runner import AutoMLRunner
+
+    skill_dir = _write_fake_skill(tmp_path)
+    fake_sdk = MagicMock()
+    fake_sdk.create_job.return_value = MagicMock(
+        id="job-budget-complete",
+        backend_job_id="be-budget-complete",
+    )
+    fake_sdk.get_job_status.return_value = MagicMock(status="Error")
+    fake_sdk.get_job_logs.return_value = "failed with return code 1\n"
+
+    def read_result_file(job_id, relative_path):
+        if relative_path == "results_dir/train/status.json":
+            return (
+                '{"date":"6/5/2026","time":"10:45:47","status":"RUNNING",'
+                '"message":"Eval metrics generated.",'
+                '"kpi":{"val_miou":0.9512068927288055}}\n'
+                '{"epoch":1999,"step":80000,"max_epoch":1999,'
+                '"max_step":80000,"status":"RUNNING",'
+                '"message":"Training loop in progress",'
+                '"kpi":{"val_miou":0.9512068927288055}}\n'
+            )
+        return ""
+
+    fake_sdk.read_job_result_file.side_effect = read_result_file
+
+    runner = AutoMLRunner(sdk=fake_sdk, skill_dir=skill_dir, action="train")
+    runner._poll_interval = 0
+    rec = MagicMock(id=11)
+
+    with patch(
+        "tao_sdk.script_runner.build_entrypoint",
+        return_value={"command": "BAKED_HEREDOC_COMMAND", "args_template": ""},
+    ):
+        metric, status = runner._run_one_job(
+            image="nvcr.io/test:1",
+            action_cfg=runner.skill_ctx.action_cfg,
+            specs={"train": {"num_epochs": 2000}},
+            rec=rec,
+            metric_name="val_miou",
+            workspace_path=str(tmp_path),
+            platform_kwargs={},
+        )
+
+    assert metric == pytest.approx(0.9512068927288055)
+    assert status == "success"
+    fake_sdk.cancel_job.assert_not_called()
 
 
 def test_run_one_job_preserves_metric_when_slurm_reports_canceled(tmp_path):

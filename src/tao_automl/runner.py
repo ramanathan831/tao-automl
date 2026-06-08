@@ -37,6 +37,7 @@ import argparse
 import copy
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -152,6 +153,34 @@ _HARD_FATAL_PATTERNS = (
     "Signal 6 (SIGABRT)",
     "Process 1 failed with return code",
 )
+
+_TRAINING_COMPLETE_MARKERS = (
+    "Execution status: PASS",
+    "Training loop complete",
+    "Train finished successfully",
+    "Outputs persisted on mount",
+    "Job complete.",
+)
+
+
+def _status_record_reaches_training_budget(record: Any) -> bool:
+    """Return whether a structured TAO status record reached its budget."""
+    if not isinstance(record, dict):
+        return False
+
+    step = _finite_float(record.get("step"))
+    max_step = _finite_float(record.get("max_step"))
+    if max_step is not None and max_step > 0 and step is not None and step >= max_step:
+        return True
+
+    epoch = _finite_float(record.get("epoch"))
+    max_epoch = _finite_float(record.get("max_epoch"))
+    return (
+        max_epoch is not None
+        and max_epoch > 0
+        and epoch is not None
+        and epoch >= max_epoch
+    )
 
 
 def _extract_metric_from_logs(logs: str, metric_name: str) -> float | None:
@@ -283,7 +312,11 @@ def _metric_aliases(metric_name: str) -> list[str]:
         aliases.append(metric_name.replace("_", "/"))
     normalized = metric_name.lower().replace("/", "_")
     if normalized in {"map", "val_map"}:
-        aliases.append("img_bbox_NuScenes/mAP")
+        aliases.extend(["val_mAP", "img_bbox_NuScenes/mAP"])
+    if normalized in {"map50", "map_50", "val_map50", "val_map_50", "ap50"}:
+        aliases.extend(["val_mAP50", "Validation mAP50"])
+    if normalized in {"val_loss", "validation_loss"}:
+        aliases.append("Validation loss")
     if normalized == "train_loss_epoch":
         aliases.append("train_loss")
     if normalized == "train_loss":
@@ -294,35 +327,171 @@ def _metric_aliases(metric_name: str) -> list[str]:
     return [alias for alias in aliases if not (alias in seen or seen.add(alias))]
 
 
+def _normalize_metric_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+
+
+def _finite_float(value: Any) -> float | None:
+    try:
+        metric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return metric if math.isfinite(metric) else None
+
+
+def _select_metric_candidate(values: list[float], metric_name: str) -> float | None:
+    """Select the best metric value for the metric's implicit direction."""
+    finite_values = [value for value in values if math.isfinite(value)]
+    if not finite_values:
+        return None
+    if _implicit_direction(metric_name) == "minimize":
+        return min(finite_values)
+    return max(finite_values)
+
+
+def _metric_alias_key_set(metric_name: str) -> set[str]:
+    return {_normalize_metric_key(alias) for alias in _metric_aliases(metric_name)}
+
+
+def _extract_metric_from_json_record(record: Any, metric_name: str) -> float | None:
+    """Find a metric in a nested JSON status/best-score record."""
+    alias_keys = _metric_alias_key_set(metric_name)
+
+    def walk(node: Any) -> float | None:
+        if isinstance(node, list):
+            for item in reversed(node):
+                metric = walk(item)
+                if metric is not None:
+                    return metric
+            return None
+        if not isinstance(node, dict):
+            return None
+
+        label = next(
+            (
+                node.get(key)
+                for key in ("metric", "metric_name", "name", "key")
+                if isinstance(node.get(key), str)
+            ),
+            None,
+        )
+        if isinstance(label, str) and _normalize_metric_key(label) in alias_keys:
+            for value_key in (
+                "value",
+                "score",
+                "best_score",
+                "best_metric",
+                "metric_value",
+                "result",
+            ):
+                metric = _finite_float(node.get(value_key))
+                if metric is not None:
+                    return metric
+
+        for key, value in node.items():
+            if isinstance(key, str) and _normalize_metric_key(key) in alias_keys:
+                metric = _finite_float(value)
+                if metric is not None:
+                    return metric
+
+        for container_key in (
+            "kpi",
+            "kpis",
+            "metrics",
+            "metric",
+            "scores",
+            "results",
+            "data",
+            "payload",
+        ):
+            if container_key in node:
+                metric = walk(node[container_key])
+                if metric is not None:
+                    return metric
+
+        for value in node.values():
+            if isinstance(value, (dict, list)):
+                metric = walk(value)
+                if metric is not None:
+                    return metric
+        return None
+
+    return walk(record)
+
+
+def _extract_metric_from_status_payload(payload: str, metric_name: str) -> float | None:
+    """Read the best finite metric value from TAO JSON/JSONL status content."""
+    if not payload:
+        return None
+    aliases = _metric_aliases(metric_name)
+    message_patterns = []
+    for alias in aliases:
+        label = alias.replace("_", " ").replace("/", " ")
+        message_patterns.append(
+            re.compile(
+                rf"{re.escape(label)}\s*:\s*([+-]?[0-9]*\.?[0-9]+(?:[eE][+-]?\d+)?)",
+                re.IGNORECASE,
+            )
+        )
+    if metric_name.lower().replace("_", "") == "valmap50":
+        message_patterns.append(
+            re.compile(
+                r"Validation\s+mAP50\s*:\s*([+-]?[0-9]*\.?[0-9]+(?:[eE][+-]?\d+)?)",
+                re.IGNORECASE,
+            )
+        )
+    if metric_name.lower().replace("_", "") in {"valmap", "map"}:
+        message_patterns.append(
+            re.compile(
+                r"Validation\s+mAP\s*:\s*([+-]?[0-9]*\.?[0-9]+(?:[eE][+-]?\d+)?)",
+                re.IGNORECASE,
+            )
+        )
+
+    lines = payload.splitlines()
+    if len(lines) == 1:
+        try:
+            data = json.loads(lines[0])
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, list):
+            lines = [json.dumps(item) for item in data]
+
+    values: list[float] = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        metric = _extract_metric_from_json_record(record, metric_name)
+        if metric is not None:
+            values.append(metric)
+        message = record.get("message")
+        if isinstance(message, str):
+            for pattern in message_patterns:
+                match = pattern.search(message)
+                if match:
+                    value = _finite_float(match.group(1))
+                    if value is not None:
+                        values.append(value)
+    return _select_metric_candidate(values, metric_name)
+
+
 def _extract_metric_from_status_file(status_path: Path, metric_name: str) -> float | None:
     """Read the latest finite KPI value from a TAO line-delimited status file."""
     if not status_path.exists():
         return None
-    aliases = _metric_aliases(metric_name)
     try:
-        lines = status_path.read_text(encoding="utf-8").splitlines()
+        return _extract_metric_from_status_payload(
+            status_path.read_text(encoding="utf-8"),
+            metric_name,
+        )
     except OSError:
         return None
-    for line in reversed(lines):
-        if not line.strip():
-            continue
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        kpi = payload.get("kpi")
-        if not isinstance(kpi, dict):
-            continue
-        for alias in aliases:
-            if alias not in kpi:
-                continue
-            try:
-                value = float(kpi[alias])
-            except (TypeError, ValueError):
-                continue
-            if value == value:
-                return value
-    return None
 
 
 def _extract_metric_from_best_score_payload(
@@ -339,6 +508,13 @@ def _extract_metric_from_best_score_payload(
         data = json.loads(payload) if isinstance(payload, str) else payload
     except json.JSONDecodeError:
         return None
+    if isinstance(data, list):
+        values = []
+        for item in data:
+            metric = _extract_metric_from_best_score_payload(item, metric_name)
+            if metric is not None:
+                values.append(metric)
+        return _select_metric_candidate(values, metric_name)
     if not isinstance(data, dict):
         return None
 
@@ -352,23 +528,18 @@ def _extract_metric_from_best_score_payload(
     for key in ("best_score", "best_metric", "metric_value", "score", "value"):
         if key not in data:
             continue
-        try:
-            value = float(data[key])
-        except (TypeError, ValueError):
-            continue
-        if value == value:
+        value = _finite_float(data[key])
+        if value is not None:
             return value
 
-    for key in aliases:
-        if key not in data:
+    alias_keys = {_normalize_metric_key(alias) for alias in aliases}
+    for key, raw_value in data.items():
+        if not isinstance(key, str) or _normalize_metric_key(key) not in alias_keys:
             continue
-        try:
-            value = float(data[key])
-        except (TypeError, ValueError):
-            continue
-        if value == value:
+        value = _finite_float(raw_value)
+        if value is not None:
             return value
-    return None
+    return _extract_metric_from_json_record(data, metric_name)
 
 
 def _extract_metric_from_best_score_file(
@@ -384,6 +555,83 @@ def _extract_metric_from_best_score_file(
         )
     except OSError:
         return None
+
+
+def _sdk_result_relative_paths(sdk, job_id: str, results_dir: str) -> list[str]:
+    """List result artifact paths relative to an SDK-managed result directory."""
+    if not results_dir:
+        return []
+
+    files: list[str] = []
+    if results_dir.startswith("lustre://"):
+        handler = getattr(sdk, "_handler", None)
+        list_remote = getattr(handler, "list_remote_files", None)
+        if not callable(list_remote):
+            return []
+        try:
+            files = list_remote(results_dir)
+        except Exception:
+            return []
+        base = results_dir.removeprefix("lustre://").rstrip("/")
+        if not base.startswith("/"):
+            base = "/" + base
+    else:
+        path = _uri_to_local_path(results_dir)
+        if not path or not path.exists():
+            return []
+        base = str(path.rstrip("/") if isinstance(path, str) else path).rstrip("/")
+        files = [str(candidate) for candidate in path.rglob("*") if candidate.is_file()]
+
+    relative_paths: list[str] = []
+    for file_path in files:
+        file_path = str(file_path)
+        if file_path == base:
+            continue
+        if not file_path.startswith(f"{base}/"):
+            continue
+        relative_paths.append(file_path[len(base) + 1:])
+    return sorted(relative_paths)
+
+
+def _metric_artifact_candidates(relative_paths: list[str]) -> list[str]:
+    """Prioritize structured artifacts that are likely to contain metrics."""
+    preferred_names = {
+        "best_score.json",
+        "status.json",
+        "metrics.json",
+        "metric.json",
+        "results.json",
+        "result.json",
+        "eval.json",
+        "evaluation.json",
+        "score.json",
+        "scores.json",
+    }
+    paths = []
+    for relative_path in relative_paths:
+        lower_path = relative_path.lower()
+        name = lower_path.rsplit("/", 1)[-1]
+        if name in preferred_names or (
+            lower_path.endswith((".json", ".jsonl"))
+            and any(token in lower_path for token in ("metric", "score", "status", "eval"))
+        ):
+            paths.append(relative_path)
+
+    def priority(path: str) -> tuple[int, str]:
+        name = path.lower().rsplit("/", 1)[-1]
+        if name == "best_score.json":
+            return (0, path)
+        if name == "status.json":
+            return (1, path)
+        return (2, path)
+
+    seen = set()
+    ordered = []
+    for path in sorted(paths, key=priority):
+        if path not in seen:
+            seen.add(path)
+            ordered.append(path)
+    return ordered
 
 
 def _extract_metric_from_local_results(job_id: str, metric_name: str,
@@ -429,6 +677,12 @@ def _extract_metric_from_sdk_results(sdk, job_id: str,
         "results_dir/best/best_score.json",
         "best/best_score.json",
     )
+    status_candidates = (
+        "results_dir/train/status.json",
+        "train/status.json",
+        "results_dir/status.json",
+        "status.json",
+    )
 
     read_remote = getattr(sdk, "read_job_result_file", None)
     if callable(read_remote):
@@ -442,11 +696,40 @@ def _extract_metric_from_sdk_results(sdk, job_id: str,
             metric = _extract_metric_from_best_score_payload(payload, metric_name)
             if metric is not None:
                 return metric
+        for relative_path in status_candidates:
+            try:
+                payload = read_remote(job_id, relative_path)
+            except Exception:
+                payload = ""
+            metric = _extract_metric_from_status_payload(payload, metric_name)
+            if metric is not None:
+                return metric
 
     try:
         results_dir = sdk.get_job_results_dir(job_id)
     except Exception:
         results_dir = ""
+    if callable(read_remote) and results_dir:
+        for relative_path in _metric_artifact_candidates(
+            _sdk_result_relative_paths(sdk, job_id, results_dir)
+        ):
+            try:
+                payload = read_remote(job_id, relative_path)
+            except Exception:
+                payload = ""
+            if not payload:
+                continue
+            if relative_path.lower().endswith("best_score.json"):
+                metric = _extract_metric_from_best_score_payload(payload, metric_name)
+            else:
+                metric = _extract_metric_from_status_payload(payload, metric_name)
+                if metric is None:
+                    metric = _extract_metric_from_best_score_payload(
+                        payload, metric_name
+                    )
+            if metric is not None:
+                return metric
+
     results_path = _uri_to_local_path(results_dir)
     if results_path and results_path.exists():
         for best_score_path in sorted(results_path.rglob("best_score.json")):
@@ -474,6 +757,124 @@ def _recover_metric_from_artifacts(
     if local_metric is not None:
         return local_metric
     return _extract_metric_from_sdk_results(sdk, job_id, metric_name)
+
+
+def _status_payload_has_training_complete(payload: str) -> bool:
+    """Return whether a structured TAO status payload shows train completion."""
+    if not payload:
+        return False
+    if any(marker in payload for marker in _TRAINING_COMPLETE_MARKERS):
+        return True
+
+    lines = payload.splitlines()
+    if len(lines) == 1:
+        try:
+            data = json.loads(lines[0])
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, list):
+            lines = [json.dumps(item) for item in data]
+
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        message = record.get("message")
+        if isinstance(message, str) and any(
+            marker in message for marker in _TRAINING_COMPLETE_MARKERS
+        ):
+            return True
+        if _status_record_reaches_training_budget(record):
+            return True
+    return False
+
+
+def _extract_status_payloads_from_local_results(
+    job_id: str,
+    platform_kwargs: dict | None,
+) -> list[str]:
+    payloads: list[str] = []
+    for mount in (platform_kwargs or {}).get("mounts", []) or []:
+        if not isinstance(mount, dict) or mount.get("container_path") != "/results":
+            continue
+        host_root = mount.get("host_path")
+        if not host_root:
+            continue
+        job_root = Path(host_root) / job_id
+        if not job_root.exists():
+            continue
+        for status_path in sorted(job_root.rglob("status.json")):
+            try:
+                payloads.append(status_path.read_text(encoding="utf-8"))
+            except OSError:
+                continue
+    return payloads
+
+
+def _result_artifacts_show_training_complete(
+    sdk,
+    job_id: str,
+    platform_kwargs: dict | None,
+) -> bool:
+    """Check result artifacts for a successful training completion marker.
+
+    Some SLURM entrypoints can return a non-zero final status after TAO has
+    already completed training and written checkpoints/status metrics. In that
+    case the metric is still a valid measured result, but only when the
+    structured artifacts prove the training loop actually completed.
+    """
+    for payload in _extract_status_payloads_from_local_results(job_id, platform_kwargs):
+        if _status_payload_has_training_complete(payload):
+            return True
+
+    status_candidates = (
+        "results_dir/train/status.json",
+        "train/status.json",
+        "results_dir/status.json",
+        "status.json",
+    )
+    read_remote = getattr(sdk, "read_job_result_file", None)
+    if callable(read_remote):
+        for relative_path in status_candidates:
+            try:
+                payload = read_remote(job_id, relative_path)
+            except Exception:
+                payload = ""
+            if _status_payload_has_training_complete(payload):
+                return True
+
+    try:
+        results_dir = sdk.get_job_results_dir(job_id)
+    except Exception:
+        results_dir = ""
+    if callable(read_remote) and results_dir:
+        for relative_path in _metric_artifact_candidates(
+            _sdk_result_relative_paths(sdk, job_id, results_dir)
+        ):
+            if "status" not in relative_path.lower():
+                continue
+            try:
+                payload = read_remote(job_id, relative_path)
+            except Exception:
+                payload = ""
+            if _status_payload_has_training_complete(payload):
+                return True
+
+    results_path = _uri_to_local_path(results_dir)
+    if results_path and results_path.exists():
+        for status_path in sorted(results_path.rglob("status.json")):
+            try:
+                payload = status_path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if _status_payload_has_training_complete(payload):
+                return True
+    return False
 
 
 def _uri_to_local_path(uri: str) -> Path | None:
@@ -1121,10 +1522,6 @@ class AutoMLRunner:
                 declared_outputs = set(declared_outputs.keys())
 
             for rec in recs:
-                if on_recommendation:
-                    on_recommendation(rec)
-                logger.info("Recommendation %d: launching job with %d spec overrides",
-                            rec.id, len(rec.specs))
                 run_base_specs = base_specs
                 try:
                     stored_specs = automl._state_store.get_job_specs(automl._context.id)
@@ -1132,6 +1529,15 @@ class AutoMLRunner:
                         run_base_specs = stored_specs
                 except Exception as ex:
                     logger.debug("Could not read AutoML-updated base specs: %s", ex)
+                self._apply_recommendation_constraints(
+                    network_arch=network_arch,
+                    base_specs=run_base_specs,
+                    rec_specs=rec.specs,
+                )
+                if on_recommendation:
+                    on_recommendation(rec)
+                logger.info("Recommendation %d: launching job with %d spec overrides",
+                            rec.id, len(rec.specs))
                 merged_specs = self._merge_specs(run_base_specs, rec.specs)
                 merged_specs = self._apply_resume_checkpoint(
                     merged_specs, rec, platform_kwargs
@@ -1248,14 +1654,29 @@ class AutoMLRunner:
             )
 
         result = {
+            "metric": metric_name,
+            "direction": _effective_dir,
             "best": {
                 "rec_id": best.id if best else None,
                 "specs": best.specs if best else {},
                 "metric_value": _unflip(best.result) if best else None,
             },
-            "progress": progress,
-            "history": [{"rec_id": r.id, "metric": _unflip(r.result),
-                          "status": r.status} for r in history],
+            "progress": {
+                **progress,
+                "best_metric": _unflip(progress.get("best_metric")),
+            },
+            "history": [
+                {
+                    "rec_id": r.id,
+                    "metric": _unflip(r.result),
+                    "status": r.status,
+                    "specs": r.specs,
+                    "job_id": r.job_id,
+                    "created_on": r.created_on,
+                    "last_modified": r.last_modified,
+                }
+                for r in history
+            ],
         }
         logger.info("AutoML complete: %d recommendations, best metric=%.6f (rec %s)",
                      progress["completed"],
@@ -1342,13 +1763,16 @@ class AutoMLRunner:
                             )
                             if artifact_metric is not None:
                                 cached_metric = artifact_metric
-                                if not hard_failure:
+                                training_complete = _result_artifacts_show_training_complete(
+                                    self._sdk, job.id, platform_kwargs
+                                )
+                                if not hard_failure or training_complete:
                                     es = None
                                     logger.info(
                                         "Rec %d: ignoring cleanup failure text "
                                         "after recovering metric=%f from result "
-                                        "artifacts",
-                                        rec.id, artifact_metric,
+                                        "artifacts (training_complete=%s)",
+                                        rec.id, artifact_metric, training_complete,
                                     )
                                 else:
                                     logger.warning(
@@ -1370,6 +1794,32 @@ class AutoMLRunner:
                                 logger.warning(
                                     "Failed to cancel failed job %s for rec %d: %s",
                                     job.id, rec.id, ex,
+                                )
+                            break
+                    if _status_payload_has_training_complete(logs):
+                        artifact_metric = _recover_metric_from_artifacts(
+                            self._sdk, job.id, metric_name, platform_kwargs
+                        )
+                        if artifact_metric is not None:
+                            cached_metric = artifact_metric
+                            cached_exec_status = "PASS"
+                            logger.info(
+                                "Rec %d: logs show training completion and "
+                                "structured artifact metric=%f exists while "
+                                "backend job is still non-terminal; canceling "
+                                "backend job to release resources",
+                                rec.id,
+                                artifact_metric,
+                            )
+                            try:
+                                self._sdk.cancel_job(job.id)
+                            except Exception as ex:
+                                logger.warning(
+                                    "Failed to cancel completed job %s for rec "
+                                    "%d: %s",
+                                    job.id,
+                                    rec.id,
+                                    ex,
                                 )
                             break
             except Exception:
@@ -1411,17 +1861,24 @@ class AutoMLRunner:
         except Exception:
             pass
 
-        if cached_metric is None:
-            artifact_metric = _recover_metric_from_artifacts(
-                self._sdk, job.id, metric_name, platform_kwargs
-            )
-            if artifact_metric is not None:
-                cached_metric = artifact_metric
+        artifact_metric = _recover_metric_from_artifacts(
+            self._sdk, job.id, metric_name, platform_kwargs
+        )
+        if artifact_metric is not None:
+            if cached_metric is None:
                 logger.info(
                     "Rec %d: recovered metric=%f from result artifacts "
                     "before final status classification",
                     rec.id, artifact_metric,
                 )
+            elif artifact_metric != cached_metric:
+                logger.info(
+                    "Rec %d: using structured artifact metric=%f instead "
+                    "of log-extracted metric=%f before final status "
+                    "classification",
+                    rec.id, artifact_metric, cached_metric,
+                )
+            cached_metric = artifact_metric
 
         exec_status = cached_exec_status or _check_execution_status(
             all_logs,
@@ -1430,18 +1887,42 @@ class AutoMLRunner:
             ),
         )
         status = job_status.status if job_status is not None else "Error"
+        hard_failure = _has_hard_failure_pattern(all_logs)
+        training_complete = (
+            cached_metric is not None
+            and _result_artifacts_show_training_complete(
+                self._sdk, job.id, platform_kwargs
+            )
+        )
 
         # fix #3: job has reached terminal state — clear it from active_jobs.json.
         self._active_jobs.pop(rec.id, None)
         if workspace_path:
             self._persist_active_jobs(workspace_path)
 
-        if status == "Error" or exec_status == "FAIL":
-            logger.warning("Rec %d: job %s failed", rec.id, job.id)
-            return cached_metric, "failure"
-        if status == "Canceled":
-            return cached_metric, "failure"
-
+        if status == "Error" or status == "Canceled" or exec_status == "FAIL":
+            valid_measured_result = (
+                cached_metric is not None
+                and (
+                    training_complete
+                    or (status != "Canceled" and not hard_failure)
+                )
+            )
+            if valid_measured_result:
+                logger.info(
+                    "Rec %d: job %s ended with terminal status=%s "
+                    "exec_status=%s but recovered metric=%f; treating as a "
+                    "valid measured result (training_complete=%s)",
+                    rec.id,
+                    job.id,
+                    status,
+                    exec_status,
+                    cached_metric,
+                    training_complete,
+                )
+            else:
+                logger.warning("Rec %d: job %s failed", rec.id, job.id)
+                return cached_metric, "failure"
         # fix #4: if an eval_fn is provided, run it post-training and let its
         # return override the log-extracted metric. Errors are isolated.
         metric_value = cached_metric
@@ -1460,20 +1941,17 @@ class AutoMLRunner:
                             f"{cached_metric:.6f}" if cached_metric is not None else "None")
                 metric_value = eval_metric
                 eval_metric_used = True
-        local_metric = _extract_metric_from_local_results(
-            job.id, metric_name, platform_kwargs
-        )
-        if local_metric is not None and not eval_metric_used:
+        if artifact_metric is not None and not eval_metric_used:
             if metric_value is None:
-                logger.info("Rec %d: recovered metric=%f from local status artifacts",
-                            rec.id, local_metric)
-            elif local_metric != metric_value:
+                logger.info("Rec %d: recovered metric=%f from structured artifacts",
+                            rec.id, artifact_metric)
+            elif artifact_metric != metric_value:
                 logger.info(
-                    "Rec %d: using local status metric=%f instead of "
+                    "Rec %d: using structured artifact metric=%f instead of "
                     "log-extracted metric=%f",
-                    rec.id, local_metric, metric_value,
+                    rec.id, artifact_metric, metric_value,
                 )
-            metric_value = local_metric
+            metric_value = artifact_metric
 
         if metric_value is None:
             logger.warning("Rec %d: job %s completed but no metric could be "
@@ -1550,13 +2028,19 @@ class AutoMLRunner:
                             )
                             if artifact_metric is not None:
                                 cached_metric = artifact_metric
-                                if not hard_failure:
+                                training_complete = _result_artifacts_show_training_complete(
+                                    self._sdk, job_id, platform_kwargs
+                                )
+                                if not hard_failure or training_complete:
                                     es = None
                                     logger.info(
                                         "Resume: rec %d ignoring cleanup "
                                         "failure text after recovering metric=%f "
-                                        "from result artifacts",
-                                        rec_id, artifact_metric,
+                                        "from result artifacts "
+                                        "(training_complete=%s)",
+                                        rec_id,
+                                        artifact_metric,
+                                        training_complete,
                                     )
                                 else:
                                     logger.warning(
@@ -1580,6 +2064,32 @@ class AutoMLRunner:
                                     "Resume: failed to cancel failed job %s for "
                                     "rec %d: %s",
                                     job_id, rec_id, ex,
+                                )
+                            break
+                    if _status_payload_has_training_complete(logs):
+                        artifact_metric = _recover_metric_from_artifacts(
+                            self._sdk, job_id, metric_name, platform_kwargs
+                        )
+                        if artifact_metric is not None:
+                            cached_metric = artifact_metric
+                            cached_exec_status = "PASS"
+                            logger.info(
+                                "Resume: rec %d logs show training completion "
+                                "and structured artifact metric=%f exists "
+                                "while backend job is still non-terminal; "
+                                "canceling backend job to release resources",
+                                rec_id,
+                                artifact_metric,
+                            )
+                            try:
+                                self._sdk.cancel_job(job_id)
+                            except Exception as ex:
+                                logger.warning(
+                                    "Resume: failed to cancel completed job "
+                                    "%s for rec %d: %s",
+                                    job_id,
+                                    rec_id,
+                                    ex,
                                 )
                             break
             except Exception:
@@ -1617,17 +2127,24 @@ class AutoMLRunner:
         except Exception:
             pass
 
-        if cached_metric is None:
-            artifact_metric = _recover_metric_from_artifacts(
-                self._sdk, job_id, metric_name, platform_kwargs
-            )
-            if artifact_metric is not None:
-                cached_metric = artifact_metric
+        artifact_metric = _recover_metric_from_artifacts(
+            self._sdk, job_id, metric_name, platform_kwargs
+        )
+        if artifact_metric is not None:
+            if cached_metric is None:
                 logger.info(
                     "Resume: rec %d recovered metric=%f from result "
                     "artifacts before final status classification",
                     rec_id, artifact_metric,
                 )
+            elif artifact_metric != cached_metric:
+                logger.info(
+                    "Resume: rec %d using structured artifact metric=%f "
+                    "instead of log-extracted metric=%f before final status "
+                    "classification",
+                    rec_id, artifact_metric, cached_metric,
+                )
+            cached_metric = artifact_metric
 
         exec_status = cached_exec_status or _check_execution_status(
             all_logs,
@@ -1636,15 +2153,48 @@ class AutoMLRunner:
             ),
         )
         status = job_status.status if job_status is not None else "Error"
+        hard_failure = _has_hard_failure_pattern(all_logs)
+        training_complete = (
+            cached_metric is not None
+            and _result_artifacts_show_training_complete(
+                self._sdk, job_id, platform_kwargs
+            )
+        )
         self._active_jobs.pop(rec_id, None)
         self._persist_active_jobs(workspace_path)
 
         if status == "Error" or exec_status == "FAIL":
             metric_value = cached_metric
-            report_status = "failure"
+            if metric_value is not None and (not hard_failure or training_complete):
+                logger.info(
+                    "Resume: rec %d job %s ended with terminal status=%s "
+                    "exec_status=%s but recovered metric=%f; treating as a "
+                    "valid measured result (training_complete=%s)",
+                    rec_id,
+                    job_id,
+                    status,
+                    exec_status,
+                    metric_value,
+                    training_complete,
+                )
+                report_status = "success"
+            else:
+                report_status = "failure"
         elif status == "Canceled":
             metric_value = cached_metric
-            report_status = "failure"
+            if metric_value is not None and training_complete:
+                logger.info(
+                    "Resume: rec %d job %s ended canceled but recovered "
+                    "metric=%f; treating as a valid measured result "
+                    "(training_complete=%s)",
+                    rec_id,
+                    job_id,
+                    metric_value,
+                    training_complete,
+                )
+                report_status = "success"
+            else:
+                report_status = "failure"
         else:
             metric_value = cached_metric
             eval_metric_used = False
@@ -1658,23 +2208,20 @@ class AutoMLRunner:
                 if em is not None:
                     metric_value = em
                     eval_metric_used = True
-            local_metric = _extract_metric_from_local_results(
-                job_id, metric_name, platform_kwargs
-            )
-            if local_metric is not None and not eval_metric_used:
+            if artifact_metric is not None and not eval_metric_used:
                 if metric_value is None:
                     logger.info(
-                        "Resume: rec %d recovered metric=%f from local status "
+                        "Resume: rec %d recovered metric=%f from structured "
                         "artifacts",
-                        rec_id, local_metric,
+                        rec_id, artifact_metric,
                     )
-                elif local_metric != metric_value:
+                elif artifact_metric != metric_value:
                     logger.info(
-                        "Resume: rec %d using local status metric=%f instead "
-                        "of log-extracted metric=%f",
-                        rec_id, local_metric, metric_value,
+                        "Resume: rec %d using structured artifact metric=%f "
+                        "instead of log-extracted metric=%f",
+                        rec_id, artifact_metric, metric_value,
                     )
-                metric_value = local_metric
+                metric_value = artifact_metric
             report_status = "success" if metric_value is not None else "failure"
 
         report_value = metric_value
@@ -1950,6 +2497,45 @@ class AutoMLRunner:
         for key, value in rec_specs.items():
             AutoMLRunner._set_nested(merged, key, value)
         return merged
+
+    @staticmethod
+    def _apply_recommendation_constraints(
+        network_arch: str,
+        base_specs: dict,
+        rec_specs: dict,
+    ) -> None:
+        """Apply final cross-parameter constraints to recommendation overrides."""
+        if network_arch not in {"dino", "deformable_detr", "grounding_dino", "rtdetr"}:
+            return
+        if not isinstance(rec_specs, dict):
+            return
+
+        def value(key: str, default=None):
+            if key in rec_specs:
+                return rec_specs[key]
+            return AutoMLRunner._get_nested(base_specs, key) or default
+
+        num_queries = value("model.num_queries", 300)
+        num_select = value("model.num_select", 300)
+        num_classes = value("dataset.num_classes", 91)
+        try:
+            max_num_select = min(
+                int(num_queries),
+                max(1, int(num_queries) * int(num_classes) - 1),
+            )
+            if int(num_select) > max_num_select:
+                rec_specs["model.num_select"] = max_num_select
+                logger.warning(
+                    "Capped %s recommendation model.num_select=%s to %s "
+                    "for model.num_queries=%s and dataset.num_classes=%s",
+                    network_arch, num_select, max_num_select, num_queries, num_classes,
+                )
+        except (TypeError, ValueError):
+            logger.debug(
+                "Could not apply %s recommendation constraint for num_select=%r, "
+                "num_queries=%r, num_classes=%r",
+                network_arch, num_select, num_queries, num_classes,
+            )
 
 
 _PLATFORMS = ("lepton", "slurm", "kubernetes", "docker", "brev")

@@ -66,6 +66,10 @@ class BOHB(AutoMLAlgorithmBase):
     def brackets_and_sh_sequence(self, max_epochs, reduction_factor):
         """Generate ni,ri arrays based on max_epochs and reduction_factor values"""
         smax = int(np.log(max_epochs) / np.log(reduction_factor))
+        if smax == 0:
+            self.ni["0"] = [1]
+            self.ri["0"] = [max(1, int(max_epochs))]
+            return
         for itr, s in enumerate(range(smax, 0, -1)):
             self.ni[str(itr)] = []
             self.ri[str(itr)] = []
