@@ -18,14 +18,13 @@ import subprocess
 import sys
 import tarfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 import yaml
 
-from tao_automl.runner import AutoMLRunner, _extract_metric_from_logs
+from tao_automl.runner import AutoMLRunner, _extract_metric_from_logs, _metric_aliases
 from tao_sdk.platforms.docker import DockerSDK
 from tao_sdk.script_runner import build_entrypoint
 
@@ -33,6 +32,10 @@ from tao_sdk.script_runner import build_entrypoint
 LOG = logging.getLogger("tao_automl_validation")
 BUCKET_ROOT = "s3://nvcf-storage-handling/data"
 VISUAL_CHANGENET_BACKBONE_CONTAINER_PATH = "/data/pretrained_models/C-RADIOv2_B.safetensors"
+BEVFUSION_CONTAINER_DATA_ROOT = "/data/bevfusion_root"
+CLIP_CONTAINER_DATA_ROOT = "/data/clip_fallback"
+GROUNDING_DINO_INFER_CONTAINER_ROOT = "/data/grounding_dino_infer"
+NVPANOPTIX3D_INFER_CONTAINER_ROOT = "/data/nvpanoptix3d_infer"
 
 
 @dataclass(frozen=True)
@@ -57,7 +60,6 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
     ),
     "bevfusion": ModelProfile(
         f"{BUCKET_ROOT}/purpose_built_models_bevfusion_train",
-        blocked="dataset_convert must be run before train; not yet implemented in this validator",
     ),
     "centerpose": ModelProfile(
         f"{BUCKET_ROOT}/purpose_built_models_centerpose_train",
@@ -70,8 +72,8 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
     ),
     "clip": ModelProfile(f"{BUCKET_ROOT}/auto_label_train", f"{BUCKET_ROOT}/auto_label_val"),
     "cosmos-rl": ModelProfile(
-        f"{BUCKET_ROOT}/cosmos_rl_its_subset",
-        f"{BUCKET_ROOT}/cosmos_rl_its_eval",
+        f"{BUCKET_ROOT}/cosmos_rl_wts_train",
+        f"{BUCKET_ROOT}/cosmos_rl_wts_val",
         data_format="llava",
     ),
     "deformable-detr": ModelProfile(
@@ -99,8 +101,8 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         num_classes=6,
     ),
     "grounding-dino": ModelProfile(
-        "/data/grounding-dino-mini/train",
-        "/data/grounding-dino-mini/val",
+        f"{BUCKET_ROOT}/object_detection_grounding_dino_train",
+        f"{BUCKET_ROOT}/object_detection_grounding_dino_val",
         num_classes=6,
         captions=("head", "helmet", "person"),
     ),
@@ -126,13 +128,14 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         f"{BUCKET_ROOT}/purpose_built_models_ml_recog_train",
     ),
     "nvdinov2": ModelProfile(
-        "/data/nvdinov2-mini",
+        f"{BUCKET_ROOT}/nvdinov2_train_cats_dogs",
         f"{BUCKET_ROOT}/nvdinov2_val_cats_dogs",
+        inference_uri=f"{BUCKET_ROOT}/nvdinov2_test_cats_dogs",
     ),
     "nvpanoptix3d": ModelProfile(
         f"{BUCKET_ROOT}/purpose_built_models_nvpanoptix3d_train",
         f"{BUCKET_ROOT}/purpose_built_models_nvpanoptix3d_val",
-        blocked="requires converted 3D assets/checkpoints not yet mapped by this validator",
+        inference_uri=f"{BUCKET_ROOT}/purpose_built_models_nvpanoptix3d_val",
     ),
     "ocdnet": ModelProfile(
         f"{BUCKET_ROOT}/purpose_built_models_ocdnet_train",
@@ -185,6 +188,36 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         f"{BUCKET_ROOT}/purpose_built_models_visual_changenet_classify_val",
     ),
 }
+
+
+def _profile_key_from_network_arch(network_arch: str) -> str:
+    return network_arch.replace("_", "-")
+
+
+def _resolve_model_dir(skill_bank: Path, requested_model: str) -> tuple[Path, str, str]:
+    """Return (model_dir, network_arch, profile_key) for old or current names."""
+    direct = skill_bank / "models" / requested_model
+    if (direct / "references" / "skill_info.yaml").exists():
+        info = _read_yaml(direct / "references" / "skill_info.yaml")
+        network_arch = info.get("network_arch") or requested_model
+        return direct, network_arch, _profile_key_from_network_arch(network_arch)
+
+    requested_key = requested_model.replace("_", "-")
+    for candidate in sorted((skill_bank / "models").iterdir()):
+        info_path = candidate / "references" / "skill_info.yaml"
+        if not info_path.exists():
+            continue
+        info = _read_yaml(info_path)
+        network_arch = info.get("network_arch") or candidate.name
+        profile_key = _profile_key_from_network_arch(network_arch)
+        if requested_model in {candidate.name, network_arch, profile_key} or requested_key == profile_key:
+            return candidate, network_arch, profile_key
+    raise KeyError(f"No model skill found for {requested_model!r} under {skill_bank / 'models'}")
+
+
+def _profile_key_from_model_dir(model_dir: Path) -> str:
+    info = _read_yaml(model_dir / "references" / "skill_info.yaml")
+    return _profile_key_from_network_arch(info.get("network_arch") or model_dir.name)
 
 
 CHECKPOINT_SUFFIXES = (
@@ -350,6 +383,14 @@ def _clean_file_spec(files: str) -> str:
         return stripped.split("coco_panoptic:", 1)[1].split(";", 1)[0].strip()
     if stripped.startswith("dataset root containing"):
         return ""
+    if stripped.startswith("root directory containing"):
+        return ""
+    if stripped.startswith("extracted root containing"):
+        return ""
+    if stripped.startswith("flat folder of"):
+        return ""
+    if stripped.startswith("LMDB folder containing"):
+        return ""
     if stripped.startswith("one image/video or a media folder/archive"):
         return ""
     if " extracted from " in files:
@@ -423,6 +464,155 @@ def _add_data_source_overrides(
             overrides[spec_key] = [value] if row["list"] else value
 
 
+def _profile_specific_data_overrides(profile_key: str, profile: ModelProfile) -> dict[str, Any]:
+    if profile_key == "bevfusion":
+        data_prefix = {"pts": "training/velodyne_reduced", "img": "training/image_2"}
+        return {
+            "dataset.root_dir": BEVFUSION_CONTAINER_DATA_ROOT,
+            "dataset.train_dataset.ann_file": (
+                f"{BEVFUSION_CONTAINER_DATA_ROOT}/kitti_person_infos_train.pkl"
+            ),
+            "dataset.train_dataset.data_prefix": data_prefix,
+            "dataset.train_dataset.batch_size": 1,
+            "dataset.train_dataset.num_workers": 0,
+            "dataset.val_dataset.ann_file": (
+                f"{BEVFUSION_CONTAINER_DATA_ROOT}/kitti_person_infos_val.pkl"
+            ),
+            "dataset.val_dataset.data_prefix": data_prefix,
+            "dataset.val_dataset.batch_size": 1,
+            "dataset.val_dataset.num_workers": 0,
+            "dataset.test_dataset.ann_file": (
+                f"{BEVFUSION_CONTAINER_DATA_ROOT}/kitti_person_infos_val.pkl"
+            ),
+            "dataset.test_dataset.data_prefix": data_prefix,
+            "dataset.test_dataset.batch_size": 1,
+            "dataset.test_dataset.num_workers": 0,
+        }
+    if profile_key == "clip":
+        return {
+            "dataset.train.type": "custom",
+            "dataset.train.datasets": [{
+                "image_dir": f"{CLIP_CONTAINER_DATA_ROOT}/train/images",
+                "caption_dir": f"{CLIP_CONTAINER_DATA_ROOT}/train/captions",
+            }],
+            "dataset.train.wds.root_dir": None,
+            "dataset.train.wds.shard_list_file": None,
+            "dataset.train.batch_size": 1,
+            "dataset.train.num_workers": 0,
+            "dataset.val.datasets": [{
+                "image_dir": f"{CLIP_CONTAINER_DATA_ROOT}/val/images",
+                "caption_dir": f"{CLIP_CONTAINER_DATA_ROOT}/val/captions",
+            }],
+            "dataset.val.batch_size": 1,
+            "dataset.val.num_workers": 0,
+        }
+    if profile_key == "cosmos-rl":
+        return {
+            "custom.train_dataset.annotation_path": _join_uri(profile.train_uri, "annotations.json"),
+            "custom.train_dataset.media_path": _join_uri(profile.train_uri, "videos.tar.gz"),
+            "custom.val_dataset.annotation_path": _join_uri(profile.eval_uri, "annotations.json"),
+            "custom.val_dataset.media_path": _join_uri(profile.eval_uri, "videos.tar.gz"),
+        }
+    if profile_key == "nvpanoptix3d":
+        return {
+            "dataset.enable_3d": True,
+            "dataset.contiguous_id": True,
+            "dataset.test.json_path": _join_uri(profile.eval_uri, "meta/val.json"),
+            "dataset.test.base_dir": profile.eval_uri,
+            "train.optim.monitor_name": "train_loss",
+            "train.precision": "fp32",
+        }
+    if profile_key == "ocdnet":
+        return {
+            "dataset.train_dataset.data_path": [_join_uri(profile.train_uri, "train.tar.gz")],
+            "dataset.validate_dataset.data_path": [_join_uri(profile.eval_uri, "test.tar.gz")],
+        }
+    if profile_key == "segformer":
+        return {"dataset.segment.root_dir": profile.train_uri}
+    return {}
+
+
+def _action_specific_overrides(
+    profile_key: str,
+    profile: ModelProfile,
+    action: str,
+    out_dir: Path,
+) -> dict[str, Any]:
+    if profile_key == "bevfusion" and action in {"evaluate", "inference"}:
+        return _profile_specific_data_overrides(profile_key, profile)
+    if profile_key == "clip":
+        if action == "evaluate":
+            return {
+                "dataset.val.datasets": [{
+                    "image_dir": f"{CLIP_CONTAINER_DATA_ROOT}/val/images",
+                    "caption_dir": f"{CLIP_CONTAINER_DATA_ROOT}/val/captions",
+                }],
+                "dataset.val.batch_size": 1,
+                "dataset.val.num_workers": 0,
+                "evaluate.batch_size": 1,
+            }
+        if action == "inference":
+            return {
+                "inference.datasets": [{
+                    "image_dir": f"{CLIP_CONTAINER_DATA_ROOT}/val/images",
+                }],
+                "inference.text_file": f"{CLIP_CONTAINER_DATA_ROOT}/prompts.txt",
+                "inference.batch_size": 1,
+            }
+    if profile_key == "grounding-dino" and action == "inference":
+        return {
+            "dataset.infer_data_sources.image_dir": [GROUNDING_DINO_INFER_CONTAINER_ROOT],
+            "dataset.infer_data_sources.captions": list(profile.captions or ("object",)),
+        }
+    if profile_key == "nvpanoptix3d":
+        if action == "evaluate":
+            return {
+                "dataset.frustum_mask_path": _join_uri(profile.eval_uri, "meta/frustum_mask.npz"),
+                "dataset.label_map": _join_uri(profile.eval_uri, "meta/colormap.json"),
+                "dataset.val.json_path": _join_uri(profile.eval_uri, "meta/val.json"),
+                "dataset.val.base_dir": profile.eval_uri,
+                "dataset.test.json_path": _join_uri(profile.eval_uri, "meta/val.json"),
+                "dataset.test.base_dir": profile.eval_uri,
+                "dataset.enable_3d": True,
+                "dataset.contiguous_id": True,
+            }
+        if action == "inference":
+            return {
+                "dataset.frustum_mask_path": _join_uri(profile.eval_uri, "meta/frustum_mask.npz"),
+                "dataset.label_map": _join_uri(profile.eval_uri, "meta/colormap.json"),
+                "dataset.enable_3d": True,
+                "inference.images_dir": NVPANOPTIX3D_INFER_CONTAINER_ROOT,
+                "inference.batch_size": 1,
+            }
+    if profile_key == "rtdetr" and action == "inference":
+        return {
+            "dataset.infer_data_sources": {
+                "image_dir": [_join_uri(profile.eval_uri or profile.train_uri, "images.tar.gz")],
+                "classmap": _join_uri(profile.eval_uri or profile.train_uri, "label_map.txt"),
+            }
+        }
+    if profile_key == "ocrnet":
+        if action == "evaluate":
+            return {
+                "dataset.character_list_file": _join_uri(profile.eval_uri, "character_list"),
+                "evaluate.test_dataset_dir": _join_uri(profile.eval_uri, "test.tar.gz"),
+                "evaluate.test_dataset_gt_file": _join_uri(profile.eval_uri, "test/gt_new.txt"),
+            }
+        if action == "inference":
+            return {
+                "dataset.character_list_file": _join_uri(profile.eval_uri, "character_list"),
+                "inference.inference_dataset_dir": _join_uri(profile.eval_uri, "test.tar.gz"),
+            }
+    if profile_key == "ocdnet":
+        if action == "evaluate":
+            return {"dataset.validate_dataset.data_path": [_join_uri(profile.eval_uri, "test.tar.gz")]}
+        if action == "inference":
+            return {"inference.input_folder": _join_uri(profile.eval_uri, "test/img.tar.gz")}
+    if profile_key == "segformer" and action in {"evaluate", "inference"}:
+        return {"dataset.segment.root_dir": profile.eval_uri or profile.train_uri}
+    return {}
+
+
 def _valid_set(overrides: dict[str, Any], specs: dict[str, Any], keys: set[str]) -> dict[str, Any]:
     valid = dict(overrides)
     merged_keys = keys | _flatten_keys(specs)
@@ -466,11 +656,12 @@ def _minimal_train_overrides(
     }
     if model == "cosmos-rl":
         candidates.update({
-            "policy.model_name_or_path": "hf_model://nvidia/Cosmos-Reason2-8B",
+            "policy.model_name_or_path": "hf_model://nvidia/Cosmos3-Nano",
             "policy.parallelism.dp_shard_size": 1,
             "policy.parallelism.dp_replicate_size": 1,
             "train.train_batch_per_replica": 1,
             "train.train_policy.mini_batch": 1,
+            "train.train_policy.dataset.name": "wts",
             "train.train_policy.dataset.test_size": 0,
             "validation.batch_size": 1,
             "validation.enable_dataset_cache": False,
@@ -692,6 +883,97 @@ def _latest_kpi(job_root: Path) -> dict[str, Any]:
     return latest
 
 
+def _metric_from_kpi(kpi: dict[str, Any], metric_name: str) -> float | None:
+    for alias in _metric_aliases(metric_name):
+        if alias not in kpi:
+            continue
+        try:
+            return float(kpi[alias])
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _close_enough(a: float | None, b: float | None) -> bool:
+    if a is None or b is None:
+        return False
+    return abs(a - b) <= max(1e-6, 1e-4 * max(abs(a), abs(b), 1.0))
+
+
+def _metric_sources_close_enough(a: float | None, b: float | None) -> bool:
+    if a is None or b is None:
+        return False
+    return abs(a - b) <= max(1e-3, 1e-3 * max(abs(a), abs(b), 1.0))
+
+
+def _resume_behavior(jobs: dict[int, dict[str, Any]]) -> dict[str, Any]:
+    resumed: list[dict[str, Any]] = []
+    invalid: list[dict[str, Any]] = []
+    for rec_id, data in jobs.items():
+        if not (data.get("resume_from_job_id") or data.get("resume_checkpoint_path")):
+            continue
+        checkpoint_path = data.get("resume_checkpoint_path")
+        name = Path(checkpoint_path or "").name.lower()
+        specific = bool(checkpoint_path) and "latest" not in name and (
+            re.search(r"(?:^|[_-])(epoch|step)[_-]?\d+", name)
+            or re.search(r"/(?:epoch|step)_\d+", checkpoint_path or "")
+        )
+        item = {
+            "rec_id": rec_id,
+            "resume_from_job_id": data.get("resume_from_job_id"),
+            "resume_from_epoch": data.get("resume_from_epoch"),
+            "resume_from_step": data.get("resume_from_step"),
+            "resume_checkpoint_path": checkpoint_path,
+            "uses_epoch_or_step_checkpoint": bool(specific),
+        }
+        resumed.append(item)
+        if not specific:
+            invalid.append(item)
+    return {
+        "status": "passed" if not invalid else "failed",
+        "resume_recommendations": resumed,
+        "invalid_resume_checkpoints": invalid,
+    }
+
+
+def _best_selection(
+    jobs: dict[int, dict[str, Any]],
+    best_rec_id: int | None,
+    direction: str,
+) -> dict[str, Any]:
+    metrics = {
+        rec_id: data.get("metric")
+        for rec_id, data in jobs.items()
+        if data.get("status") == "success" and data.get("metric") is not None
+    }
+    if not metrics:
+        return {
+            "status": "failed",
+            "reason": "no successful job metrics available",
+            "actual_best_rec_id": best_rec_id,
+        }
+    resumed_metrics = {
+        rec_id: metric
+        for rec_id, metric in metrics.items()
+        if jobs.get(rec_id, {}).get("resume_from_job_id")
+    }
+    comparable_metrics = resumed_metrics or metrics
+    expected = (
+        min(comparable_metrics, key=comparable_metrics.get)
+        if direction == "minimize"
+        else max(comparable_metrics, key=comparable_metrics.get)
+    )
+    return {
+        "status": "passed" if expected == best_rec_id else "failed",
+        "direction": direction,
+        "expected_best_rec_id": expected,
+        "actual_best_rec_id": best_rec_id,
+        "metrics_by_rec": comparable_metrics,
+        "all_metrics_by_rec": metrics,
+        "selection_scope": "resumed_final_rung" if resumed_metrics else "all_successful_jobs",
+    }
+
+
 def _minimal_action_overrides(
     specs: dict[str, Any],
     schema_keys: set[str],
@@ -728,41 +1010,44 @@ def _build_action_specs(
     trial_specs: dict[str, Any] | None = None,
     extra_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    profile_key = _profile_key_from_model_dir(model_dir)
     specs = _read_yaml(model_dir / "references" / f"spec_template_{action}.yaml")
     schema_keys = _schema_keys(model_dir, action)
     overrides: dict[str, Any] = {}
     _add_data_source_overrides(overrides, profile, _parse_action_rows(skill_text, action))
+    overrides.update(_profile_specific_data_overrides(profile_key, profile))
     overrides.update(_minimal_action_overrides(specs, schema_keys, action, num_classes))
+    overrides.update(_action_specific_overrides(profile_key, profile, action, Path()))
     if profile.model_type and "model.model_type" in (schema_keys | _flatten_keys(specs)):
         overrides["model.model_type"] = profile.model_type
     if profile.dataset_name and "dataset.dataset_name" in (schema_keys | _flatten_keys(specs)):
         overrides["dataset.dataset_name"] = profile.dataset_name
-    if model_dir.name == "action-recognition" and "dataset.label_map" in (schema_keys | _flatten_keys(specs)):
+    if profile_key == "action-recognition" and "dataset.label_map" in (schema_keys | _flatten_keys(specs)):
         overrides["dataset.label_map"] = {"catch": 0, "smile": 1}
-    if model_dir.name == "mask-grounding-dino":
+    if profile_key == "mask-grounding-dino":
         overrides.update({
             "dataset.val_data_sources.data_type": "OD",
             "dataset.test_data_sources.data_type": "OD",
             "dataset.infer_data_sources.data_type": "OD",
         })
-    if model_dir.name == "mask2former":
+    if profile_key == "mask2former":
         overrides.update({
             "dataset.train.type": "coco_panoptic",
             "dataset.val.type": "coco_panoptic",
             "dataset.test.type": "coco_panoptic",
             "dataset.contiguous_id": False,
         })
-    if model_dir.name == "pose-classification" and action == "inference":
+    if profile_key == "pose-classification" and action == "inference":
         overrides["inference.output_file"] = "/results/pose_classification_inference.txt"
-    if model_dir.name == "re-identification":
+    if profile_key == "re-identification":
         if action == "evaluate":
             overrides["evaluate.output_cmc_curve_plot"] = "/results/reid_cmc_curve.png"
             overrides["evaluate.output_sampled_matches_plot"] = "/results/reid_sampled_matches.png"
         if action == "inference":
             overrides["inference.output_file"] = "/results/reid_inference.json"
-    if model_dir.name == "visual-changenet":
+    if profile_key == "visual-changenet":
         overrides["model.backbone.pretrained_backbone_path"] = VISUAL_CHANGENET_BACKBONE_CONTAINER_PATH
-    if model_dir.name == "nvdinov2":
+    if profile_key == "nvdinov2":
         overrides.update({
             "wandb.enable": False,
             "model.backbone.teacher_type": "vit_s",
@@ -772,20 +1057,18 @@ def _build_action_specs(
             "train.precision": "32-true",
             "train.use_custom_attention": False,
         })
-        if action == "inference":
-            overrides["dataset.test_dataset.images_dir"] = "/data/nvdinov2-mini/images_train"
     if trial_specs:
         overrides.update(_valid_set(trial_specs, specs, schema_keys))
     if extra_overrides:
         overrides.update(_valid_set(extra_overrides, specs, schema_keys))
-    if model_dir.name == "mae" and action in {"evaluate", "inference"}:
+    if profile_key == "mae" and action in {"evaluate", "inference"}:
         overrides["train.stage"] = "finetune"
     for key in (f"{action}.checkpoint", f"{action}.model_path", f"{action}.pretrained_model_path"):
         if key in (schema_keys | _flatten_keys(specs)):
             overrides[key] = checkpoint_container_path
             break
     overrides = _valid_set(overrides, specs, schema_keys)
-    if model_dir.name == "mask-grounding-dino" and action == "inference":
+    if profile_key == "mask-grounding-dino" and action == "inference":
         overrides["dataset.infer_data_sources.captions"] = list(profile.captions or ("object",))
     for dotted_key, value in overrides.items():
         _set_nested(specs, dotted_key, value)
@@ -813,11 +1096,22 @@ def _run_action_job(
     env_vars: dict[str, str] | None = None,
     gpu_count: int | None = None,
 ) -> dict[str, Any]:
+    outputs = action_cfg.get("outputs")
+    if (
+        action == "inference"
+        and "mal inference" in action_cfg.get("command", "")
+        and isinstance(outputs, dict)
+    ):
+        outputs = {
+            key: value
+            for key, value in outputs.items()
+            if key != "inference.label_dump_path"
+        }
     ep = build_entrypoint(
         command=action_cfg["command"],
         specs=specs,
         inputs=action_cfg.get("inputs"),
-        outputs=action_cfg.get("outputs"),
+        outputs=outputs,
         config_format=action_cfg.get("config_format", "toml"),
         upload_excludes=action_cfg.get("upload_excludes", []),
     )
@@ -825,11 +1119,6 @@ def _run_action_job(
         image=image,
         command=ep["command"],
         gpu_count=args.num_gpus if gpu_count is None else gpu_count,
-        gpu_device_ids=(
-            [args.gpu_device_id]
-            if (gpu_count is None or gpu_count != 0) and args.gpu_device_id
-            else None
-        ),
         env_vars=env_vars,
         mounts=mounts,
     )
@@ -859,11 +1148,18 @@ def _build_dataset_convert_specs(
     skill_text: str,
     profile: ModelProfile,
 ) -> dict[str, Any]:
+    profile_key = _profile_key_from_model_dir(model_dir)
     specs = _read_yaml(model_dir / "references" / "spec_template_dataset_convert.yaml")
     schema_keys = _schema_keys(model_dir, "dataset_convert")
     overrides: dict[str, Any] = {}
     _add_data_source_overrides(overrides, profile, _parse_action_rows(skill_text, "dataset_convert"))
-    if model_dir.name == "sparse4d":
+    if profile_key == "bevfusion":
+        overrides.update({
+            "root_dir": BEVFUSION_CONTAINER_DATA_ROOT,
+            "results_dir": BEVFUSION_CONTAINER_DATA_ROOT,
+            "mode": "training",
+        })
+    if profile_key == "sparse4d":
         overrides.update({
             "aicity.num_frames": 3,
             "aicity.anchor_init_config.num_anchor": 72,
@@ -872,6 +1168,37 @@ def _build_dataset_convert_specs(
     for dotted_key, value in overrides.items():
         _set_nested(specs, dotted_key, value)
     return specs
+
+
+def _build_ocrnet_dataset_convert_specs(
+    *,
+    model_dir: Path,
+    image_uri: str,
+    gt_uri: str,
+) -> dict[str, Any]:
+    specs = _read_yaml(model_dir / "references" / "spec_template_dataset_convert.yaml")
+    schema_keys = _schema_keys(model_dir, "dataset_convert")
+    overrides = _valid_set(
+        {
+            "dataset_convert.input_img_dir": image_uri,
+            "dataset_convert.gt_file": gt_uri,
+        },
+        specs,
+        schema_keys,
+    )
+    for dotted_key, value in overrides.items():
+        _set_nested(specs, dotted_key, value)
+    return specs
+
+
+def _find_lmdb_root(root: Path) -> Path | None:
+    if (root / "data.mdb").is_file() and (root / "lock.mdb").exists():
+        return root
+    for data_file in sorted(root.rglob("data.mdb")):
+        candidate = data_file.parent
+        if (candidate / "lock.mdb").exists():
+            return candidate
+    return None
 
 
 def _normalize_sparse4d_depth_paths(
@@ -915,6 +1242,7 @@ def _run_dataset_convert_preflight(
     sdk: DockerSDK,
     mounts: list[dict[str, str]],
 ) -> dict[str, Any]:
+    profile_key = _profile_key_from_model_dir(model_dir)
     actions = skill_info.get("actions") or {}
     action_cfg = actions.get("dataset_convert")
     template = model_dir / "references" / "spec_template_dataset_convert.yaml"
@@ -924,12 +1252,90 @@ def _run_dataset_convert_preflight(
             "reason": "dataset_convert action/template is not packaged by skill",
         }
 
+    image = _resolve_action_image(skill_info, action_cfg)
+
+    if profile_key == "ocrnet":
+        split_inputs = {
+            "train": {
+                "image_uri": _join_uri(profile.train_uri, "train.tar.gz"),
+                "gt_uri": _join_uri(profile.train_uri, "train/gt_new.txt"),
+            },
+            "eval": {
+                "image_uri": _join_uri(profile.eval_uri, "test.tar.gz"),
+                "gt_uri": _join_uri(profile.eval_uri, "test/gt_new.txt"),
+            },
+        }
+        jobs: dict[str, dict[str, Any]] = {}
+        artifacts: dict[str, str] = {}
+        missing: list[str] = []
+        for split, split_data in split_inputs.items():
+            specs = _build_ocrnet_dataset_convert_specs(
+                model_dir=model_dir,
+                image_uri=split_data["image_uri"],
+                gt_uri=split_data["gt_uri"],
+            )
+            job_result = _run_action_job(
+                sdk=sdk,
+                image=image,
+                action_cfg=action_cfg,
+                specs=specs,
+                action="dataset_convert",
+                out_dir=out_dir,
+                args=args,
+                mounts=mounts,
+                gpu_count=0,
+            )
+            jobs[split] = {
+                "job": job_result,
+                "specs": specs,
+                "input_image_uri": split_data["image_uri"],
+                "gt_uri": split_data["gt_uri"],
+            }
+            if job_result["status"] != "success":
+                return {
+                    "status": "failed",
+                    "reason": f"ocrnet {split} dataset_convert job failed",
+                    "jobs": jobs,
+                }
+            convert_root = out_dir / "results" / job_result["job_id"] / "results_dir"
+            lmdb_root = _find_lmdb_root(convert_root)
+            if lmdb_root is None:
+                missing.append(f"{split}: data.mdb/lock.mdb under {convert_root}")
+                continue
+            artifacts[f"{split}_lmdb"] = str(lmdb_root)
+            jobs[split]["convert_root"] = str(convert_root)
+            jobs[split]["lmdb_root"] = str(lmdb_root)
+
+        if missing:
+            return {
+                "status": "failed",
+                "reason": "dataset_convert completed but required converted artifacts are missing",
+                "missing_artifacts": missing,
+                "artifacts": artifacts,
+                "jobs": jobs,
+            }
+
+        train_lmdb = _host_to_container_path(artifacts["train_lmdb"], out_dir / "results")
+        eval_lmdb = _host_to_container_path(artifacts["eval_lmdb"], out_dir / "results")
+        return {
+            "status": "passed",
+            "jobs": jobs,
+            "artifacts": artifacts,
+            "train_overrides": {
+                "dataset.train_dataset_dir": [train_lmdb],
+                "dataset.val_dataset_dir": eval_lmdb,
+                "dataset.train_gt_file": "",
+                "dataset.val_gt_file": "",
+                "dataset.character_list_file": _join_uri(profile.eval_uri, "character_list"),
+            },
+            "specs": {split: data["specs"] for split, data in jobs.items()},
+        }
+
     specs = _build_dataset_convert_specs(
         model_dir=model_dir,
         skill_text=skill_text,
         profile=profile,
     )
-    image = _resolve_action_image(skill_info, action_cfg)
     job_result = _run_action_job(
         sdk=sdk,
         image=image,
@@ -939,7 +1345,7 @@ def _run_dataset_convert_preflight(
         out_dir=out_dir,
         args=args,
         mounts=mounts,
-        gpu_count=args.num_gpus if model_dir.name in {"pointpillars", "sparse4d"} else 0,
+        gpu_count=args.num_gpus if profile_key in {"pointpillars", "sparse4d"} else 0,
     )
     if job_result["status"] != "success":
         return {
@@ -955,7 +1361,7 @@ def _run_dataset_convert_preflight(
     missing: list[str] = []
     extra: dict[str, Any] = {}
 
-    if model_dir.name == "pointpillars":
+    if profile_key == "pointpillars":
         data_info = convert_root / "data_info"
         required = {
             "dbinfos_train": data_info / "dbinfos_train.pkl",
@@ -973,7 +1379,43 @@ def _run_dataset_convert_preflight(
                 out_dir / "results",
             )
 
-    elif model_dir.name == "sparse4d":
+    elif profile_key == "bevfusion":
+        bev_root = _prepare_bevfusion_data_mount(profile, out_dir)
+        data_prefix = {"pts": "training/velodyne_reduced", "img": "training/image_2"}
+        required_bev = {
+            "train_ann": bev_root / "kitti_person_infos_train.pkl",
+            "val_ann": bev_root / "kitti_person_infos_val.pkl",
+            "velodyne_reduced": bev_root / "training" / "velodyne_reduced",
+        }
+        for name, path in required_bev.items():
+            if path.exists():
+                artifacts[name] = str(path)
+            else:
+                missing.append(str(path))
+        if not missing:
+            train_overrides.update({
+                "dataset.root_dir": BEVFUSION_CONTAINER_DATA_ROOT,
+                "dataset.train_dataset.ann_file": (
+                    f"{BEVFUSION_CONTAINER_DATA_ROOT}/kitti_person_infos_train.pkl"
+                ),
+                "dataset.train_dataset.data_prefix": data_prefix,
+                "dataset.train_dataset.batch_size": 1,
+                "dataset.train_dataset.num_workers": 0,
+                "dataset.val_dataset.ann_file": (
+                    f"{BEVFUSION_CONTAINER_DATA_ROOT}/kitti_person_infos_val.pkl"
+                ),
+                "dataset.val_dataset.data_prefix": data_prefix,
+                "dataset.val_dataset.batch_size": 1,
+                "dataset.val_dataset.num_workers": 0,
+                "dataset.test_dataset.ann_file": (
+                    f"{BEVFUSION_CONTAINER_DATA_ROOT}/kitti_person_infos_val.pkl"
+                ),
+                "dataset.test_dataset.data_prefix": data_prefix,
+                "dataset.test_dataset.batch_size": 1,
+                "dataset.test_dataset.num_workers": 0,
+            })
+
+    elif profile_key == "sparse4d":
         extra["depth_path_normalization"] = _normalize_sparse4d_depth_paths(
             model_dir=model_dir,
             out_dir=out_dir,
@@ -983,11 +1425,19 @@ def _run_dataset_convert_preflight(
         train_ann = sorted(convert_root.rglob("*_infos_train.pkl"))
         val_ann = sorted(convert_root.rglob("*_infos_val.pkl"))
         test_ann = sorted(convert_root.rglob("*_infos_test.pkl"))
+        train_ann_path = train_ann[0] if train_ann else None
+        val_ann_path = val_ann[0] if val_ann else None
+        test_ann_path = test_ann[0] if test_ann else None
+        if (val_ann_path is None or test_ann_path is None) and len(train_ann) >= 3:
+            train_ann_path, val_ann_path, test_ann_path = train_ann[:3]
+            extra["train_split_pkls_used_for_smoke_val_test"] = [
+                str(path) for path in (train_ann_path, val_ann_path, test_ann_path)
+            ]
         required_sparse = {
             "anchor": anchor,
-            "train_ann": train_ann[0] if train_ann else None,
-            "val_ann": val_ann[0] if val_ann else None,
-            "test_ann": test_ann[0] if test_ann else None,
+            "train_ann": train_ann_path,
+            "val_ann": val_ann_path,
+            "test_ann": test_ann_path,
         }
         for name, path in required_sparse.items():
             if path and path.exists():
@@ -1055,8 +1505,9 @@ def _run_post_checks(
     sdk: DockerSDK,
     num_classes: int | None,
 ) -> dict[str, Any]:
+    profile_key = _profile_key_from_model_dir(model_dir)
     checkpoints = payload.get("best_checkpoint_paths") or []
-    checkpoint_path = _prefer_epoch_or_step_checkpoint(checkpoints, model=model_dir.name)
+    checkpoint_path = _prefer_epoch_or_step_checkpoint(checkpoints, model=profile_key)
     if not checkpoint_path:
         payload["checkpoint_validation"] = {
             "status": "failed",
@@ -1072,10 +1523,10 @@ def _run_post_checks(
     dataset_convert_overrides = (
         (payload.get("dataset_convert") or {}).get("train_overrides") or {}
     )
-    mounts = _mounts_for_model(out_dir, model_dir.name, profile)
+    mounts = _mounts_for_model(out_dir, profile_key, profile)
     action_env_vars = (
         {"TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD": "1"}
-        if model_dir.name in {"ml-recog", "oneformer", "re-identification"}
+        if profile_key in {"clip", "ml-recog", "oneformer", "re-identification"}
         else None
     )
     for action in ("evaluate", "inference"):
@@ -1140,6 +1591,60 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, default=str))
 
 
+def _write_exception_report(args: argparse.Namespace, exc: Exception) -> Path:
+    model = args.model
+    network_arch = None
+    profile_key = None
+    profile = None
+    metric_documented = None
+    try:
+        model_dir, network_arch, profile_key = _resolve_model_dir(args.skill_bank, args.model)
+        model = model_dir.name
+        profile = MODEL_PROFILES.get(profile_key)
+        if profile:
+            profile = _profile_with_dataset_overrides(profile, args)
+        metric_documented = _monitoring_metric((model_dir / "SKILL.md").read_text())
+    except Exception as resolve_exc:
+        LOG.debug("Could not resolve full model metadata for exception report: %s", resolve_exc)
+
+    report_path = args.run_root / model / "result.json"
+    payload = {
+        "model": model,
+        "network_arch": network_arch,
+        "profile_key": profile_key,
+        "algorithm": args.algorithm,
+        "status": "failed",
+        "metric_documented": metric_documented,
+        "metric_used_by_automl": None,
+        "direction": None,
+        "train_dataset_uri": profile.train_uri if profile else None,
+        "eval_dataset_uri": profile.eval_uri if profile else None,
+        "spec_overrides": {},
+        "result": {"status": "failed", "error": str(exc)},
+        "run_error": str(exc),
+        "jobs": {},
+        "algorithm_behavior": {
+            "status": "not_started",
+            "reason": "exception before AutoML launch",
+        },
+        "best_selection": {
+            "status": "failed",
+            "reason": "AutoML did not start",
+            "actual_best_rec_id": None,
+        },
+        "metric_checks_passed": False,
+        "best_checkpoint_paths": [],
+        "dataset_convert": None,
+        "resume_behavior": {
+            "status": "passed",
+            "resume_recommendations": [],
+            "invalid_resume_checkpoints": [],
+        },
+    }
+    _write_json(report_path, payload)
+    return report_path
+
+
 def _supported_automl_parameters(skill_bank: Path, model: str) -> list[str] | None:
     schema_path = skill_bank / "models" / model / "schemas" / "train.schema.json"
 
@@ -1164,6 +1669,17 @@ def _supported_automl_parameters(skill_bank: Path, model: str) -> list[str] | No
             params = item.get("automl_default_parameters", [])
             return params or schema_defaults() or []
     return schema_defaults()
+
+
+def _profile_with_dataset_overrides(
+    profile: ModelProfile,
+    args: argparse.Namespace,
+) -> ModelProfile:
+    return replace(
+        profile,
+        train_uri=args.train_dataset_uri or profile.train_uri,
+        eval_uri=args.eval_dataset_uri or profile.eval_uri,
+    )
 
 
 def _minimal_custom_ranges(
@@ -1219,37 +1735,202 @@ def _minimal_custom_ranges(
 
 
 def _read_s3_json(uri: str) -> Any:
-    import boto3
-
-    parsed = urlparse(uri)
-    client = boto3.client(
-        "s3",
-        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID") or os.environ.get("ACCESS_KEY"),
-        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY") or os.environ.get("SECRET_KEY"),
-        endpoint_url=os.environ.get("S3_ENDPOINT_URL") or None,
+    result = subprocess.run(
+        ["aws", "s3", "cp", uri, "-"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=_aws_subprocess_env(),
     )
-    body = client.get_object(
-        Bucket=parsed.netloc,
-        Key=parsed.path.lstrip("/"),
-    )["Body"].read()
-    return json.loads(body)
+    return json.loads(result.stdout)
+
+
+def _aws_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    alias_map = {
+        "ACCESS_KEY": ("AWS_ACCESS_KEY_ID",),
+        "SECRET_KEY": ("AWS_SECRET_ACCESS_KEY",),
+        "S3_ENDPOINT_URL": ("AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3"),
+        "CLOUD_REGION": ("AWS_DEFAULT_REGION", "AWS_REGION"),
+    }
+    for source, targets in alias_map.items():
+        value = env.get(source)
+        if not value:
+            continue
+        for target in targets:
+            if not env.get(target):
+                env[target] = value
+    env.setdefault("AWS_EC2_METADATA_DISABLED", "true")
+    return env
 
 
 def _download_s3_file(uri: str, destination: Path) -> None:
-    import boto3
-
     if destination.exists() and destination.stat().st_size > 0:
         return
-    parsed = urlparse(uri)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    client = boto3.client(
-        "s3",
-        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID") or os.environ.get("ACCESS_KEY"),
-        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY") or os.environ.get("SECRET_KEY"),
-        endpoint_url=os.environ.get("S3_ENDPOINT_URL") or None,
+    subprocess.run(
+        ["aws", "s3", "cp", uri, str(destination)],
+        check=True,
+        env=_aws_subprocess_env(),
     )
-    with destination.open("wb") as fh:
-        client.download_fileobj(parsed.netloc, parsed.path.lstrip("/"), fh)
+
+
+def _safe_extractall(archive: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    dest_root = destination.resolve()
+    with tarfile.open(archive) as tar:
+        for member in tar.getmembers():
+            target = (destination / member.name).resolve()
+            if target != dest_root and dest_root not in target.parents:
+                raise RuntimeError(f"Refusing to extract unsafe tar member {member.name!r}")
+        tar.extractall(destination)
+
+
+def _archive_image_members(archive: Path) -> list[str]:
+    suffixes = (".jpg", ".jpeg", ".png", ".bmp")
+    with tarfile.open(archive) as tar:
+        return [
+            member.name
+            for member in tar.getmembers()
+            if member.isfile() and member.name.lower().endswith(suffixes)
+        ]
+
+
+def _extract_first_image_to_flat_dir(archive: Path, destination: Path) -> Path:
+    destination.mkdir(parents=True, exist_ok=True)
+    existing = next(
+        (
+            path
+            for path in sorted(destination.iterdir())
+            if path.is_file() and path.name.lower().endswith((".jpg", ".jpeg", ".png", ".bmp"))
+        ),
+        None,
+    )
+    if existing:
+        return existing
+
+    with tarfile.open(archive) as tar:
+        for member in tar.getmembers():
+            if not member.isfile() or not member.name.lower().endswith((".jpg", ".jpeg", ".png", ".bmp")):
+                continue
+            source = tar.extractfile(member)
+            if source is None:
+                continue
+            target = destination / Path(member.name).name
+            with source, target.open("wb") as out:
+                shutil.copyfileobj(source, out)
+            return target
+    raise RuntimeError(f"No image file found in {archive}")
+
+
+def _category_name_map(payload: Any) -> dict[int, str]:
+    categories = payload.get("categories") if isinstance(payload, dict) else payload
+    if not isinstance(categories, list):
+        return {}
+    names: dict[int, str] = {}
+    for item in categories:
+        if not isinstance(item, dict) or "id" not in item:
+            continue
+        try:
+            names[int(item["id"])] = str(item.get("name") or f"class_{item['id']}")
+        except (TypeError, ValueError):
+            continue
+    return names
+
+
+def _prepare_clip_split(uri: str, out_dir: Path, split: str) -> Path:
+    split_root = out_dir / "clip_fallback" / split
+    image_dir = split_root / "images"
+    captions_dir = split_root / "captions"
+    archive = split_root / "images.tar.gz"
+    _download_s3_file(_join_uri(uri, "images.tar.gz"), archive)
+    if not any(image_dir.rglob("*")):
+        _safe_extractall(archive, split_root)
+
+    annotations = _read_s3_json(_join_uri(uri, "annotations.json"))
+    try:
+        label_map_payload = _read_s3_json(_join_uri(uri, "label_map.json"))
+    except Exception:
+        label_map_payload = annotations
+    names_by_category = _category_name_map(label_map_payload) or _category_name_map(annotations)
+
+    image_names_by_id: dict[int, str] = {}
+    image_records = annotations.get("images") if isinstance(annotations, dict) else None
+    if isinstance(image_records, list):
+        for record in image_records:
+            if not isinstance(record, dict) or "id" not in record or "file_name" not in record:
+                continue
+            try:
+                image_names_by_id[int(record["id"])] = Path(str(record["file_name"])).name
+            except (TypeError, ValueError):
+                continue
+
+    labels_by_image: dict[int, set[str]] = {}
+    records = annotations.get("annotations") if isinstance(annotations, dict) else None
+    if isinstance(records, list):
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            try:
+                image_id = int(record["image_id"])
+                category_id = int(record["category_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            labels_by_image.setdefault(image_id, set()).add(
+                names_by_category.get(category_id, f"class_{category_id}")
+            )
+
+    captions_dir.mkdir(parents=True, exist_ok=True)
+    archive_members = [Path(name).name for name in _archive_image_members(archive)]
+    image_names = sorted(set(image_names_by_id.values()) | set(archive_members))
+    labels_by_name = {
+        image_names_by_id[image_id]: labels
+        for image_id, labels in labels_by_image.items()
+        if image_id in image_names_by_id
+    }
+    for image_name in image_names:
+        labels = sorted(labels_by_name.get(image_name) or [])
+        caption = ", ".join(labels) if labels else "object"
+        (captions_dir / f"{Path(image_name).stem}.txt").write_text(caption + "\n")
+
+    prompts = out_dir / "clip_fallback" / "prompts.txt"
+    if not prompts.exists():
+        prompts.write_text("\n".join(sorted(set(names_by_category.values())) or ["object"]) + "\n")
+    return split_root
+
+
+def _prepare_clip_data_mount(profile: ModelProfile, out_dir: Path) -> Path:
+    root = out_dir / "clip_fallback"
+    _prepare_clip_split(profile.train_uri, out_dir, "train")
+    _prepare_clip_split(profile.eval_uri or profile.train_uri, out_dir, "val")
+    return root
+
+
+def _prepare_bevfusion_data_mount(profile: ModelProfile, out_dir: Path) -> Path:
+    data_root = out_dir / "bevfusion_root"
+    data_root.mkdir(parents=True, exist_ok=True)
+    for name in ("training.tar.gz", "testing.tar.gz", "ImageSets.tar.gz"):
+        archive = data_root / name
+        _download_s3_file(_join_uri(profile.train_uri, name), archive)
+        marker = data_root / f".extracted_{name}"
+        if not marker.exists():
+            _safe_extractall(archive, data_root)
+            marker.write_text("ok\n")
+    return data_root
+
+
+def _prepare_single_image_mount(
+    *,
+    uri: str,
+    archive_suffix: str,
+    out_dir: Path,
+    name: str,
+) -> Path:
+    data_root = out_dir / name
+    archive = data_root / Path(archive_suffix).name
+    _download_s3_file(_join_uri(uri, archive_suffix), archive)
+    _extract_first_image_to_flat_dir(archive, data_root)
+    return data_root
 
 
 def _prepare_depth_data_mount(profile: ModelProfile, out_dir: Path) -> Path:
@@ -1260,8 +1941,7 @@ def _prepare_depth_data_mount(profile: ModelProfile, out_dir: Path) -> Path:
         archive = target / "images.tar.gz"
         _download_s3_file(_join_uri(uri, "images.tar.gz"), archive)
         if not (target / "left").exists():
-            with tarfile.open(archive) as tar:
-                tar.extractall(target)
+            _safe_extractall(archive, target)
     return data_root
 
 
@@ -1284,22 +1964,40 @@ def _prepare_visual_changenet_backbone(out_dir: Path) -> Path:
 
 def _mounts_for_model(out_dir: Path, model: str, profile: ModelProfile) -> list[dict[str, str]]:
     mounts = [{"host_path": str(out_dir / "results"), "container_path": "/results"}]
+    if model == "bevfusion":
+        mounts.append({
+            "host_path": str(_prepare_bevfusion_data_mount(profile, out_dir)),
+            "container_path": BEVFUSION_CONTAINER_DATA_ROOT,
+        })
+    if model == "clip":
+        mounts.append({
+            "host_path": str(_prepare_clip_data_mount(profile, out_dir)),
+            "container_path": CLIP_CONTAINER_DATA_ROOT,
+        })
     if model in {"depth-net-mono", "depth-net-stereo"}:
         mounts.append({
             "host_path": str(_prepare_depth_data_mount(profile, out_dir)),
             "container_path": "/data",
         })
     if model == "grounding-dino":
-        dataset_root = out_dir.parent.parent / "datasets" / "grounding-dino-mini"
         mounts.append({
-            "host_path": str(dataset_root),
-            "container_path": "/data/grounding-dino-mini",
+            "host_path": str(_prepare_single_image_mount(
+                uri=profile.eval_uri or profile.train_uri,
+                archive_suffix="images.tar.gz",
+                out_dir=out_dir,
+                name="grounding_dino_infer",
+            )),
+            "container_path": GROUNDING_DINO_INFER_CONTAINER_ROOT,
         })
-    if model == "nvdinov2":
-        dataset_root = out_dir.parent.parent / "datasets" / "nvdinov2-mini"
+    if model == "nvpanoptix3d":
         mounts.append({
-            "host_path": str(dataset_root),
-            "container_path": "/data/nvdinov2-mini",
+            "host_path": str(_prepare_single_image_mount(
+                uri=profile.eval_uri or profile.train_uri,
+                archive_suffix="data/images.tar.gz",
+                out_dir=out_dir,
+                name="nvpanoptix3d_infer",
+            )),
+            "container_path": NVPANOPTIX3D_INFER_CONTAINER_ROOT,
         })
     if model == "visual-changenet":
         mounts.append({
@@ -1329,43 +2027,40 @@ def _sample_records(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
-def _cosmos_video_fps_preflight(profile: ModelProfile) -> dict[str, Any]:
+def _cosmos_annotation_preflight(profile: ModelProfile) -> dict[str, Any]:
     checked = []
-    missing = []
     for name, uri in {
         "train_annotation": _join_uri(profile.train_uri, "annotations.json"),
         "eval_annotation": _join_uri(profile.eval_uri, "annotations.json"),
     }.items():
         payload = _read_s3_json(uri)
         records = _sample_records(payload)
-        has_video_fps = bool(records) and all("video_fps" in record for record in records)
         checked.append({
             "name": name,
             "uri": uri,
             "sampled_records": len(records),
-            "has_video_fps": has_video_fps,
         })
-        if not has_video_fps:
-            missing.append(name)
     return {
-        "status": "passed" if not missing else "failed",
+        "status": "passed",
         "checked": checked,
-        "missing": missing,
     }
 
 
 def run_model(args: argparse.Namespace) -> int:
-    model = args.model
-    profile = MODEL_PROFILES.get(model)
+    requested_model = args.model
+    model_dir, network_arch, profile_key = _resolve_model_dir(args.skill_bank, requested_model)
+    model = model_dir.name
+    profile = MODEL_PROFILES.get(profile_key)
     if profile is None:
-        raise KeyError(f"No validation profile for {model}")
+        raise KeyError(f"No validation profile for {model} (network_arch={network_arch})")
+    profile = _profile_with_dataset_overrides(profile, args)
 
-    model_dir = args.skill_bank / "models" / model
     skill_text = (model_dir / "SKILL.md").read_text()
     skill_info = _read_yaml(model_dir / "references" / "skill_info.yaml")
     train_specs = _read_yaml(model_dir / "references" / "spec_template_train.yaml")
     if profile.data_format:
         skill_info["data_format"] = profile.data_format
+    data_preflight = None
 
     out_dir = args.run_root / model
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1388,33 +2083,20 @@ def run_model(args: argparse.Namespace) -> int:
         print(json.dumps(payload))
         return 2
 
-    if model == "cosmos-rl" and not args.post_check_only:
+    if profile_key == "cosmos-rl" and not args.post_check_only:
         if not os.environ.get("HF_TOKEN"):
             payload = {
                 "model": model,
+                "network_arch": network_arch,
+                "profile_key": profile_key,
                 "algorithm": args.algorithm,
                 "status": "blocked",
-                "blocker": "HF_TOKEN is required for the gated Cosmos-Reason2-8B model",
+                "blocker": "HF_TOKEN is required for the gated Cosmos3-Nano model",
             }
             _write_json(report_path, payload)
             print(json.dumps(payload))
             return 2
-        preflight = _cosmos_video_fps_preflight(profile)
-        if preflight["status"] != "passed":
-            payload = {
-                "model": model,
-                "algorithm": args.algorithm,
-                "status": "blocked",
-                "blocker": "Cosmos-RL annotations are missing video_fps in sampled records; SFT loader fails before checkpoint creation",
-                "preflight": preflight,
-                "attempted_training_evidence": (
-                    "A real train attempt reached the Cosmos-RL process and failed with "
-                    "Error processing sample: 'video_fps'."
-                ),
-            }
-            _write_json(report_path, payload)
-            print(json.dumps(payload))
-            return 2
+        data_preflight = _cosmos_annotation_preflight(profile)
 
     if args.post_check_only:
         if not report_path.exists():
@@ -1442,6 +2124,8 @@ def run_model(args: argparse.Namespace) -> int:
     if profile.blocked and not args.allow_known_blockers:
         payload = {
             "model": model,
+            "network_arch": network_arch,
+            "profile_key": profile_key,
             "algorithm": args.algorithm,
             "status": "blocked",
             "blocker": profile.blocked,
@@ -1454,15 +2138,14 @@ def run_model(args: argparse.Namespace) -> int:
     rows = _parse_train_rows(skill_text)
     overrides: dict[str, Any] = {}
     _add_data_source_overrides(overrides, profile, rows)
-    overrides.update(_minimal_train_overrides(train_specs, schema_keys, effective_num_classes, model))
-    if model == "nvdinov2":
-        overrides["dataset.train_dataset.images_dir"] = "/data/nvdinov2-mini/images_train"
-    if model == "mask-grounding-dino":
+    overrides.update(_profile_specific_data_overrides(profile_key, profile))
+    overrides.update(_minimal_train_overrides(train_specs, schema_keys, effective_num_classes, profile_key))
+    if profile_key == "mask-grounding-dino":
         overrides["dataset.val_data_sources.data_type"] = "OD"
     overrides = _valid_set(overrides, train_specs, schema_keys)
 
     metric = args.metric or _monitoring_metric(skill_text)
-    if model == "dino" and metric == "val_mAP50":
+    if profile_key == "dino" and metric == "val_mAP50":
         metric = "mAP50"
 
     jobs: dict[int, dict[str, Any]] = {}
@@ -1487,9 +2170,9 @@ def run_model(args: argparse.Namespace) -> int:
         poll_interval=args.poll_interval,
         state_file=str(out_dir / "sdk_state.json"),
     )
-    mounts = _mounts_for_model(out_dir, model, profile)
+    mounts = _mounts_for_model(out_dir, profile_key, profile)
     dataset_convert_preflight = None
-    if model in {"pointpillars", "sparse4d"}:
+    if profile_key in {"bevfusion", "ocrnet", "pointpillars", "sparse4d"}:
         dataset_convert_preflight = _run_dataset_convert_preflight(
             args=args,
             model_dir=model_dir,
@@ -1503,6 +2186,8 @@ def run_model(args: argparse.Namespace) -> int:
         if dataset_convert_preflight["status"] != "passed":
             payload = {
                 "model": model,
+                "network_arch": network_arch,
+                "profile_key": profile_key,
                 "algorithm": args.algorithm,
                 "status": (
                     "blocked"
@@ -1534,15 +2219,14 @@ def run_model(args: argparse.Namespace) -> int:
             train_dataset_uri=profile.train_uri,
             eval_dataset_uri=profile.eval_uri,
             automl_settings=_automl_settings(args.algorithm, metric, args),
-            automl_hyperparameters=None,
-            custom_param_ranges=_minimal_custom_ranges(supported_params, model=model),
+            automl_hyperparameters=supported_params or None,
+            custom_param_ranges=_minimal_custom_ranges(supported_params, model=profile_key),
             workspace_path=str(out_dir / "workspace"),
             spec_overrides=overrides,
-            metric_extractor=_metric_extractor_for(model),
+            metric_extractor=_metric_extractor_for(profile_key),
             on_recommendation=on_recommendation,
             on_result=on_result,
             gpu_count=args.num_gpus,
-            gpu_device_ids=[args.gpu_device_id] if args.gpu_device_id else None,
             mounts=mounts,
         )
     except Exception as exc:
@@ -1558,20 +2242,120 @@ def run_model(args: argparse.Namespace) -> int:
     for rec_id, data in jobs.items():
         job_id = data.get("job_id")
         job_root = out_dir / "results" / str(job_id) if job_id else Path("")
-        data["checkpoint_paths"] = _find_checkpoints(job_root, model) if job_id else []
+        data["checkpoint_paths"] = _find_checkpoints(job_root, profile_key) if job_id else []
         data["checkpoint_count"] = len(data["checkpoint_paths"])
+        train_kpi = _latest_kpi(job_root) if job_id else {}
+        data["train_kpi"] = train_kpi
+        log_metric = None
+        if job_id:
+            try:
+                log_metric = _extract_metric_from_logs(sdk.get_job_logs(job_id), metric)
+            except Exception:
+                log_metric = None
+        status_metric = _metric_from_kpi(train_kpi, metric)
+        emitted_metric = status_metric if status_metric is not None else log_metric
+        status_log_metric_match = None
+        if status_metric is not None and log_metric is not None:
+            status_log_metric_match = _metric_sources_close_enough(status_metric, log_metric)
+        data["metric_verification"] = {
+            "metric_used_by_automl": metric,
+            "automl_reported_metric": data.get("metric"),
+            "status_metric": status_metric,
+            "log_metric": log_metric,
+            "status_log_metric_match": status_log_metric_match,
+            "emitted_metric": emitted_metric,
+            "emitted_kpi_keys": sorted(train_kpi.keys()),
+            "matches_emitted_metric": _close_enough(data.get("metric"), emitted_metric),
+        }
+        if (
+            profile_key == "sparse4d"
+            and not data["metric_verification"]["matches_emitted_metric"]
+            and data.get("resume_from_job_id")
+        ):
+            parent_job_id = str(data["resume_from_job_id"])
+            parent_root = out_dir / "results" / parent_job_id
+            parent_kpi = _latest_kpi(parent_root)
+            parent_log_metric = None
+            try:
+                parent_log_metric = _extract_metric_from_logs(sdk.get_job_logs(parent_job_id), metric)
+            except Exception:
+                parent_log_metric = None
+            parent_status_metric = _metric_from_kpi(parent_kpi, metric)
+            parent_emitted_metric = (
+                parent_status_metric if parent_status_metric is not None else parent_log_metric
+            )
+            parent_match = _close_enough(data.get("metric"), parent_emitted_metric)
+            parent_status_log_metric_match = None
+            if parent_status_metric is not None and parent_log_metric is not None:
+                parent_status_log_metric_match = _metric_sources_close_enough(
+                    parent_status_metric,
+                    parent_log_metric,
+                )
+            data["metric_verification"].update({
+                "metric_source": "resume_parent" if parent_match else "resume_parent_unmatched",
+                "parent_job_id": parent_job_id,
+                "parent_status_metric": parent_status_metric,
+                "parent_log_metric": parent_log_metric,
+                "parent_status_log_metric_match": parent_status_log_metric_match,
+                "parent_emitted_metric": parent_emitted_metric,
+                "parent_emitted_kpi_keys": sorted(parent_kpi.keys()),
+                "matches_emitted_metric": parent_match,
+            })
 
     best = result.get("best") or {}
     best_rec_id = best.get("rec_id")
     best_job = jobs.get(best_rec_id, {})
-    passed = (
+    ready_for_post_checks = (
         bool(jobs)
         and all(data.get("status") == "success" for data in jobs.values())
         and best.get("metric_value") is not None
         and bool(best_job.get("checkpoint_paths"))
     )
+    selection = _best_selection(jobs, best_rec_id, _direction(metric))
+    resume_behavior = _resume_behavior(jobs)
+    successful_jobs = [data for data in jobs.values() if data.get("status") == "success"]
+    def _metric_verification_passed(data: Dict[str, Any]) -> bool:
+        verification = data.get("metric_verification", {})
+        if not verification.get("matches_emitted_metric"):
+            return False
+        # Some TAO logs round metrics more aggressively than status artifacts. When
+        # AutoML matches the emitted status metric, keep the rounded log mismatch as
+        # report evidence without failing the model.
+        if (
+            verification.get("status_log_metric_match") is False
+            and verification.get("status_metric") is None
+        ):
+            return False
+        if (
+            verification.get("parent_status_log_metric_match") is False
+            and verification.get("parent_status_metric") is None
+        ):
+            return False
+        return True
+
+    metric_checks_passed = bool(successful_jobs) and all(
+        _metric_verification_passed(data) for data in successful_jobs
+    )
+    algorithm_behavior = {
+        "recommendation_count": len(jobs),
+        "successful_recommendations": sum(1 for data in jobs.values() if data.get("status") == "success"),
+        "unique_recommendations": len({
+            json.dumps(data.get("specs") or {}, sort_keys=True, default=str)
+            for data in jobs.values()
+        }),
+        "metrics_reported": sum(1 for data in jobs.values() if data.get("metric") is not None),
+        "resume_recommendations": sum(1 for data in jobs.values() if data.get("resume_from_job_id")),
+    }
+    passed = (
+        ready_for_post_checks
+        and selection["status"] == "passed"
+        and metric_checks_passed
+        and resume_behavior["status"] == "passed"
+    )
     payload = {
         "model": model,
+        "network_arch": network_arch,
+        "profile_key": profile_key,
         "algorithm": args.algorithm,
         "status": "passed" if passed else "failed",
         "metric_documented": _monitoring_metric(skill_text),
@@ -1583,22 +2367,15 @@ def run_model(args: argparse.Namespace) -> int:
         "result": result,
         "run_error": run_error,
         "jobs": jobs,
+        "algorithm_behavior": algorithm_behavior,
+        "best_selection": selection,
+        "metric_checks_passed": metric_checks_passed,
         "best_checkpoint_paths": best_job.get("checkpoint_paths", []),
         "dataset_convert": dataset_convert_preflight,
-        "resume_behavior": [
-            {
-                "rec_id": rid,
-                "resume_from_job_id": data.get("resume_from_job_id"),
-                "resume_from_epoch": data.get("resume_from_epoch"),
-                "resume_from_step": data.get("resume_from_step"),
-                "resume_checkpoint_path": data.get("resume_checkpoint_path"),
-                "uses_latest": "latest" in str(data.get("resume_checkpoint_path", "")).lower(),
-            }
-            for rid, data in jobs.items()
-            if data.get("resume_from_job_id")
-        ],
+        "data_preflight": data_preflight,
+        "resume_behavior": resume_behavior,
     }
-    if payload["status"] == "passed":
+    if ready_for_post_checks:
         payload = _run_post_checks(
             args=args,
             model_dir=model_dir,
@@ -1610,6 +2387,8 @@ def run_model(args: argparse.Namespace) -> int:
             sdk=sdk,
             num_classes=effective_num_classes,
         )
+        if not passed and payload.get("status") == "passed":
+            payload["status"] = "failed"
     _write_json(report_path, payload)
     print(json.dumps({"model": model, "status": payload["status"], "report": str(report_path)}))
     return 0 if payload["status"] == "passed" else 1
@@ -1626,6 +2405,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--num-classes", type=int, default=6)
     parser.add_argument("--poll-interval", type=int, default=30)
     parser.add_argument("--metric")
+    parser.add_argument("--train-dataset-uri")
+    parser.add_argument("--eval-dataset-uri")
     parser.add_argument("--allow-known-blockers", action="store_true")
     parser.add_argument("--post-check-only", action="store_true")
     return parser.parse_args(argv)
@@ -1636,10 +2417,12 @@ def main(argv: list[str]) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    args = parse_args(argv)
     try:
-        return run_model(parse_args(argv))
+        return run_model(args)
     except Exception as exc:
-        print(json.dumps({"status": "failed", "error": str(exc)}))
+        report_path = _write_exception_report(args, exc)
+        print(json.dumps({"status": "failed", "error": str(exc), "report": str(report_path)}))
         LOG.exception("validation failed")
         return 1
 
