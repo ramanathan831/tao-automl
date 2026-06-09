@@ -127,6 +127,29 @@ class SkillContext:
             or self.skill_info.get("container_image", "")
         )
 
+    def validate_runtime(self) -> dict[str, Any]:
+        """Validate that the model/action can be loaded by AutoML runtime code.
+
+        Skill JSON can exist even when the runtime import path is broken. This
+        probes the generated schema path used by ``AutoML`` construction, which
+        catches issues such as ``cosmos-rl`` versus ``cosmos_rl`` package names
+        before a long-running launch starts.
+        """
+        from tao_automl.schema.generate_schema import generate_schema
+
+        schema = generate_schema(self.network_arch, self.action)
+        return {
+            "network_arch": self.network_arch,
+            "action": self.action,
+            "schema_title": schema.get("title"),
+            "parameter_count": len(_schema_property_keys(schema)),
+        }
+
+
+def validate_skill_runtime(skill_dir: str | Path, action: str = "train") -> dict[str, Any]:
+    """Load a skill directory and validate its AutoML runtime schema path."""
+    return SkillContext(skill_dir=Path(skill_dir), action=action).validate_runtime()
+
 _DEFAULT_POLL_INTERVAL = 30
 _TERMINAL_STATUSES = {"Complete", "Error", "Canceled"}
 
@@ -870,6 +893,265 @@ def _resolve_direction(metric_name: str, explicit) -> tuple[str, bool]:
 
 
 # ---------------------------------------------------------------------------
+# Recommendation safety helpers.
+# ---------------------------------------------------------------------------
+
+_SAMPLE_COUNT_KEYS = (
+    "train_sample_count",
+    "training_sample_count",
+    "num_train_samples",
+    "train_samples",
+    "dataset_sample_count",
+    "dataset_size",
+    "samples_per_epoch",
+    "custom.train_dataset.sample_count",
+    "custom.train_dataset.num_samples",
+    "custom.train_dataset.size",
+    "dataset.train_sample_count",
+    "dataset.num_train_samples",
+    "data.train_sample_count",
+    "train.num_samples",
+)
+_BATCH_SIZE_KEYS = (
+    "train.train_batch_per_replica",
+    "train.batch_size",
+    "dataset.batch_size",
+    "batch_size",
+)
+_MINI_BATCH_KEYS = (
+    "train.train_policy.mini_batch",
+    "train.mini_batch",
+    "mini_batch",
+)
+_DP_SHARD_KEYS = (
+    "policy.parallelism.dp_shard_size",
+    "train.num_gpus",
+    "num_gpus",
+    "gpu_count",
+)
+_EFFECTIVE_BATCH_FAILURE_PATTERNS = (
+    r"NoneType.*state_dict",
+    r"scheduler.*None",
+    r"0\s+training\s+steps",
+    r"zero\s+training\s+steps",
+    r"num_training_steps[^0-9]*0",
+    r"train_batch_per_replica.*samples",
+)
+
+
+def _coerce_positive_int(value) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _get_dotted_value(source, dotted_key: str):
+    if not isinstance(source, dict):
+        return None
+    if dotted_key in source:
+        return source[dotted_key]
+    cursor = source
+    for part in dotted_key.split("."):
+        key, idx = _parse_path_part(part)
+        if not isinstance(cursor, dict) or key not in cursor:
+            return None
+        cursor = cursor[key]
+        if idx is not None:
+            if not isinstance(cursor, list) or idx >= len(cursor):
+                return None
+            cursor = cursor[idx]
+    return cursor
+
+
+def _set_dotted_value(target: dict, dotted_key: str, value) -> None:
+    parts = dotted_key.split(".")
+    cursor = target
+    for part in parts[:-1]:
+        key, idx = _parse_path_part(part)
+        if key not in cursor:
+            cursor[key] = [] if idx is not None else {}
+        cursor = cursor[key]
+        if idx is not None:
+            while len(cursor) <= idx:
+                cursor.append({})
+            if cursor[idx] is None:
+                cursor[idx] = {}
+            cursor = cursor[idx]
+    last_key, last_idx = _parse_path_part(parts[-1])
+    if last_idx is None:
+        cursor[last_key] = value
+        return
+    cursor.setdefault(last_key, [])
+    while len(cursor[last_key]) <= last_idx:
+        cursor[last_key].append(None)
+    cursor[last_key][last_idx] = value
+
+
+def _first_positive_int(sources, keys, default=None) -> int | None:
+    for source in sources:
+        for key in keys:
+            value = _coerce_positive_int(_get_dotted_value(source, key))
+            if value is not None:
+                return value
+    return default
+
+
+def _first_present_key(source: dict, keys) -> tuple[str | None, int | None]:
+    for key in keys:
+        value = _coerce_positive_int(_get_dotted_value(source, key))
+        if value is not None:
+            return key, value
+    return None, None
+
+
+def _append_adjustment(rec, adjustment: dict[str, Any]) -> None:
+    adjustments = getattr(rec, "adjustments", None)
+    if adjustments is None:
+        adjustments = []
+        rec.adjustments = adjustments
+    adjustments.append(adjustment)
+
+
+def _maybe_cap_effective_batch(
+    specs: dict,
+    rec,
+    automl_settings: dict,
+    platform_kwargs: dict | None,
+) -> str | None:
+    """Cap impossible batch-size recommendations when sample count is known.
+
+    Cosmos-RL FSDP sees roughly ``sample_count / dp_shard_size`` samples per
+    rank. If a recommendation exceeds that, the trainer can produce zero steps
+    and later crash while saving checkpoint state. When possible, cap the
+    recommendation to the largest valid value and record the adjustment; if
+    even one sample per rank is unavailable, return a failure reason so the
+    caller can report an invalid recommendation without launching a job.
+    """
+    settings = automl_settings or {}
+    kwargs = platform_kwargs or {}
+    if settings.get("allow_unsafe_effective_batch") or kwargs.get(
+        "allow_unsafe_effective_batch"
+    ):
+        return None
+
+    sources = (settings, kwargs, specs)
+    sample_count = _first_positive_int(sources, _SAMPLE_COUNT_KEYS)
+    if sample_count is None:
+        return None
+
+    batch_key, batch = _first_present_key(specs, _BATCH_SIZE_KEYS)
+    if batch_key is None or batch is None:
+        return None
+
+    dp_shard_size = _first_positive_int(sources, _DP_SHARD_KEYS, default=1) or 1
+    samples_per_rank = sample_count / dp_shard_size
+    if batch <= samples_per_rank:
+        return None
+
+    reason = (
+        f"{batch_key}={batch} exceeds samples per rank "
+        f"{samples_per_rank:.3g} (sample_count={sample_count}, "
+        f"dp_shard_size={dp_shard_size})"
+    )
+    capped = int(samples_per_rank)
+    mini_batch = _first_positive_int((specs,), _MINI_BATCH_KEYS, default=1) or 1
+    if mini_batch > 1 and capped >= mini_batch:
+        capped = (capped // mini_batch) * mini_batch
+
+    if capped < 1:
+        setattr(rec, "failure_reason", f"invalid_configuration: {reason}")
+        return getattr(rec, "failure_reason")
+
+    _set_dotted_value(specs, batch_key, capped)
+    if isinstance(getattr(rec, "specs", None), dict):
+        rec.specs[batch_key] = capped
+    adjustment = {
+        "type": "effective_batch_cap",
+        "key": batch_key,
+        "from": batch,
+        "to": capped,
+        "sample_count": sample_count,
+        "dp_shard_size": dp_shard_size,
+        "reason": reason,
+    }
+    _append_adjustment(rec, adjustment)
+    logger.warning(
+        "Rec %d: capped %s from %s to %s because %s",
+        getattr(rec, "id", -1),
+        batch_key,
+        batch,
+        capped,
+        reason,
+    )
+    return None
+
+
+def _classify_failure(logs: str) -> str | None:
+    if not logs:
+        return None
+    for pattern in _EFFECTIVE_BATCH_FAILURE_PATTERNS:
+        if re.search(pattern, logs, re.IGNORECASE | re.DOTALL):
+            return (
+                "invalid_configuration: effective batch size appears to have "
+                "produced zero training steps; reduce train_batch_per_replica "
+                "or increase dataset samples per data-parallel rank"
+            )
+    return None
+
+
+def _compare_to_baseline(
+    baseline_metric: float | None,
+    best_metric: float | None,
+    direction: str,
+) -> dict[str, Any] | None:
+    if baseline_metric is None or best_metric is None:
+        return None
+    if direction == "minimize":
+        delta = baseline_metric - best_metric
+    else:
+        delta = best_metric - baseline_metric
+    return {
+        "delta": delta,
+        "improved": delta > 0,
+        "direction": direction,
+    }
+
+
+def _evaluation_record_path(settings: dict, explicit_key: str, filename: str) -> str | None:
+    if settings.get(explicit_key):
+        return str(settings[explicit_key])
+    records_dir = settings.get("evaluation_records_dir")
+    if records_dir:
+        return str(Path(records_dir) / filename)
+    return None
+
+
+def _merge_metric_payload(target: dict[str, Any], payload) -> bool:
+    """Merge a metric callback payload into ``target``.
+
+    Callback authors can return a bare float or a dict with ``metric_value`` and
+    optional metadata such as ``record_path`` / ``job_id``. Returns True when a
+    numeric metric was present.
+    """
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if key in {"metric", "metric_value"}:
+                continue
+            target[key] = value
+        metric = payload.get("metric_value", payload.get("metric"))
+    else:
+        metric = payload
+    if metric is None:
+        return False
+    target["metric_value"] = float(metric)
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Active-jobs persistence (fix #3: survive orchestrator crashes without
 # leaking in-flight Lepton jobs).
 # ---------------------------------------------------------------------------
@@ -934,6 +1216,8 @@ class AutoMLRunner:
             spec_overrides=None, resume=False,
             metric_extractor=None,
             eval_fn=None,
+            baseline_fn=None,
+            final_eval_fn=None,
             on_recommendation=None, on_result=None,
             **platform_kwargs) -> dict:
         """Run a full AutoML optimization loop.
@@ -980,6 +1264,18 @@ class AutoMLRunner:
                 via ``report_result``. Return ``None`` to fall back to the
                 extractor. Raised exceptions are caught and logged; the rec
                 is reported with the extractor's value (or None + failure).
+            baseline_fn: Optional callable ``(base_specs: dict) -> float | None``.
+                When provided and ``automl_settings.run_baseline`` is not False,
+                run a base/pretrained evaluation before tuning and include the
+                metric plus best-vs-baseline comparison in the returned result.
+                Callers may instead provide ``automl_settings.baseline_metric``
+                when the baseline was measured by a separate workflow step.
+            final_eval_fn: Optional callable ``(best_rec, train_job_id: str | None) -> float | dict | None``.
+                When provided and ``automl_settings.run_final_evaluation`` is not
+                False, run the final evaluation for the selected best
+                recommendation before ``run`` returns. Return either a numeric
+                metric or a dict containing ``metric_value`` plus optional
+                metadata such as ``record_path``.
             on_recommendation: Callback(rec) called when a new rec is generated.
             on_result: Callback(rec, metric, status) called when a result is reported.
 
@@ -994,7 +1290,7 @@ class AutoMLRunner:
                 see their original metric scale.
 
         Returns:
-            Dict with keys: best, progress, history.
+            Dict with keys: best, progress, baseline, final_evaluation, history.
         """
         from tao_automl import AutoML
 
@@ -1053,6 +1349,42 @@ class AutoMLRunner:
         metric_name = automl_settings.get("metric", "loss")
         _effective_dir, invert_metric = _resolve_direction(
             metric_name, automl_settings.get("direction"))
+
+        baseline = {
+            "enabled": bool(automl_settings.get("run_baseline", True)),
+            "metric_name": metric_name,
+            "metric_value": None,
+            "status": "not_run",
+        }
+        if baseline["enabled"]:
+            if automl_settings.get("baseline_metric") is not None:
+                baseline["metric_value"] = float(automl_settings["baseline_metric"])
+                baseline["status"] = "provided"
+            elif baseline_fn is not None:
+                try:
+                    baseline_metric = baseline_fn(copy.deepcopy(base_specs))
+                except Exception as ex:
+                    logger.warning("baseline_fn raised: %s", ex)
+                    baseline["status"] = "failure"
+                    baseline["failure_reason"] = str(ex)
+                else:
+                    if baseline_metric is not None:
+                        baseline["metric_value"] = float(baseline_metric)
+                        baseline["status"] = "measured"
+                    else:
+                        baseline["status"] = "metric_missing"
+            else:
+                baseline["status"] = "unavailable"
+                baseline["failure_reason"] = (
+                    "baseline_fn or automl_settings['baseline_metric'] was not provided"
+                )
+        else:
+            baseline["status"] = "skipped"
+        baseline_record_path = _evaluation_record_path(
+            automl_settings, "baseline_record_path", "ptm_baseline.json"
+        )
+        if baseline_record_path:
+            baseline.setdefault("record_path", baseline_record_path)
 
         automl = AutoML(
             workspace=workspace_path, network=network_arch,
@@ -1175,6 +1507,22 @@ class AutoMLRunner:
                         "Rec %d: auto-suffixed %d hardcoded output dir(s) "
                         "with /rec_%d to prevent rec-to-rec overwrite: %s",
                         rec.id, len(rewritten), rec.id, rewritten)
+                invalid_reason = _maybe_cap_effective_batch(
+                    merged_specs, rec, automl_settings, job_platform_kwargs
+                )
+                if invalid_reason:
+                    logger.warning(
+                        "Rec %d: skipping invalid recommendation: %s",
+                        rec.id, invalid_reason,
+                    )
+                    automl.report_result(
+                        rec_id=rec.id,
+                        metric_value=0.0,
+                        status="failure",
+                    )
+                    if on_result:
+                        on_result(rec, None, "failure")
+                    continue
                 metric_value, status = self._run_one_job(
                     image=resolved_image, action_cfg=action_cfg,
                     specs=merged_specs, rec=rec, metric_name=metric_name,
@@ -1247,16 +1595,88 @@ class AutoMLRunner:
                 f"failed recommendation ids: {failed}"
             )
 
+        best_metric = _unflip(best.result) if best else None
+        final_evaluation = {
+            "enabled": bool(automl_settings.get("run_final_evaluation", True)),
+            "metric_name": metric_name,
+            "metric_value": None,
+            "status": "not_run",
+        }
+        final_record_path = _evaluation_record_path(
+            automl_settings, "final_evaluation_record_path", "best_automl.json"
+        )
+        if final_record_path:
+            final_evaluation["record_path"] = final_record_path
+
+        if final_evaluation["enabled"]:
+            provided_payload = automl_settings.get("final_evaluation")
+            if isinstance(provided_payload, dict):
+                if _merge_metric_payload(final_evaluation, provided_payload):
+                    final_evaluation["status"] = provided_payload.get("status", "provided")
+                else:
+                    final_evaluation["status"] = provided_payload.get(
+                        "status", "metric_missing"
+                    )
+                final_evaluation["source"] = provided_payload.get("source", "provided")
+            elif automl_settings.get("final_evaluation_metric") is not None:
+                final_evaluation["metric_value"] = float(
+                    automl_settings["final_evaluation_metric"]
+                )
+                final_evaluation["status"] = "provided"
+                final_evaluation["source"] = "automl_settings.final_evaluation_metric"
+            elif final_eval_fn is not None:
+                try:
+                    payload = final_eval_fn(best, getattr(best, "job_id", None))
+                except Exception as ex:
+                    logger.warning("final_eval_fn raised for rec %s: %s", best.id, ex)
+                    final_evaluation["status"] = "failure"
+                    final_evaluation["failure_reason"] = str(ex)
+                    final_evaluation["source"] = "final_eval_fn"
+                else:
+                    if _merge_metric_payload(final_evaluation, payload):
+                        final_evaluation["status"] = "measured"
+                    else:
+                        final_evaluation["status"] = "metric_missing"
+                    final_evaluation["source"] = "final_eval_fn"
+            elif automl_settings.get("reuse_best_metric_for_final_evaluation"):
+                final_evaluation["metric_value"] = best_metric
+                final_evaluation["status"] = "reused_best"
+                final_evaluation["source"] = "best_selection_metric"
+            else:
+                final_evaluation["status"] = "unavailable"
+                final_evaluation["failure_reason"] = (
+                    "final_eval_fn, automl_settings['final_evaluation_metric'], "
+                    "or reuse_best_metric_for_final_evaluation=True was not provided"
+                )
+        else:
+            final_evaluation["status"] = "skipped"
+        final_evaluation["comparison_to_baseline"] = _compare_to_baseline(
+            baseline.get("metric_value"),
+            final_evaluation.get("metric_value"),
+            _effective_dir,
+        )
+
         result = {
             "best": {
                 "rec_id": best.id if best else None,
                 "specs": best.specs if best else {},
-                "metric_value": _unflip(best.result) if best else None,
+                "metric_value": best_metric,
+                "adjustments": getattr(best, "adjustments", []) if best else [],
             },
             "progress": progress,
+            "baseline": baseline,
+            "final_evaluation": final_evaluation,
             "history": [{"rec_id": r.id, "metric": _unflip(r.result),
-                          "status": r.status} for r in history],
+                          "status": r.status,
+                          "failure_reason": getattr(r, "failure_reason", None),
+                          "adjustments": getattr(r, "adjustments", [])}
+                         for r in history],
         }
+        baseline["comparison_to_best"] = _compare_to_baseline(
+            baseline.get("metric_value"),
+            result["best"]["metric_value"],
+            _effective_dir,
+        )
         logger.info("AutoML complete: %d recommendations, best metric=%.6f (rec %s)",
                      progress["completed"],
                      _unflip(best.result) if best and best.result is not None else 0.0,
@@ -1294,6 +1714,7 @@ class AutoMLRunner:
             )
         except Exception as e:
             logger.error("Failed to create job for rec %d: %s", rec.id, e)
+            rec.failure_reason = f"job_creation_failed: {e}"
             return None, "failure"
 
         rec.assign_job_id(job.id)
@@ -1437,9 +1858,13 @@ class AutoMLRunner:
             self._persist_active_jobs(workspace_path)
 
         if status == "Error" or exec_status == "FAIL":
+            reason = _classify_failure(all_logs)
+            if reason:
+                rec.failure_reason = reason
             logger.warning("Rec %d: job %s failed", rec.id, job.id)
             return cached_metric, "failure"
         if status == "Canceled":
+            rec.failure_reason = "job_canceled"
             return cached_metric, "failure"
 
         # fix #4: if an eval_fn is provided, run it post-training and let its
@@ -1642,9 +2067,13 @@ class AutoMLRunner:
         if status == "Error" or exec_status == "FAIL":
             metric_value = cached_metric
             report_status = "failure"
+            reason = _classify_failure(all_logs)
+            if reason:
+                rec.failure_reason = reason
         elif status == "Canceled":
             metric_value = cached_metric
             report_status = "failure"
+            rec.failure_reason = "job_canceled"
         else:
             metric_value = cached_metric
             eval_metric_used = False
