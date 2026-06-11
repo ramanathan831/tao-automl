@@ -247,6 +247,8 @@ class Controller:
                 "job_id": r.job_id,
                 "status": r.status,
                 "metric_value": r.result,
+                "failure_reason": getattr(r, "failure_reason", None),
+                "adjustments": getattr(r, "adjustments", []),
                 "created_on": r.created_on,
                 "last_modified": r.last_modified,
             })
@@ -545,6 +547,8 @@ class Controller:
             "resume_from_epoch": rec.resume_from_epoch,
             "resume_from_step": rec.resume_from_step,
             "early_stop_epoch": rec.early_stop_epoch,
+            "failure_reason": getattr(rec, "failure_reason", None),
+            "adjustments": getattr(rec, "adjustments", []),
             "created_on": rec.created_on,
             "last_modified": rec.last_modified,
         }
