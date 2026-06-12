@@ -124,6 +124,33 @@ def test_extract_metric_reads_sparse4d_status_kpi_alias(tmp_path):
     assert _extract_metric_from_status_file(status_path, "val_mAP") == 0.125
 
 
+def test_extract_latency_aliases_from_logs_and_status(tmp_path):
+    from tao_automl.runner import _extract_metric_from_logs, _extract_metric_from_status_file
+
+    logs = "val_mAP: 0.812\ninference_latency_ms: 14.5\n"
+    assert _extract_metric_from_logs(logs, "latency") == pytest.approx(14.5)
+
+    status_path = tmp_path / "status.json"
+    status_path.write_text(
+        '{"status": "RUNNING", "kpi": {"avg_latency_ms": 12.25}}\n'
+    )
+    assert _extract_metric_from_status_file(status_path, "latency") == pytest.approx(12.25)
+
+
+def test_latency_does_not_fall_back_to_primary_best_score():
+    from tao_automl.runner import _extract_metric_from_best_score_payload
+
+    payload = '{"best_score": 0.93, "metric": "val_mAP"}\n'
+    assert _extract_metric_from_best_score_payload(payload, "latency") is None
+
+    payload_with_latency = (
+        '{"best_score": 0.93, "metric": "val_mAP", "latency_ms": 18.0}\n'
+    )
+    assert _extract_metric_from_best_score_payload(
+        payload_with_latency, "latency"
+    ) == pytest.approx(18.0)
+
+
 def test_execution_status_can_ignore_fatal_cleanup_patterns():
     from tao_automl.runner import _check_execution_status
 
@@ -344,6 +371,38 @@ def test_run_one_job_calls_build_entrypoint_with_action_cfg(tmp_path):
     for legacy in ("specs", "script_runner", "network_arch", "data_format",
                    "backend_details", "workspace_id", "train_dataset_uri"):
         assert legacy not in create_kwargs, f"legacy kwarg {legacy!r} leaked"
+
+
+def test_run_one_job_returns_multi_objective_values(tmp_path):
+    from tao_automl.runner import AutoMLRunner
+
+    skill_dir = _write_fake_skill(tmp_path)
+    fake_sdk = MagicMock()
+    fake_sdk.create_job.return_value = MagicMock(id="job-mo", backend_job_id="be-mo")
+    fake_sdk.get_job_status.return_value = MagicMock(status="Complete")
+    fake_sdk.get_job_logs.return_value = "val_mAP: 0.75\nlatency_ms: 21.0\n"
+
+    runner = AutoMLRunner(sdk=fake_sdk, skill_dir=skill_dir, action="train")
+    runner._poll_interval = 0
+    rec = MagicMock(id=3)
+
+    with patch(
+        "tao_sdk.script_runner.build_entrypoint",
+        return_value={"command": "BAKED_HEREDOC_COMMAND", "args_template": ""},
+    ):
+        metric, status = runner._run_one_job(
+            image="nvcr.io/test:1",
+            action_cfg=runner.skill_ctx.action_cfg,
+            specs={"train": {"num_epochs": 1}},
+            rec=rec,
+            metric_name="val_mAP",
+            objective_names=["val_mAP", "latency"],
+            workspace_path=str(tmp_path),
+            platform_kwargs={},
+        )
+
+    assert status == "success"
+    assert metric == {"val_mAP": pytest.approx(0.75), "latency": pytest.approx(21.0)}
 
 
 def test_run_one_job_allows_completed_metric_with_cleanup_rendezvous(tmp_path):

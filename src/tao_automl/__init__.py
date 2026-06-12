@@ -31,6 +31,7 @@ import logging
 import os
 import uuid
 
+from tao_automl.objectives import parse_objective_config
 from tao_automl.types import AutoMLContext, JobStates
 
 logger = logging.getLogger(__name__)
@@ -124,10 +125,14 @@ def query_status(workspace_path: str) -> dict:
     best = {}
     if best_info:
         bd = best_info.get("rec_data", {})
+        objective_values = bd.get("objective_values") or {}
+        metric_name = bd.get("metric")
         best = {
             "rec_id": bd.get("id"),
             "specs": bd.get("specs", {}),
-            "metric_value": bd.get("result"),
+            "metric_value": objective_values.get(metric_name, bd.get("result")),
+            "objective_score": bd.get("objective_score", bd.get("result")),
+            "objective_values": objective_values,
         }
 
     return {
@@ -149,7 +154,12 @@ def query_status(workspace_path: str) -> dict:
                 "specs": r.get("specs", {}),
                 "job_id": r.get("job_id"),
                 "status": r.get("status"),
-                "metric_value": r.get("result"),
+                "metric_value": (
+                    (r.get("objective_values") or {}).get(r.get("metric"))
+                    if r.get("objective_values") else r.get("result")
+                ),
+                "objective_score": r.get("objective_score", r.get("result")),
+                "objective_values": r.get("objective_values", {}),
                 "created_on": r.get("created_on"),
                 "last_modified": r.get("last_modified"),
             }
@@ -229,6 +239,8 @@ class AutoML:
 
         algorithm = settings["algorithm"]
         metric = settings.get("metric", "loss")
+        objective_config = parse_objective_config(settings)
+        brain_metric = objective_config.brain_metric
 
         # 1. State store
         self._state_store = StateStore(workspace)
@@ -283,7 +295,7 @@ class AutoML:
             network=network,
             parameters=param_records,
             params=algo_params,
-            metric=metric,
+            metric=brain_metric,
             resume=resume,
         )
 
@@ -298,6 +310,7 @@ class AutoML:
                 algorithm=algorithm,
                 parameter_names=param_names,
                 wandb_config=wandb_config,
+                objective_config=objective_config,
             )
         else:
             self._controller = Controller(
@@ -309,11 +322,12 @@ class AutoML:
                 algorithm=algorithm,
                 parameter_names=param_names,
                 wandb_config=wandb_config,
+                objective_config=objective_config,
             )
 
         logger.info(
-            "AutoML initialized: algorithm=%s, metric=%s, params=%d, resume=%s",
-            algorithm, metric, len(param_names), resume,
+            "AutoML initialized: algorithm=%s, metric=%s, objectives=%s, params=%d, resume=%s",
+            algorithm, metric, objective_config.metric_names, len(param_names), resume,
         )
 
     # ------------------------------------------------------------------
@@ -334,7 +348,8 @@ class AutoML:
 
         Args:
             rec_id: Recommendation ID (from ``rec.id``).
-            metric_value: The metric value achieved.
+            metric_value: The metric value achieved, or a dict of objective
+                metric values for multi-objective sessions.
             best_epoch: Best epoch number (optional).
             status: ``"success"`` or ``"failure"``.
         """

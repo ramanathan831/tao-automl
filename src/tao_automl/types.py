@@ -39,6 +39,8 @@ class Recommendation:
         self.job_id = None
         self.status = JobStates.pending
         self.result = 0.0
+        self.objective_values = {}
+        self.objective_score = 0.0
         self.best_epoch_number = ""
         self.metric = metric
         self.resume_from_job_id = None  # For PBT: job ID to resume checkpoint from
@@ -72,6 +74,26 @@ class Recommendation:
         result = float(result)
         assert type(result) is float, f"Result must be a float value, got {type(result)}"
         self.result = result
+        self.objective_score = result
+        if not self.objective_values:
+            self.objective_values = {self.metric: result}
+
+    def update_objectives(self, objective_values, objective_score):
+        """Update raw objective values and the scalar optimization score."""
+        assert type(objective_values) is dict, (
+            f"Objective values must be a dictionary, got {type(objective_values)}"
+        )
+        self.objective_values = {
+            str(key): float(value)
+            for key, value in objective_values.items()
+        }
+        score = float(objective_score)
+        self.objective_score = score
+        self.result = score
+
+    def primary_metric_value(self):
+        """Return the raw value for this recommendation's primary metric."""
+        return self.objective_values.get(self.metric, self.result)
 
     def update_status(self, status):
         """Update the status value"""

@@ -11,6 +11,7 @@ Optionally integrates with Weights & Biases (wandb) for experiment tracking.
 import logging
 import os
 
+from tao_automl.objectives import parse_objective_config
 from tao_automl.types import Recommendation, ResumeRecommendation, JobStates
 
 logger = logging.getLogger(__name__)
@@ -58,6 +59,7 @@ class Controller:
         algorithm,
         parameter_names=None,
         wandb_config=None,
+        objective_config=None,
     ):
         """
         Args:
@@ -79,6 +81,7 @@ class Controller:
         self.metric = metric
         self.algorithm = algorithm.lower()
         self.parameter_names = parameter_names or []
+        self.objective_config = objective_config or parse_objective_config({"metric": metric})
         self.history = []  # list of Recommendation objects
         self._next_id = 0
 
@@ -156,7 +159,8 @@ class Controller:
 
         Args:
             rec_id: Recommendation ID (int).
-            metric_value: The metric value achieved (float).
+            metric_value: The metric value achieved. For multi-objective
+                sessions, pass a dict keyed by objective metric name.
             best_epoch: Best epoch number (optional).
             status: ``"success"`` or ``"failure"``.
         """
@@ -166,8 +170,30 @@ class Controller:
                 logger.warning("report_result: recommendation %s not found", rec_id)
                 return
 
-            rec.update_result(metric_value)
-            rec.update_status(status if status else JobStates.success)
+            rec_status = status if status else JobStates.success
+            objective_values = self.objective_config.coerce_values(metric_value)
+            try:
+                objective_score = self.objective_config.scalarize(objective_values)
+            except ValueError:
+                if rec_status in (JobStates.success, JobStates.done):
+                    raise
+                objective_score = 0.0
+
+            if self.objective_config.is_multi_objective and objective_values:
+                if all(
+                    name in objective_values
+                    for name in self.objective_config.metric_names
+                ):
+                    rec.update_objectives(objective_values, objective_score)
+                else:
+                    rec.update_result(objective_score)
+                    rec.objective_values = objective_values
+                    rec.objective_score = objective_score
+            else:
+                rec.update_result(objective_score)
+                rec.objective_values = objective_values
+                rec.objective_score = objective_score
+            rec.update_status(rec_status)
             if best_epoch is not None:
                 rec.best_epoch_number = best_epoch
 
@@ -176,8 +202,8 @@ class Controller:
             self.save_state()
 
         logger.info(
-            "Reported result for rec %d: metric=%.6f status=%s",
-            rec_id, metric_value, status,
+            "Reported result for rec %d: score=%.6f values=%s status=%s",
+            rec_id, rec.result, rec.objective_values, status,
         )
 
         self._update_wandb_table()
@@ -185,8 +211,8 @@ class Controller:
     def get_best(self):
         """Return the best Recommendation so far, or None.
 
-        Uses the convention that if the metric name contains ``"loss"`` then
-        lower is better; otherwise higher is better.
+        Uses explicit objective configuration when present; otherwise preserves
+        the legacy metric-name direction rule.
         """
         completed = [
             r for r in self.history
@@ -198,8 +224,7 @@ class Controller:
         if self.algorithm in _MULTI_FIDELITY_ALGORITHMS:
             completed = self._largest_budget_candidates(completed)
 
-        lower_is_better = "loss" in self.metric.lower()
-        if lower_is_better:
+        if self.objective_config.score_direction == "minimize":
             return min(completed, key=lambda r: r.result)
         return max(completed, key=lambda r: r.result)
 
@@ -214,15 +239,19 @@ class Controller:
             if r.status in (JobStates.success, JobStates.done, JobStates.failure, JobStates.error)
         ]
         best = self.get_best()
+        pareto_front = self.get_pareto_front()
 
         total = self._estimate_total()
 
         return {
             "completed": len(completed_recs),
             "total": total,
-            "best_metric": best.result if best else None,
+            "best_metric": best.primary_metric_value() if best else None,
+            "best_objective_score": best.objective_score if best else None,
             "best_rec_id": best.id if best else None,
             "algorithm": self.algorithm,
+            "objectives": self.objective_config.to_dict(),
+            "pareto_front_size": len(pareto_front),
         }
 
     def get_history(self):
@@ -246,7 +275,9 @@ class Controller:
                 "specs": r.specs,
                 "job_id": r.job_id,
                 "status": r.status,
-                "metric_value": r.result,
+                "metric_value": r.primary_metric_value(),
+                "objective_score": r.objective_score,
+                "objective_values": dict(r.objective_values),
                 "created_on": r.created_on,
                 "last_modified": r.last_modified,
             })
@@ -258,9 +289,12 @@ class Controller:
             "best": {
                 "rec_id": best.id if best else None,
                 "specs": best.specs if best else {},
-                "metric_value": best.result if best else None,
+                "metric_value": best.primary_metric_value() if best else None,
+                "objective_score": best.objective_score if best else None,
+                "objective_values": dict(best.objective_values) if best else {},
             },
             "recommendations": recs,
+            "pareto_front": self._serialize_pareto_front(),
             "active_rec_ids": active,
         }
 
@@ -337,6 +371,11 @@ class Controller:
             logger.info("WandB initialized with group: %s", group)
 
             columns = ["experiment_id", "job_id", "status", self.metric, "best_epoch_number"]
+            if self.objective_config.is_multi_objective:
+                columns = [
+                    "experiment_id", "job_id", "status", "objective_score",
+                    *self.objective_config.metric_names, "best_epoch_number",
+                ]
             columns.extend(self.parameter_names)
             self._wandb_table = wandb.Table(columns=columns)
 
@@ -355,11 +394,16 @@ class Controller:
             import wandb
 
             columns = ["experiment_id", "job_id", "status", self.metric, "best_epoch_number"]
+            if self.objective_config.is_multi_objective:
+                columns = [
+                    "experiment_id", "job_id", "status", "objective_score",
+                    *self.objective_config.metric_names, "best_epoch_number",
+                ]
             columns.extend(self.parameter_names)
             self._wandb_table = wandb.Table(columns=columns)
 
             for rec in self.history:
-                result_value = rec.result
+                result_value = rec.objective_score
                 if isinstance(result_value, float):
                     formatted = f"{result_value:.10f}".rstrip('0')
                     if formatted.endswith('.'):
@@ -370,9 +414,14 @@ class Controller:
                     rec.id,
                     rec.job_id or "",
                     rec.status,
-                    result_value,
-                    rec.best_epoch_number,
                 ]
+                if self.objective_config.is_multi_objective:
+                    row_data.append(result_value)
+                    for name in self.objective_config.metric_names:
+                        row_data.append(rec.objective_values.get(name, "N/A"))
+                    row_data.append(rec.best_epoch_number)
+                else:
+                    row_data.extend([rec.primary_metric_value(), rec.best_epoch_number])
                 for param_name in self.parameter_names:
                     value = rec.specs.get(param_name, "N/A")
                     row_data.append(value)
@@ -431,6 +480,7 @@ class Controller:
         algorithm,
         parameter_names=None,
         wandb_config=None,
+        objective_config=None,
     ):
         """Load controller from persisted state.
 
@@ -445,6 +495,7 @@ class Controller:
             algorithm=algorithm,
             parameter_names=parameter_names,
             wandb_config=wandb_config,
+            objective_config=objective_config,
         )
 
         saved = state_store.get_controller_info(context.id)
@@ -458,6 +509,15 @@ class Controller:
                 rec.job_id = rec_dict.get("job_id")
                 rec.status = rec_dict.get("status", JobStates.pending)
                 rec.result = float(rec_dict.get("result", 0.0))
+                rec.objective_values = {
+                    str(k): float(v)
+                    for k, v in rec_dict.get("objective_values", {}).items()
+                }
+                if not rec.objective_values:
+                    rec.objective_values = {metric: rec.result}
+                rec.objective_score = float(
+                    rec_dict.get("objective_score", rec.result)
+                )
                 rec.best_epoch_number = rec_dict.get("best_epoch_number", "")
                 rec.resume_from_job_id = rec_dict.get("resume_from_job_id")
                 rec.resume_from_epoch = rec_dict.get("resume_from_epoch")
@@ -521,6 +581,29 @@ class Controller:
         ]
         return largest_budget_recs or completed
 
+    def get_pareto_front(self):
+        """Return non-dominated successful recommendations for configured objectives."""
+        completed = [
+            r for r in self.history
+            if r.status in (JobStates.success, JobStates.done)
+        ]
+        if not self.objective_config.is_multi_objective:
+            return completed
+        return self.objective_config.pareto_front(completed)
+
+    def _serialize_pareto_front(self):
+        """Return JSON-safe Pareto-front records."""
+        return [
+            {
+                "rec_id": rec.id,
+                "specs": rec.specs,
+                "metric_value": rec.primary_metric_value(),
+                "objective_score": rec.objective_score,
+                "objective_values": dict(rec.objective_values),
+            }
+            for rec in self.get_pareto_front()
+        ]
+
     def _estimate_total(self):
         """Estimate total number of recommendations for progress reporting."""
         if self.algorithm in _MAX_REC_ALGORITHMS:
@@ -539,6 +622,8 @@ class Controller:
             "job_id": rec.job_id,
             "status": rec.status,
             "result": rec.result,
+            "objective_score": rec.objective_score,
+            "objective_values": dict(rec.objective_values),
             "best_epoch_number": rec.best_epoch_number,
             "metric": rec.metric,
             "resume_from_job_id": rec.resume_from_job_id,
