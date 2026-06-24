@@ -1,17 +1,5 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Default evaluation config file for Cosmos-RL"""
 
 from typing import Optional, List
@@ -61,6 +49,20 @@ class MetricsConfig:
         value="en",
         display_name="BERTScore language",
         description="Language for BERTScore computation"
+    )
+    bertscore_device: Optional[str] = STR_FIELD(
+        default_value="cpu",
+        value="cpu",
+        display_name="BERTScore device",
+        description="Device for BERTScore computation (use cpu to avoid competing with the eval model for GPU memory)"
+    )
+    bertscore_batch_size: Optional[int] = INT_FIELD(
+        default_value=1,
+        value=1,
+        valid_min=1,
+        valid_max=1024,
+        display_name="BERTScore batch size",
+        description="Optional BERTScore batch size; lower values reduce peak memory"
     )
 
 

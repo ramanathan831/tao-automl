@@ -1,17 +1,5 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """CLIP experiment configuration."""
 
 from dataclasses import dataclass
@@ -42,15 +30,13 @@ class CLIPModelConfig:
     """CLIP model configuration."""
 
     type: str = STR_FIELD(
-        value="siglip2-so400m-patch16-256",
-        default_value="siglip2-so400m-patch16-256",
+        value="ViT-L-14-SigLIP-CLIPA-224",
+        default_value="ViT-L-14-SigLIP-CLIPA-224",
         description="CLIP model type. "
                     "C-RADIO: c-radio_v3-h, c-radio_v3-l, c-radio_v3-b, c-radio_v3-g; "
-                    "SigLIP2: siglip2-so400m-patch16-naflex (NaFlex), siglip2-so400m-patch14-224, "
-                    "siglip2-so400m-patch14-384, siglip2-so400m-patch16-256, "
-                    "siglip2-so400m-patch16-384, siglip2-so400m-patch16-512; "
                     "OpenCLIP: ViT-L-14-SigLIP-CLIPA-224, ViT-L-14-SigLIP-CLIPA-336, "
-                    "ViT-H-14-SigLIP-CLIPA-224.",
+                    "ViT-H-14-SigLIP-CLIPA-224, ViT-H-14-SigLIP-CLIPA-336, "
+                    "ViT-H-14-SigLIP-CLIPA-574.",
         display_name="Model Type",
     )
     adaptor_name: Optional[str] = STR_FIELD(
@@ -74,8 +60,8 @@ class CLIPModelConfig:
         display_name="Freeze Text Encoder",
     )
     image_size: int = INT_FIELD(
-        value=256,
-        default_value=256,
+        value=224,
+        default_value=224,
         description="Input image resolution for training transforms. "
                     "Common values: 224 (RADIO/OpenCLIP), 384 (SigLIP2-g), "
                     "256 (SigLIP2-so400m). "

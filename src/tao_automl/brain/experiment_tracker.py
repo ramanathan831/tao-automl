@@ -1,17 +1,5 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Experiment Tracker with keep/discard reasoning.
 
 Tracks all experiments with autoresearch-style keep/discard decisions,
@@ -58,6 +46,7 @@ class ExperimentEntry:
         """Serialize entry to dict."""
         return {
             "experiment_id": self.experiment_id,
+            "spec": self.spec,
             "modifications": self.modifications,
             "metric": self.metric,
             "status": self.status,
@@ -147,13 +136,14 @@ class ExperimentTracker:
             is_better = self._is_improvement(metric)
             entry.decision = "keep" if is_better else "discard"
             if is_better:
+                previous_best = self.best_metric
                 self.best_spec = deepcopy(spec)
                 self.best_metric = metric
                 self.best_experiment_id = entry.experiment_id
                 logger.info(
                     "Experiment %d: KEEP (metric=%.4f, improved from %.4f)",
                     entry.experiment_id, metric,
-                    self.best_metric if self.best_metric else 0.0,
+                    previous_best if previous_best is not None else 0.0,
                 )
             else:
                 logger.info(
@@ -215,6 +205,7 @@ class ExperimentTracker:
         """Serialize tracker state for persistence."""
         return {
             "history": [e.to_dict() for e in self.history],
+            "best_spec": self.best_spec,
             "best_metric": self.best_metric,
             "best_experiment_id": self.best_experiment_id,
             "metric_direction": self.metric_direction,
@@ -225,6 +216,7 @@ class ExperimentTracker:
     def from_dict(cls, data: Dict[str, Any]) -> "ExperimentTracker":
         """Deserialize tracker state."""
         tracker = cls(metric_direction=data.get("metric_direction", "maximize"))
+        tracker.best_spec = data.get("best_spec")
         tracker.best_metric = data.get("best_metric")
         tracker.best_experiment_id = data.get("best_experiment_id")
         tracker._next_id = data.get("next_id", 0)

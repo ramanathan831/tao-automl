@@ -1,18 +1,7 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """BOHB (Bayesian Optimization and HyperBand) AutoML algorithm modules"""
+import copy
 import numpy as np
 import math
 import logging
@@ -498,6 +487,9 @@ class BOHB(AutoMLAlgorithmBase):
             suggestions = self._tpe_suggest()
             specs = self._generate_parameters_from_suggestions(suggestions)
             self.epoch_number = self.ri[self.bracket][self.sh_iter] * self.epoch_multiplier
+            final_epoch = self.ri[self.bracket][-1] * self.epoch_multiplier
+            self.override_num_epochs(final_epoch)
+            specs.update(self._epoch_spec_overrides(self.epoch_number))
             to_return = specs
         else:
             lower = -1 * self.ni.get(self.bracket, [0])[0]
@@ -519,10 +511,19 @@ class BOHB(AutoMLAlgorithmBase):
                     )[0:self.ni[self.bracket][self.sh_iter]]
 
             self.epoch_number = self.ri[self.bracket][self.sh_iter] * self.epoch_multiplier
+            final_epoch = self.ri[self.bracket][-1] * self.epoch_multiplier
+            resume_from_epoch = (
+                self.ri[self.bracket][self.sh_iter - 1] * self.epoch_multiplier
+                if self.sh_iter > 0 else 0
+            )
+            self.override_num_epochs(final_epoch)
+            specs = copy.deepcopy(self.experiments_considered[self.expt_iter].specs)
+            specs.update(self._epoch_spec_overrides(self.epoch_number))
             resumerec = ResumeRecommendation(
                 self.experiments_considered[self.expt_iter].id,
-                self.experiments_considered[self.expt_iter].specs,
-                self.experiments_considered[self.expt_iter].job_id
+                specs,
+                self.experiments_considered[self.expt_iter].job_id,
+                resume_from_epoch=resume_from_epoch,
             )
             to_return = resumerec
         self.expt_iter += 1

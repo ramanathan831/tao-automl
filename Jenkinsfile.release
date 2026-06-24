@@ -200,8 +200,41 @@ pipeline {
                                             skipProdPromote: params.SKIP_PROD_PROMOTE
                                         )
                                         if (skipResult.shouldSkip) {
-                                            echo "⏭ Skipping build — reusing #${skipResult.previousBuildNumber}"
-                                            env.SKIP_BUILD = 'true'
+                                            // Additional check on top of detectSkipBuild's
+                                            // version + RC + SHA match: the published wheel pins
+                                            // nvidia-tao-sdk[all]==${TAO_SDK_VERSION}, so reusing
+                                            // a build that pinned a different SDK would publish
+                                            // a stale pin. Read the prior build's archived
+                                            // release_metadata.json and compare.
+                                            def prevSdkVersion = ''
+                                            try {
+                                                withCredentials([usernamePassword(
+                                                    credentialsId: TaoConfig.credentials.JENKINS_API_TOKEN,
+                                                    usernameVariable: 'JENKINS_USER',
+                                                    passwordVariable: 'JENKINS_TOKEN'
+                                                )]) {
+                                                    def prevMetaUrl = "${env.JOB_URL}${skipResult.previousBuildNumber}/artifact/release_metadata.json"
+                                                    sh """
+                                                        curl -fsS --user "\${JENKINS_USER}:\${JENKINS_TOKEN}" \
+                                                            "${prevMetaUrl}" -o prev_release_metadata.json
+                                                    """
+                                                    def prevMeta = readJSON file: 'prev_release_metadata.json'
+                                                    prevSdkVersion = prevMeta?.build_info?.sdk_pinned_version ?: ''
+                                                }
+                                            } catch (Exception e) {
+                                                echo "⚠ Could not read previous build's sdk_pinned_version (${e.message}); honoring upstream skip decision"
+                                            }
+
+                                            if (prevSdkVersion && prevSdkVersion != env.TAO_SDK_VERSION) {
+                                                echo "⚠ Previous build #${skipResult.previousBuildNumber} pinned " +
+                                                     "TAO_SDK_VERSION=${prevSdkVersion}, current build requests " +
+                                                     "${env.TAO_SDK_VERSION} — forcing rebuild."
+                                                env.SKIP_BUILD = 'false'
+                                            } else {
+                                                echo "⏭ Skipping build — reusing #${skipResult.previousBuildNumber}" +
+                                                     (prevSdkVersion ? " (TAO_SDK_VERSION matches: ${prevSdkVersion})" : "")
+                                                env.SKIP_BUILD = 'true'
+                                            }
                                         } else {
                                             echo "✓ Proceeding with full build"
                                             env.SKIP_BUILD = 'false'
@@ -415,12 +448,21 @@ pipeline {
                                     script {
                                         sh "rm -rf dist/*.whl || true"
 
-                                        // Re-patch to FINAL_VER and rebuild
+                                        // Re-patch to FINAL_VER and rebuild.
+                                        // Also re-pin nvidia-tao-sdk[all] from the RC version
+                                        // (==${TAO_SDK_VERSION}, set by the earlier install step)
+                                        // to ==${FINAL_VER}, so the published final wheel ships
+                                        // with the final SDK pin (e.g. ==7.0.0) instead of the RC
+                                        // pin (e.g. ==7.0.0rc21).
                                         sh """
                                             sed -i 's/^version = \\".*\\"/version = \\"${FINAL_VER}\\"/' pyproject.toml
                                             sed -i 's/__version__ = \\".*\\"/__version__ = \\"${FINAL_VER}\\"/' src/tao_automl/__init__.py
+                                            sed -i.bak -E \
+                                                "s|\\"nvidia-tao-sdk[^\\"]*\\"|\\"nvidia-tao-sdk[all]==${FINAL_VER}\\"|" \
+                                                pyproject.toml
                                             grep '^version' pyproject.toml
                                             grep '__version__' src/tao_automl/__init__.py
+                                            grep nvidia-tao-sdk pyproject.toml
                                             python -m build --wheel
                                             ls -la dist/
                                         """
@@ -486,7 +528,12 @@ pipeline {
                                             componentName: COMPONENT_NAME,
                                             wheelInstallLocation: env.RC_WHEEL_INSTALL_LOC ?: '',
                                             finalWheelInstallLocation: env.FINAL_WHEEL_INSTALL_LOC ?: '',
-                                            pythonVersion: env.PYTHON_VERSION ?: 'unknown'
+                                            pythonVersion: env.PYTHON_VERSION ?: 'unknown',
+                                            additionalMetadata: [
+                                                build_info: [
+                                                    sdk_pinned_version: env.TAO_SDK_VERSION
+                                                ]
+                                            ]
                                         )
                                     }
                                 }

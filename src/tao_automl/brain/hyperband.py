@@ -1,18 +1,7 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Hyperband AutoML algorithm modules"""
+import copy
 import numpy as np
 import math
 import logging
@@ -144,6 +133,36 @@ class HyperBand(AutoMLAlgorithmBase):
             elif key1 in ("num_epochs"):
                 spec[key1] = num_epochs
         self.state_store.save_job_specs(self.context.id, spec)
+
+    def _epoch_spec_overrides(self, num_epochs):
+        """Return dotted spec overrides for epoch-like train keys.
+
+        Hyperband controls the resource budget per rung. Expose that budget on
+        each recommendation so runners that merge ``rec.specs`` with a static
+        base spec actually launch the requested epoch count.
+        """
+        spec = self.state_store.get_job_specs(self.context.id) or {}
+        epoch_names = {"num_epochs", "epochs", "n_epochs", "max_iters", "epoch"}
+        training_sections = {"training_config", "train_config", "train"}
+        overrides = {}
+
+        def walk(node, prefix="", in_training=False):
+            if not isinstance(node, dict):
+                return
+            for key, value in node.items():
+                full = f"{prefix}.{key}" if prefix else str(key)
+                child_in_training = in_training or key in training_sections
+                if (child_in_training and key in epoch_names) or (
+                    key == "max_epochs" and "runner" in prefix.split(".")
+                ):
+                    overrides[full] = num_epochs
+                    continue
+                walk(value, full, child_in_training)
+
+        walk(spec)
+        if "num_epochs" in spec:
+            overrides["num_epochs"] = num_epochs
+        return overrides
 
     def generate_automl_param_rec_value(self, parameter_config):
         """Generate a random value for the parameter passed"""
@@ -355,6 +374,7 @@ class HyperBand(AutoMLAlgorithmBase):
             self.epoch_number = self.ri[self.bracket][self.sh_iter] * self.epoch_multiplier
             final_epoch = self.ri[self.bracket][-1] * self.epoch_multiplier
             self.override_num_epochs(final_epoch)
+            specs.update(self._epoch_spec_overrides(self.epoch_number))
             logger.info(
                 f"Hyperband: New experiment in bracket {self.bracket}, SH iter {self.sh_iter}, "
                 f"will_pause_at_epoch={self.epoch_number}, spec_total_epochs={final_epoch}"
@@ -395,10 +415,13 @@ class HyperBand(AutoMLAlgorithmBase):
                 f"will_run_to_epoch={self.epoch_number}, spec_total_epochs={final_epoch}, "
                 f"resume_from={resume_from_epoch}"
             )
+            specs = copy.deepcopy(self.experiments_considered[self.expt_iter].specs)
+            specs.update(self._epoch_spec_overrides(self.epoch_number))
             resumerec = ResumeRecommendation(
                 self.experiments_considered[self.expt_iter].id,
-                self.experiments_considered[self.expt_iter].specs,
-                self.experiments_considered[self.expt_iter].job_id
+                specs,
+                self.experiments_considered[self.expt_iter].job_id,
+                resume_from_epoch=resume_from_epoch,
             )
             to_return = resumerec
         self.expt_iter += 1

@@ -1,17 +1,5 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """HyperBand with Early Stopping (Learning Curve Prediction) AutoML algorithm modules"""
 import numpy as np
 import logging
@@ -27,9 +15,12 @@ class HyperBandES(HyperBand):
     """HyperBand with Early Stopping via Learning Curve Prediction"""
 
     def __init__(self, context, state_store, network, parameters, max_epochs, reduction_factor, epoch_multiplier,
-                 early_stop_threshold=0.8, min_early_stop_epochs=3):
+                 early_stop_threshold=0.8, min_early_stop_epochs=3, metric="loss"):
         """Initialize the HyperBand ES algorithm class"""
-        super().__init__(context, state_store, network, parameters, max_epochs, reduction_factor, epoch_multiplier)
+        super().__init__(
+            context, state_store, network, parameters, max_epochs,
+            reduction_factor, epoch_multiplier, metric=metric,
+        )
 
         self.min_epochs_for_prediction = int(min_early_stop_epochs)
         self.confidence_threshold = float(early_stop_threshold)
@@ -39,7 +30,7 @@ class HyperBandES(HyperBand):
 
         logger.info(
             f"HyperBandES initialized with early_stop_threshold={early_stop_threshold}, "
-            f"min_early_stop_epochs={min_early_stop_epochs}"
+            f"min_early_stop_epochs={min_early_stop_epochs}, metric={metric}"
         )
 
     @staticmethod
@@ -149,18 +140,24 @@ class HyperBandES(HyperBand):
 
     @staticmethod
     def load_state(context, state_store, network, parameters, max_epochs, reduction_factor, epoch_multiplier,
-                   metric="loss", min_epochs_for_prediction=3, confidence_threshold=0.8):
+                   early_stop_threshold=0.8, min_early_stop_epochs=3, metric="loss"):
         """Load the HyperBandES algorithm related variables from brain metadata"""
         json_loaded = state_store.get_brain_info(context.id)
         if not json_loaded:
             return HyperBandES(
-                context, state_store, network, parameters, max_epochs, reduction_factor, epoch_multiplier,
-                min_epochs_for_prediction, confidence_threshold
+                context, state_store, network, parameters, max_epochs,
+                reduction_factor, epoch_multiplier,
+                early_stop_threshold=early_stop_threshold,
+                min_early_stop_epochs=min_early_stop_epochs,
+                metric=metric,
             )
 
         brain = HyperBandES(
-            context, state_store, network, parameters, max_epochs, reduction_factor, epoch_multiplier,
-            min_epochs_for_prediction, confidence_threshold
+            context, state_store, network, parameters, max_epochs,
+            reduction_factor, epoch_multiplier,
+            early_stop_threshold=early_stop_threshold,
+            min_early_stop_epochs=min_early_stop_epochs,
+            metric=metric,
         )
         brain.bracket = json_loaded["bracket"]
         brain.sh_iter = json_loaded["sh_iter"]
