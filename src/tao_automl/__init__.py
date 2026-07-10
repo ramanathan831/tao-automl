@@ -195,6 +195,7 @@ class AutoML:
         custom_param_ranges=None,
         resume=False,
         wandb_config=None,
+        search_schema=None,
     ):
         """
         Args:
@@ -216,6 +217,11 @@ class AutoML:
                 ``enabled`` (bool), ``project``, ``entity``, ``api_key``,
                 ``group``. Pass ``{"enabled": True}`` to activate; the
                 API key can also come from ``WANDB_API_KEY`` env var.
+            search_schema: Optional JSON schema describing the search space.
+                When omitted, the schema is generated from the built-in TAO
+                configuration module for ``network``. Supplying a schema lets
+                external model scripts define searchable parameters without a
+                corresponding ``tao_automl.config.<network>`` package.
         """
         # Lazy imports to avoid pulling in heavy deps (requests, omegaconf)
         # at package import time.
@@ -264,6 +270,7 @@ class AutoML:
             action="train",
             train_specs=train_specs,
             automl_hyperparameters=automl_hyperparameters,
+            schema=search_schema,
         )
 
         if not param_records or param_records == [{}]:
