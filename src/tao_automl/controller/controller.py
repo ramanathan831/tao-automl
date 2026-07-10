@@ -278,6 +278,8 @@ class Controller:
                 "metric_value": r.primary_metric_value(),
                 "objective_score": r.objective_score,
                 "objective_values": dict(r.objective_values),
+                "failure_reason": getattr(r, "failure_reason", None),
+                "adjustments": getattr(r, "adjustments", []),
                 "created_on": r.created_on,
                 "last_modified": r.last_modified,
             })
@@ -630,6 +632,8 @@ class Controller:
             "resume_from_epoch": rec.resume_from_epoch,
             "resume_from_step": rec.resume_from_step,
             "early_stop_epoch": rec.early_stop_epoch,
+            "failure_reason": getattr(rec, "failure_reason", None),
+            "adjustments": getattr(rec, "adjustments", []),
             "created_on": rec.created_on,
             "last_modified": rec.last_modified,
         }

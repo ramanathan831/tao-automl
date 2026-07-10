@@ -268,7 +268,7 @@ def test_promoted_metric_missing_checkpoint_carries_forward_prior_metric(
             return self.rec if self.rec.status == JobStates.success else None
 
         def get_progress(self):
-            return {"completed": 1, "best_metric": self.rec.result}
+            return {"completed": int(self.complete), "best_metric": self.rec.result}
 
         def get_history(self):
             return [self.rec]
@@ -295,6 +295,238 @@ def test_promoted_metric_missing_checkpoint_carries_forward_prior_metric(
 
     assert result["best"]["metric_value"] == 0.42
     assert result["history"][0]["status"] == JobStates.success
+
+
+def test_run_reports_baseline_metric_and_comparison(tmp_path, monkeypatch):
+    from tao_automl.runner import AutoMLRunner
+    from tao_automl.types import JobStates, Recommendation
+
+    skill_dir = _write_fake_skill(tmp_path)
+
+    class FakeAutoML:
+        def __init__(self, *args, **kwargs):
+            self.rec = Recommendation(0, {"train.num_epochs": 2}, "accuracy")
+            self.complete = False
+
+        def is_complete(self):
+            return self.complete
+
+        def next_recommendation(self):
+            return [self.rec]
+
+        def report_result(self, rec_id, metric_value, best_epoch=None, status="success"):
+            self.rec.update_result(metric_value)
+            self.rec.update_status(status)
+            self.complete = True
+
+        def get_best(self):
+            return self.rec if self.rec.status == JobStates.success else None
+
+        def get_progress(self):
+            return {"completed": int(self.complete), "best_metric": self.rec.result}
+
+        def get_history(self):
+            return [self.rec]
+
+    def fake_run_one_job(self, *args, **kwargs):
+        return 0.62, "success"
+
+    monkeypatch.setattr("tao_automl.AutoML", FakeAutoML)
+    monkeypatch.setattr(AutoMLRunner, "_run_one_job", fake_run_one_job)
+
+    runner = AutoMLRunner(sdk=MagicMock(), skill_dir=skill_dir, action="train")
+    result = runner.run(
+        image="nvcr.io/test:1",
+        automl_settings={
+            "algorithm": "bayesian",
+            "metric": "accuracy",
+            "direction": "maximize",
+            "automl_max_recommendations": 1,
+        },
+        baseline_fn=lambda specs: 0.5,
+        workspace_path=str(tmp_path / "workspace"),
+    )
+
+    assert result["baseline"]["status"] == "measured"
+    assert result["baseline"]["metric_value"] == 0.5
+    assert result["baseline"]["comparison_to_best"]["delta"] == pytest.approx(0.12)
+    assert result["baseline"]["comparison_to_best"]["improved"] is True
+
+
+def test_run_reports_runner_owned_final_evaluation(tmp_path, monkeypatch):
+    from tao_automl.runner import AutoMLRunner
+    from tao_automl.types import JobStates, Recommendation
+
+    skill_dir = _write_fake_skill(tmp_path)
+    final_eval_calls = []
+    final_record_path = tmp_path / "workspace" / "evaluations" / "best_automl.json"
+
+    class FakeAutoML:
+        def __init__(self, *args, **kwargs):
+            self.rec = Recommendation(0, {"train.num_epochs": 2}, "accuracy")
+            self.complete = False
+
+        def is_complete(self):
+            return self.complete
+
+        def next_recommendation(self):
+            return [self.rec]
+
+        def report_result(self, rec_id, metric_value, best_epoch=None, status="success"):
+            self.rec.update_result(metric_value)
+            self.rec.update_status(status)
+            self.complete = True
+
+        def get_best(self):
+            return self.rec if self.rec.status == JobStates.success else None
+
+        def get_progress(self):
+            return {"completed": int(self.complete), "best_metric": self.rec.result}
+
+        def get_history(self):
+            return [self.rec]
+
+    def fake_run_one_job(self, *args, **kwargs):
+        kwargs["rec"].assign_job_id("train-job-0")
+        return 0.62, "success"
+
+    def final_eval_fn(best_rec, train_job_id):
+        final_eval_calls.append((best_rec.id, train_job_id))
+        return {"metric_value": 0.64, "record_path": str(final_record_path)}
+
+    monkeypatch.setattr("tao_automl.AutoML", FakeAutoML)
+    monkeypatch.setattr(AutoMLRunner, "_run_one_job", fake_run_one_job)
+
+    runner = AutoMLRunner(sdk=MagicMock(), skill_dir=skill_dir, action="train")
+    result = runner.run(
+        image="nvcr.io/test:1",
+        automl_settings={
+            "algorithm": "bayesian",
+            "metric": "accuracy",
+            "direction": "maximize",
+            "automl_max_recommendations": 1,
+            "run_final_evaluation": True,
+        },
+        baseline_fn=lambda specs: 0.5,
+        final_eval_fn=final_eval_fn,
+        workspace_path=str(tmp_path / "workspace"),
+    )
+
+    assert final_eval_calls == [(0, "train-job-0")]
+    assert result["best"]["metric_value"] == 0.62
+    assert result["final_evaluation"]["status"] == "measured"
+    assert result["final_evaluation"]["source"] == "final_eval_fn"
+    assert result["final_evaluation"]["metric_value"] == 0.64
+    assert result["final_evaluation"]["record_path"] == str(final_record_path)
+    assert result["final_evaluation"]["comparison_to_baseline"]["delta"] == pytest.approx(0.14)
+    assert result["final_evaluation"]["comparison_to_baseline"]["improved"] is True
+
+
+def test_effective_batch_is_capped_before_launch(tmp_path, monkeypatch):
+    from tao_automl.runner import AutoMLRunner
+    from tao_automl.types import JobStates, Recommendation
+
+    skill_dir = _write_fake_skill(tmp_path)
+    captured_specs = {}
+
+    class FakeAutoML:
+        def __init__(self, *args, **kwargs):
+            self.rec = Recommendation(
+                0,
+                {
+                    "train.train_batch_per_replica": 8,
+                    "policy.parallelism.dp_shard_size": 8,
+                },
+                "accuracy",
+            )
+            self.complete = False
+
+        def is_complete(self):
+            return self.complete
+
+        def next_recommendation(self):
+            return [self.rec]
+
+        def report_result(self, rec_id, metric_value, best_epoch=None, status="success"):
+            self.rec.update_result(metric_value)
+            self.rec.update_status(status)
+            self.complete = True
+
+        def get_best(self):
+            return self.rec if self.rec.status == JobStates.success else None
+
+        def get_progress(self):
+            return {"completed": int(self.complete), "best_metric": self.rec.result}
+
+        def get_history(self):
+            return [self.rec]
+
+    def fake_run_one_job(self, *args, **kwargs):
+        captured_specs.update(kwargs["specs"])
+        return 0.6, "success"
+
+    monkeypatch.setattr("tao_automl.AutoML", FakeAutoML)
+    monkeypatch.setattr(AutoMLRunner, "_run_one_job", fake_run_one_job)
+
+    runner = AutoMLRunner(sdk=MagicMock(), skill_dir=skill_dir, action="train")
+    result = runner.run(
+        image="nvcr.io/test:1",
+        automl_settings={
+            "algorithm": "bayesian",
+            "metric": "accuracy",
+            "direction": "maximize",
+            "automl_max_recommendations": 1,
+            "train_sample_count": 31,
+        },
+        workspace_path=str(tmp_path / "workspace"),
+    )
+
+    assert captured_specs["train"]["train_batch_per_replica"] == 3
+    assert result["history"][0]["adjustments"][0]["type"] == "effective_batch_cap"
+    assert result["history"][0]["adjustments"][0]["from"] == 8
+    assert result["history"][0]["adjustments"][0]["to"] == 3
+
+
+def test_effective_batch_reports_invalid_when_no_rank_has_samples():
+    from tao_automl.runner import _maybe_cap_effective_batch
+    from tao_automl.types import Recommendation
+
+    rec = Recommendation(
+        0,
+        {
+            "train.train_batch_per_replica": 8,
+            "policy.parallelism.dp_shard_size": 8,
+        },
+        "loss",
+    )
+    specs = {
+        "train": {"train_batch_per_replica": 8},
+        "policy": {"parallelism": {"dp_shard_size": 8}},
+    }
+
+    reason = _maybe_cap_effective_batch(
+        specs, rec, {"train_sample_count": 2}, {}
+    )
+
+    assert "invalid_configuration" in reason
+    assert rec.failure_reason == reason
+    assert specs["train"]["train_batch_per_replica"] == 8
+
+
+def test_validate_skill_runtime_probes_schema_import_path(tmp_path):
+    from tao_automl.runner import validate_skill_runtime
+
+    skill_dir = _write_fake_skill(tmp_path)
+    info_path = skill_dir / "references/skill_info.yaml"
+    info_path.write_text(
+        info_path.read_text().replace("network_arch: fake-net", "network_arch: cosmos-rl")
+    )
+
+    result = validate_skill_runtime(skill_dir, action="train")
+
+    assert result["network_arch"] == "cosmos-rl"
+    assert result["action"] == "train"
+    assert result["parameter_count"] > 0
 
 
 # ---------------------------------------------------------------------------
