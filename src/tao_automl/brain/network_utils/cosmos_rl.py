@@ -317,7 +317,20 @@ def apply_optm_lr_logic(parameter_name, lr_value, v_max, default_train_spec, par
     if not is_full_sft_training(default_train_spec):
         return lr_value
 
-    # 80% chance to use multi-part learning rates for vision-language models
+    valid_min_list, valid_max_list, _ = get_optm_lr_range_override(default_train_spec)
+    existing_lr = default_train_spec.get("train", {}).get("optm_lr")
+    has_explicit_multi_part_lr = (
+        valid_min_list is not None
+        and valid_max_list is not None
+    ) or isinstance(existing_lr, list)
+    if not has_explicit_multi_part_lr:
+        logger.info(
+            "Keeping scalar optm_lr for Full SFT because no explicit per-part "
+            "LR bounds or existing LR list are configured."
+        )
+        return lr_value
+
+    # 50% chance to use multi-part learning rates for vision-language models
     multi_lr_chance = np.random.random()
     logger.info(f"Multi-part learning rates chance: {multi_lr_chance}")
     if multi_lr_chance < 0.5:

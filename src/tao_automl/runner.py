@@ -323,6 +323,8 @@ def _metric_aliases(metric_name: str) -> list[str]:
         aliases.append("train_loss_epoch")
     if normalized in {"avg_loss", "val_avg_loss"}:
         aliases.append("avg_loss")
+    if normalized in {"miou", "val_miou", "mean_iou", "val_mean_iou"}:
+        aliases.extend(["mIoU", "val_mIoU", "Validation mIoU", "mean_iou"])
     seen = set()
     return [alias for alias in aliases if not (alias in seen or seen.add(alias))]
 

@@ -165,6 +165,17 @@ def test_extract_metric_reads_dino_message_only_status(tmp_path):
     assert _extract_metric_from_status_file(status_path, "val_mAP50") == pytest.approx(0.34)
 
 
+def test_extract_metric_reads_segmentation_miou_message_only_status(tmp_path):
+    from tao_automl.runner import _extract_metric_from_status_file
+
+    status_path = tmp_path / "status.json"
+    status_path.write_text(
+        '{"status":"RUNNING","message":"\\n Validation mIoU : 0.93864\\n"}\n'
+    )
+
+    assert _extract_metric_from_status_file(status_path, "val_miou") == pytest.approx(0.93864)
+
+
 def test_status_payload_treats_reached_budget_as_training_complete():
     from tao_automl.runner import _status_payload_has_training_complete
 
