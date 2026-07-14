@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from tao_automl.objectives import is_latency_metric, parse_objective_config
 from tao_sdk.checkpoints import (
     build_checkpoint_candidate,
     checkpoint_epoch as sdk_checkpoint_epoch,
@@ -322,6 +323,50 @@ def _scan_terminal_logs(
     return cached_metric, cached_exec_status, context
 
 
+def _scan_terminal_metric_values(
+    sdk,
+    job_id: str,
+    metric_names: list[str],
+    extract_fn,
+    cached_metrics: dict[str, float],
+    cached_exec_status: str | None,
+) -> tuple[dict[str, float], str | None, str]:
+    """Extract terminal signals for one or more objective metrics."""
+    overlap = ""
+    context = ""
+    latest_explicit_status = None
+    cleanup_failure_seen = False
+    hard_failure_seen = False
+    for chunk in _iter_terminal_log_chunks(sdk, job_id):
+        if not isinstance(chunk, str) or not chunk:
+            continue
+        scan_text = overlap + chunk
+        try:
+            values = _extract_metric_values(scan_text, metric_names, extract_fn)
+        except Exception as exc:
+            logger.warning("metric_extractor raised for job %s: %s", job_id, exc)
+            values = {}
+        cached_metrics.update(values)
+
+        explicit_status = _latest_explicit_execution_status(scan_text)
+        if explicit_status is not None:
+            latest_explicit_status = explicit_status
+        cleanup_failure_seen = cleanup_failure_seen or any(
+            pattern in scan_text for pattern in _CLEANUP_FATAL_PATTERNS
+        )
+        hard_failure_seen = hard_failure_seen or _has_hard_failure_pattern(scan_text)
+
+        context = (context + chunk)[-_TERMINAL_LOG_CONTEXT_CHARS:]
+        overlap = scan_text[-_TERMINAL_LOG_OVERLAP_CHARS:]
+    if latest_explicit_status is not None:
+        cached_exec_status = latest_explicit_status
+    elif hard_failure_seen or (
+        cleanup_failure_seen and metric_names[0] not in cached_metrics
+    ):
+        cached_exec_status = "FAIL"
+    return cached_metrics, cached_exec_status, context
+
+
 _COSMOS_RL_SFT_VAL_RE = re.compile(
     r'\[SFT\]\s+Validation loss:\s*([0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)',
     re.IGNORECASE,
@@ -481,6 +526,21 @@ def _metric_aliases(metric_name: str) -> list[str]:
         aliases.append("train_loss_epoch")
     if normalized in {"avg_loss", "val_avg_loss"}:
         aliases.append("avg_loss")
+    if is_latency_metric(metric_name):
+        aliases.extend([
+            "latency",
+            "latency_ms",
+            "inference_latency",
+            "inference_latency_ms",
+            "avg_latency",
+            "avg_latency_ms",
+            "average_latency",
+            "average_latency_ms",
+            "runtime",
+            "runtime_ms",
+            "duration",
+            "duration_ms",
+        ])
     seen = set()
     return [alias for alias in aliases if not (alias in seen or seen.add(alias))]
 
@@ -535,12 +595,13 @@ def _extract_metric_from_best_score_payload(
 
     aliases = set(_metric_aliases(metric_name))
     aliases.update(alias.replace("/", "_") for alias in list(aliases))
+    requested_aliases = set(aliases)
     metric_label = data.get("metric")
     if isinstance(metric_label, str):
         aliases.add(metric_label)
         aliases.add(metric_label.replace("/", "_"))
 
-    for key in ("best_score", "best_metric", "metric_value", "score", "value"):
+    for key in aliases:
         if key not in data:
             continue
         try:
@@ -550,7 +611,17 @@ def _extract_metric_from_best_score_payload(
         if value == value:
             return value
 
-    for key in aliases:
+    if is_latency_metric(metric_name):
+        if not isinstance(metric_label, str):
+            return None
+        if (
+            metric_label not in requested_aliases
+            and metric_label.replace("/", "_") not in requested_aliases
+            and not is_latency_metric(metric_label)
+        ):
+            return None
+
+    for key in ("best_score", "best_metric", "metric_value", "score", "value"):
         if key not in data:
             continue
         try:
@@ -715,6 +786,87 @@ def _recover_metric_from_artifacts(
     if local_metric is not None:
         return local_metric
     return _extract_metric_from_sdk_results(sdk, job_id, metric_name)
+
+
+def _extract_metric_values(
+    logs: str,
+    metric_names: list[str],
+    extract_fn,
+) -> dict[str, float]:
+    """Extract all requested objective metrics from a log snapshot."""
+    values = {}
+    for name in metric_names:
+        try:
+            value = extract_fn(logs, name)
+        except Exception:
+            raise
+        if value is not None:
+            values[name] = float(value)
+    return values
+
+
+def _recover_metric_values_from_artifacts(
+    sdk,
+    job_id: str,
+    metric_names: list[str],
+    platform_kwargs: dict | None,
+) -> dict[str, float]:
+    """Recover all requested objective metrics from result artifacts."""
+    values = {}
+    for name in metric_names:
+        metric = _recover_metric_from_artifacts(
+            sdk, job_id, name, platform_kwargs
+        )
+        if metric is not None:
+            values[name] = float(metric)
+    return values
+
+
+def _metric_payload_from_values(
+    values: dict[str, float],
+    metric_name: str,
+    metric_names: list[str],
+):
+    """Return a legacy scalar for one metric or a dict for objectives."""
+    if len(metric_names) == 1:
+        return values.get(metric_name)
+    missing = [name for name in metric_names if name not in values]
+    if missing:
+        return None
+    return {name: values[name] for name in metric_names}
+
+
+def _metric_payload_primary(payload, metric_name: str):
+    if isinstance(payload, dict):
+        return payload.get(metric_name)
+    return payload
+
+
+def _recommendation_primary_metric(rec, metric_name: str):
+    if rec is None:
+        return None
+    getter = getattr(rec, "primary_metric_value", None)
+    if callable(getter):
+        return getter()
+    objective_values = getattr(rec, "objective_values", None)
+    if isinstance(objective_values, dict) and metric_name in objective_values:
+        return objective_values[metric_name]
+    return _metric_payload_primary(getattr(rec, "result", None), metric_name)
+
+
+def _recommendation_objective_values(rec) -> dict:
+    objective_values = getattr(rec, "objective_values", None)
+    if isinstance(objective_values, dict):
+        return dict(objective_values)
+    return {}
+
+
+def _format_metric_payload(payload) -> str:
+    if payload is None:
+        return "None"
+    if isinstance(payload, dict):
+        return json.dumps(payload, sort_keys=True)
+    return f"{float(payload):.6f}"
 
 
 def _uri_to_local_path(uri: str) -> Path | None:
@@ -1621,6 +1773,8 @@ class AutoMLRunner:
         from tao_automl import AutoML
 
         automl_settings = automl_settings or {"algorithm": "bayesian", "metric": "loss"}
+        objective_config = parse_objective_config(automl_settings)
+        objective_names = objective_config.metric_names
         workspace_id = workspace_id or getattr(self._sdk, "_workspace_id", "")
         network_arch = self.skill_ctx.network_arch
 
@@ -1700,11 +1854,11 @@ class AutoMLRunner:
                 list(automl_hyperparameters), base_specs, "automl_hyperparameter",
                 self.skill_ctx.valid_spec_keys)
 
-        # --- fix #1: resolve explicit direction. _invert_metric tells us
-        #              whether to negate values before reporting to the brain
-        #              (and flip them back in the returned result).
+        # Validate explicit direction. Direction is now honored by AutoML's
+        # objective config, so the runner keeps reported values on their
+        # original scale.
         metric_name = automl_settings.get("metric", "loss")
-        _effective_dir, invert_metric = _resolve_direction(
+        _effective_dir, _ = _resolve_direction(
             metric_name, automl_settings.get("direction"))
 
         baseline = {
@@ -1755,17 +1909,9 @@ class AutoMLRunner:
             resume=resume,
         )
         logger.info("Starting AutoML loop: network=%s, algorithm=%s, "
-                    "metric=%s, direction=%s%s",
+                    "metric=%s, direction=%s",
                      network_arch, automl_settings.get("algorithm"),
-                     metric_name, _effective_dir,
-                     " (values will be inverted for the brain)" if invert_metric else "")
-
-        # Unflip values if we inverted them for the brain, so callers see
-        # metrics in their original scale regardless of `direction`.
-        def _unflip(v):
-            if v is None:
-                return None
-            return -v if invert_metric else v
+                     metric_name, _effective_dir)
 
         # --- fix #3: if resuming, recover any jobs that were in flight when
         #              the previous orchestrator died. Poll each to terminal,
@@ -1779,8 +1925,8 @@ class AutoMLRunner:
                     self._recover_pending_job(
                         entry=entry, automl=automl, metric_name=metric_name,
                         metric_extractor=metric_extractor, eval_fn=eval_fn,
-                        workspace_path=workspace_path, invert_metric=invert_metric,
-                        on_result=on_result,
+                        workspace_path=workspace_path, on_result=on_result,
+                        objective_names=objective_names,
                         platform_kwargs=platform_kwargs,
                     )
 
@@ -1852,10 +1998,13 @@ class AutoMLRunner:
                 # output keys here — that lived in the deleted SDK contract.
                 previous_metric = None
                 if getattr(rec, "resume_from_job_id", None):
-                    try:
-                        previous_metric = _unflip(float(rec.result))
-                    except (TypeError, ValueError):
-                        previous_metric = None
+                    if objective_config.is_multi_objective and rec.objective_values:
+                        previous_metric = dict(rec.objective_values)
+                    else:
+                        try:
+                            previous_metric = float(rec.result)
+                        except (TypeError, ValueError):
+                            previous_metric = None
                 # Safety net: if a user hardcoded a local *.results_dir /
                 # *.output_dir / *.save_dir in the spec, every rec would
                 # write to the same path and overwrite the previous one.
@@ -1891,6 +2040,7 @@ class AutoMLRunner:
                     metric_extractor=metric_extractor,
                     eval_fn=eval_fn,
                     workspace_path=workspace_path,
+                    objective_names=objective_names,
                     platform_kwargs=job_platform_kwargs,
                 )
                 if (
@@ -1903,8 +2053,8 @@ class AutoMLRunner:
                 ):
                     logger.warning(
                         "Rec %d: promoted job %s produced a checkpoint but no "
-                        "fresh metric; carrying forward prior metric=%f",
-                        rec.id, rec.job_id, previous_metric,
+                        "fresh metric; carrying forward prior metric=%s",
+                        rec.id, rec.job_id, _format_metric_payload(previous_metric),
                     )
                     metric_value = previous_metric
                     status = "success"
@@ -1932,20 +2082,20 @@ class AutoMLRunner:
                             f"job's logs to confirm.")
                 else:
                     self._consecutive_none_metrics = 0
-                # Report to the brain, inverting if explicit direction disagrees
-                # with the brain's implicit metric-name rule.
-                report_value = metric_value
-                if invert_metric and report_value is not None:
-                    report_value = -report_value
+                # Report raw values; AutoML objective config handles direction
+                # and scalarization.
                 automl.report_result(
                     rec_id=rec.id,
-                    metric_value=report_value if report_value is not None else 0.0,
+                    metric_value=metric_value if metric_value is not None else 0.0,
                     status=status,
                 )
                 if on_result:
                     on_result(rec, metric_value, status)
                 logger.info("Recommendation %d: metric=%.6f, status=%s",
-                            rec.id, metric_value if metric_value is not None else 0.0, status)
+                            rec.id,
+                            _metric_payload_primary(metric_value, metric_name)
+                            if metric_value is not None else 0.0,
+                            status)
 
         best = automl.get_best()
         progress = automl.get_progress()
@@ -1957,7 +2107,7 @@ class AutoMLRunner:
                 f"failed recommendation ids: {failed}"
             )
 
-        best_metric = _unflip(best.result) if best else None
+        best_metric = _recommendation_primary_metric(best, metric_name)
         final_evaluation = {
             "enabled": bool(automl_settings.get("run_final_evaluation", True)),
             "metric_name": metric_name,
@@ -2023,25 +2173,36 @@ class AutoMLRunner:
                 "rec_id": best.id if best else None,
                 "specs": best.specs if best else {},
                 "metric_value": best_metric,
+                "objective_score": getattr(best, "objective_score", None),
+                "objective_values": _recommendation_objective_values(best),
                 "adjustments": getattr(best, "adjustments", []) if best else [],
             },
             "progress": progress,
             "baseline": baseline,
             "final_evaluation": final_evaluation,
-            "history": [{"rec_id": r.id, "metric": _unflip(r.result),
-                          "status": r.status,
-                          "failure_reason": getattr(r, "failure_reason", None),
-                          "adjustments": getattr(r, "adjustments", [])}
-                         for r in history],
+            "history": [
+                {
+                    "rec_id": r.id,
+                    "metric": _recommendation_primary_metric(r, metric_name),
+                    "objective_score": getattr(r, "objective_score", None),
+                    "objective_values": _recommendation_objective_values(r),
+                    "status": r.status,
+                    "failure_reason": getattr(r, "failure_reason", None),
+                    "adjustments": getattr(r, "adjustments", []),
+                }
+                for r in history
+            ],
         }
         baseline["comparison_to_best"] = _compare_to_baseline(
             baseline.get("metric_value"),
             result["best"]["metric_value"],
             _effective_dir,
         )
+        if objective_config.is_multi_objective:
+            result["pareto_front"] = automl.get_status().get("pareto_front", [])
         logger.info("AutoML complete: %d recommendations, best metric=%.6f (rec %s)",
                      progress["completed"],
-                     _unflip(best.result) if best and best.result is not None else 0.0,
+                     best_metric if best_metric is not None else 0.0,
                      best.id if best else "N/A")
         return result
 
@@ -2050,7 +2211,8 @@ class AutoMLRunner:
                      metric_extractor=None,
                      eval_fn=None,
                      workspace_path=None,
-                     platform_kwargs=None) -> tuple[float | None, str]:
+                     objective_names=None,
+                     platform_kwargs=None) -> tuple[float | dict[str, float] | None, str]:
         """Launch a single training job and wait for it to finish.
 
         Container actions use ``tao_sdk.script_runner.build_entrypoint`` and
@@ -2110,10 +2272,11 @@ class AutoMLRunner:
 
         # Caller can plug in a custom extractor; fall back to the built-in.
         extract_fn = metric_extractor or _extract_metric_from_logs
+        metric_names = list(objective_names or [metric_name])
 
         # Poll status AND logs simultaneously — Lepton clears logs fast after
         # completion, so we cache the best metric seen during polling.
-        cached_metric = None
+        cached_metrics = {}
         cached_exec_status = None
         all_logs = ""
         job_status = None
@@ -2129,38 +2292,46 @@ class AutoMLRunner:
                 if logs:
                     all_logs = logs  # Keep latest snapshot
                     try:
-                        m = extract_fn(logs, metric_name)
+                        values = _extract_metric_values(logs, metric_names, extract_fn)
                     except Exception as ex:
                         logger.warning("metric_extractor raised for rec %d: %s",
                                        rec.id, ex)
-                        m = None
-                    if m is not None:
-                        cached_metric = m
+                        values = {}
+                    cached_metrics.update(values)
                     es = _check_execution_status(
                         logs, include_fatal_patterns=False
                     )
                     hard_failure = _has_hard_failure_pattern(logs)
-                    if not es and (cached_metric is None or hard_failure):
+                    if not es and (
+                        metric_name not in cached_metrics or hard_failure
+                    ):
                         es = _check_execution_status(logs)
                         if es == "FAIL":
-                            artifact_metric = _recover_metric_from_artifacts(
-                                self._sdk, job.id, metric_name, platform_kwargs
+                            artifact_metrics = _recover_metric_values_from_artifacts(
+                                self._sdk, job.id, metric_names, platform_kwargs
                             )
-                            if artifact_metric is not None:
-                                cached_metric = artifact_metric
+                            if artifact_metrics:
+                                cached_metrics.update(artifact_metrics)
+                                primary_metric = cached_metrics.get(metric_name)
                                 if not hard_failure:
                                     es = None
                                     logger.info(
                                         "Rec %d: ignoring cleanup failure text "
-                                        "after recovering metric=%f from result "
+                                        "after recovering metric=%s from result "
                                         "artifacts",
-                                        rec.id, artifact_metric,
+                                        rec.id,
+                                        _format_metric_payload(
+                                            _metric_payload_from_values(
+                                                cached_metrics, metric_name, metric_names
+                                            )
+                                        ),
                                     )
                                 else:
                                     logger.warning(
-                                        "Rec %d: recovered metric=%f from result "
+                                        "Rec %d: recovered metric=%s from result "
                                         "artifacts before canceling hard failed job",
-                                        rec.id, artifact_metric,
+                                        rec.id,
+                                        _format_metric_payload(primary_metric),
                                     )
                     if es:
                         cached_exec_status = es
@@ -2192,33 +2363,40 @@ class AutoMLRunner:
             if job_status.status in _TERMINAL_STATUSES:
                 break
 
-        cached_metric, cached_exec_status, terminal_logs = _scan_terminal_logs(
+        cached_metrics, cached_exec_status, terminal_logs = _scan_terminal_metric_values(
             self._sdk,
             job.id,
-            metric_name,
+            metric_names,
             extract_fn,
-            cached_metric,
+            cached_metrics,
             cached_exec_status,
         )
         if terminal_logs:
             all_logs = terminal_logs
 
-        if cached_metric is None:
-            artifact_metric = _recover_metric_from_artifacts(
-                self._sdk, job.id, metric_name, platform_kwargs
+        if metric_name not in cached_metrics or any(
+            name not in cached_metrics for name in metric_names
+        ):
+            artifact_metrics = _recover_metric_values_from_artifacts(
+                self._sdk, job.id, metric_names, platform_kwargs
             )
-            if artifact_metric is not None:
-                cached_metric = artifact_metric
+            if artifact_metrics:
+                cached_metrics.update(artifact_metrics)
                 logger.info(
-                    "Rec %d: recovered metric=%f from result artifacts "
+                    "Rec %d: recovered metric=%s from result artifacts "
                     "before final status classification",
-                    rec.id, artifact_metric,
+                    rec.id,
+                    _format_metric_payload(
+                        _metric_payload_from_values(
+                            cached_metrics, metric_name, metric_names
+                        )
+                    ),
                 )
 
         exec_status = cached_exec_status or _check_execution_status(
             all_logs,
             include_fatal_patterns=(
-                cached_metric is None or _has_hard_failure_pattern(all_logs)
+                metric_name not in cached_metrics or _has_hard_failure_pattern(all_logs)
             ),
         )
         status = job_status.status if job_status is not None else "Error"
@@ -2233,14 +2411,14 @@ class AutoMLRunner:
             if reason:
                 rec.failure_reason = reason
             logger.warning("Rec %d: job %s failed", rec.id, job.id)
-            return cached_metric, "failure"
+            return _metric_payload_from_values(cached_metrics, metric_name, metric_names), "failure"
         if status == "Canceled":
             rec.failure_reason = "job_canceled"
-            return cached_metric, "failure"
+            return _metric_payload_from_values(cached_metrics, metric_name, metric_names), "failure"
 
         # fix #4: if an eval_fn is provided, run it post-training and let its
         # return override the log-extracted metric. Errors are isolated.
-        metric_value = cached_metric
+        metric_values = dict(cached_metrics)
         eval_metric_used = False
         if eval_fn is not None:
             try:
@@ -2250,35 +2428,56 @@ class AutoMLRunner:
                                 "to log-extracted metric", rec.id, ex)
                 eval_metric = None
             if eval_metric is not None:
-                logger.info("Rec %d: eval_fn returned metric=%f "
+                if isinstance(eval_metric, dict):
+                    metric_values.update({
+                        str(key): float(value)
+                        for key, value in eval_metric.items()
+                    })
+                else:
+                    metric_values[metric_name] = float(eval_metric)
+                logger.info("Rec %d: eval_fn returned metric=%s "
                             "(overriding log-extracted %s)",
-                            rec.id, eval_metric,
-                            f"{cached_metric:.6f}" if cached_metric is not None else "None")
-                metric_value = eval_metric
+                            rec.id,
+                            _format_metric_payload(
+                                _metric_payload_from_values(
+                                    metric_values, metric_name, metric_names
+                                )
+                            ),
+                            _format_metric_payload(
+                                _metric_payload_from_values(
+                                    cached_metrics, metric_name, metric_names
+                                )
+                            ))
                 eval_metric_used = True
-        local_metric = _extract_metric_from_local_results(
-            job.id, metric_name, platform_kwargs
-        )
-        if local_metric is not None and not eval_metric_used:
-            if metric_value is None:
-                logger.info("Rec %d: recovered metric=%f from local status artifacts",
-                            rec.id, local_metric)
-            elif local_metric != metric_value:
-                logger.info(
-                    "Rec %d: using local status metric=%f instead of "
-                    "log-extracted metric=%f",
-                    rec.id, local_metric, metric_value,
+        if not eval_metric_used:
+            local_metrics = {}
+            for name in metric_names:
+                local_metric = _extract_metric_from_local_results(
+                    job.id, name, platform_kwargs
                 )
-            metric_value = local_metric
+                if local_metric is not None:
+                    local_metrics[name] = float(local_metric)
+            if local_metrics:
+                metric_values.update(local_metrics)
+                logger.info(
+                    "Rec %d: using local status metric(s)=%s",
+                    rec.id, _format_metric_payload(local_metrics),
+                )
 
+        metric_value = _metric_payload_from_values(
+            metric_values, metric_name, metric_names
+        )
         if metric_value is None:
             logger.warning("Rec %d: job %s completed but no metric could be "
                            "extracted (neither metric_extractor nor eval_fn "
-                           "produced a value for '%s')",
-                           rec.id, job.id, metric_name)
+                           "produced all requested metrics: %s)",
+                           rec.id, job.id, metric_names)
             return None, "metric_missing"
 
-        logger.info("Rec %d: job %s succeeded, metric=%f", rec.id, job.id, metric_value)
+        logger.info(
+            "Rec %d: job %s succeeded, metric=%s",
+            rec.id, job.id, _format_metric_payload(metric_value)
+        )
         return metric_value, "success"
 
     def _persist_active_jobs(self, workspace_path: str) -> None:
@@ -2295,7 +2494,8 @@ class AutoMLRunner:
 
     def _recover_pending_job(self, entry, automl, metric_name,
                               metric_extractor, eval_fn, workspace_path,
-                              invert_metric, on_result, platform_kwargs=None) -> None:
+                              on_result, objective_names=None,
+                              platform_kwargs=None) -> None:
         """Poll an in-flight job (recovered on resume), extract its result,
         and report it to the brain. Mirrors the tail of _run_one_job.
         """
@@ -2312,9 +2512,10 @@ class AutoMLRunner:
 
         self._active_jobs[rec_id] = job_id
         extract_fn = metric_extractor or _extract_metric_from_logs
+        metric_names = list(objective_names or [metric_name])
 
         logger.info("Resume: polling rec %d job %s", rec_id, job_id)
-        cached_metric = None
+        cached_metrics = {}
         cached_exec_status = None
         all_logs = ""
         job_status = None
@@ -2329,39 +2530,48 @@ class AutoMLRunner:
                 if logs:
                     all_logs = logs
                     try:
-                        m = extract_fn(logs, metric_name)
+                        values = _extract_metric_values(logs, metric_names, extract_fn)
                     except Exception as ex:
                         logger.warning("metric_extractor raised during resume "
                                         "for rec %d: %s", rec_id, ex)
-                        m = None
-                    if m is not None:
-                        cached_metric = m
+                        values = {}
+                    cached_metrics.update(values)
                     es = _check_execution_status(
                         logs, include_fatal_patterns=False
                     )
                     hard_failure = _has_hard_failure_pattern(logs)
-                    if not es and (cached_metric is None or hard_failure):
+                    if not es and (metric_name not in cached_metrics or hard_failure):
                         es = _check_execution_status(logs)
                         if es == "FAIL":
-                            artifact_metric = _recover_metric_from_artifacts(
-                                self._sdk, job_id, metric_name, platform_kwargs
+                            artifact_metrics = _recover_metric_values_from_artifacts(
+                                self._sdk, job_id, metric_names, platform_kwargs
                             )
-                            if artifact_metric is not None:
-                                cached_metric = artifact_metric
+                            if artifact_metrics:
+                                cached_metrics.update(artifact_metrics)
                                 if not hard_failure:
                                     es = None
                                     logger.info(
                                         "Resume: rec %d ignoring cleanup "
-                                        "failure text after recovering metric=%f "
+                                        "failure text after recovering metric=%s "
                                         "from result artifacts",
-                                        rec_id, artifact_metric,
+                                        rec_id,
+                                        _format_metric_payload(
+                                            _metric_payload_from_values(
+                                                cached_metrics, metric_name, metric_names
+                                            )
+                                        ),
                                     )
                                 else:
                                     logger.warning(
-                                        "Resume: rec %d recovered metric=%f from "
+                                        "Resume: rec %d recovered metric=%s from "
                                         "result artifacts before canceling hard "
                                         "failed job",
-                                        rec_id, artifact_metric,
+                                        rec_id,
+                                        _format_metric_payload(
+                                            _metric_payload_from_values(
+                                                cached_metrics, metric_name, metric_names
+                                            )
+                                        ),
                                     )
                     if es:
                         cached_exec_status = es
@@ -2393,33 +2603,40 @@ class AutoMLRunner:
             if job_status.status in _TERMINAL_STATUSES:
                 break
 
-        cached_metric, cached_exec_status, terminal_logs = _scan_terminal_logs(
+        cached_metrics, cached_exec_status, terminal_logs = _scan_terminal_metric_values(
             self._sdk,
             job_id,
-            metric_name,
+            metric_names,
             extract_fn,
-            cached_metric,
+            cached_metrics,
             cached_exec_status,
         )
         if terminal_logs:
             all_logs = terminal_logs
 
-        if cached_metric is None:
-            artifact_metric = _recover_metric_from_artifacts(
-                self._sdk, job_id, metric_name, platform_kwargs
+        if metric_name not in cached_metrics or any(
+            name not in cached_metrics for name in metric_names
+        ):
+            artifact_metrics = _recover_metric_values_from_artifacts(
+                self._sdk, job_id, metric_names, platform_kwargs
             )
-            if artifact_metric is not None:
-                cached_metric = artifact_metric
+            if artifact_metrics:
+                cached_metrics.update(artifact_metrics)
                 logger.info(
-                    "Resume: rec %d recovered metric=%f from result "
+                    "Resume: rec %d recovered metric=%s from result "
                     "artifacts before final status classification",
-                    rec_id, artifact_metric,
+                    rec_id,
+                    _format_metric_payload(
+                        _metric_payload_from_values(
+                            cached_metrics, metric_name, metric_names
+                        )
+                    ),
                 )
 
         exec_status = cached_exec_status or _check_execution_status(
             all_logs,
             include_fatal_patterns=(
-                cached_metric is None or _has_hard_failure_pattern(all_logs)
+                metric_name not in cached_metrics or _has_hard_failure_pattern(all_logs)
             ),
         )
         status = job_status.status if job_status is not None else "Error"
@@ -2427,17 +2644,17 @@ class AutoMLRunner:
         self._persist_active_jobs(workspace_path)
 
         if status == "Error" or exec_status == "FAIL":
-            metric_value = cached_metric
+            metric_value = _metric_payload_from_values(cached_metrics, metric_name, metric_names)
             report_status = "failure"
             reason = _classify_failure(all_logs)
             if reason:
                 rec.failure_reason = reason
         elif status == "Canceled":
-            metric_value = cached_metric
+            metric_value = _metric_payload_from_values(cached_metrics, metric_name, metric_names)
             report_status = "failure"
             rec.failure_reason = "job_canceled"
         else:
-            metric_value = cached_metric
+            metric_values = dict(cached_metrics)
             eval_metric_used = False
             if eval_fn is not None:
                 try:
@@ -2447,33 +2664,36 @@ class AutoMLRunner:
                                     rec_id, ex)
                     em = None
                 if em is not None:
-                    metric_value = em
+                    if isinstance(em, dict):
+                        metric_values.update({
+                            str(key): float(value)
+                            for key, value in em.items()
+                        })
+                    else:
+                        metric_values[metric_name] = float(em)
                     eval_metric_used = True
-            local_metric = _extract_metric_from_local_results(
-                job_id, metric_name, platform_kwargs
+            if not eval_metric_used:
+                local_metrics = {}
+                for name in metric_names:
+                    local_metric = _extract_metric_from_local_results(
+                        job_id, name, platform_kwargs
+                    )
+                    if local_metric is not None:
+                        local_metrics[name] = float(local_metric)
+                if local_metrics:
+                    metric_values.update(local_metrics)
+                    logger.info(
+                        "Resume: rec %d using local status metric(s)=%s",
+                        rec_id, _format_metric_payload(local_metrics),
+                    )
+            metric_value = _metric_payload_from_values(
+                metric_values, metric_name, metric_names
             )
-            if local_metric is not None and not eval_metric_used:
-                if metric_value is None:
-                    logger.info(
-                        "Resume: rec %d recovered metric=%f from local status "
-                        "artifacts",
-                        rec_id, local_metric,
-                    )
-                elif local_metric != metric_value:
-                    logger.info(
-                        "Resume: rec %d using local status metric=%f instead "
-                        "of log-extracted metric=%f",
-                        rec_id, local_metric, metric_value,
-                    )
-                metric_value = local_metric
             report_status = "success" if metric_value is not None else "failure"
 
-        report_value = metric_value
-        if invert_metric and report_value is not None:
-            report_value = -report_value
         automl.report_result(
             rec_id=rec_id,
-            metric_value=report_value if report_value is not None else 0.0,
+            metric_value=metric_value if metric_value is not None else 0.0,
             status=report_status,
         )
         if on_result:
@@ -2483,7 +2703,7 @@ class AutoMLRunner:
                 logger.warning("on_result callback raised during resume: %s", ex)
         logger.info("Resume: rec %d %s metric=%s",
                     rec_id, report_status,
-                    f"{metric_value:.6f}" if metric_value is not None else "None")
+                    _format_metric_payload(metric_value))
 
     # _skill_has_tarball_media was removed: tar/tar.gz extraction is now
     # handled by script_runner inline (tao-sdk commit 661040b "Port tar/tar.gz
