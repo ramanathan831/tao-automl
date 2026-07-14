@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -53,6 +54,94 @@ def _write_fake_skill(tmp_path: Path, action: str = "train") -> Path:
         "  num_classes: 80\n"
     )
     return skill_dir
+
+
+def _write_fake_action_skill(
+    tmp_path: Path,
+    *,
+    network_arch: str = "dino",
+    action: str = "quantize",
+) -> Path:
+    """Create a minimal non-train action skill that can run a shell command."""
+    skill_dir = tmp_path / "models" / f"fake-{action}"
+    refs = skill_dir / "references"
+    refs.mkdir(parents=True)
+    (refs / "skill_info.yaml").write_text(
+        f"network_arch: {network_arch}\n"
+        "container_image: nvcr.io/nvidia/tao/fake:0.1\n"
+        "actions:\n"
+        f"  {action}:\n"
+        "    command: >-\n"
+        "      python -c \"print('action_metric: 0.73')\"\n"
+        "    config_format: yaml\n"
+        "    inputs: {}\n"
+        "    outputs: {}\n"
+        "    upload_excludes: []\n"
+    )
+    results_dir = tmp_path / "action-results"
+    (refs / f"spec_template_{action}.yaml").write_text(
+        f"results_dir: {results_dir}\n"
+        "train:\n"
+        "  optim:\n"
+        "    lr: 2.0e-4\n"
+        "quantize:\n"
+        f"  results_dir: {results_dir}\n"
+    )
+    return skill_dir
+
+
+class _CompletedProcessSDK:
+    """SDK shim that executes submitted jobs as real local subprocesses."""
+
+    def __init__(self):
+        self.jobs = {}
+
+    def create_job(self, image, command, **kwargs):
+        from tao_sdk.models import Job
+
+        job_id = f"job-{len(self.jobs)}"
+        env = dict(**kwargs.pop("env_vars", {}))
+        proc_env = None
+        if env:
+            import os
+            proc_env = os.environ.copy()
+            proc_env.update(env)
+        if proc_env is None:
+            import os
+            proc_env = os.environ.copy()
+        proc_env["TAO_JOB_ID"] = job_id
+
+        completed = subprocess.run(
+            command,
+            shell=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=proc_env,
+            check=False,
+        )
+        self.jobs[job_id] = completed
+        return Job(
+            id=job_id,
+            network_arch="dino",
+            action="quantize",
+            workspace_id="local",
+            backend_job_id=job_id,
+            status="Complete" if completed.returncode == 0 else "Error",
+        )
+
+    def get_job_status(self, job_id):
+        from tao_sdk.models import JobStatus
+
+        completed = self.jobs[job_id]
+        status = "Complete" if completed.returncode == 0 else "Error"
+        return JobStatus(job_id=job_id, status=status)
+
+    def get_job_logs(self, job_id, tail=None):
+        logs = self.jobs[job_id].stdout or ""
+        if tail is not None:
+            return "\n".join(logs.splitlines()[-tail:])
+        return logs
 
 
 def _write_python_skill(tmp_path: Path) -> Path:
@@ -167,6 +256,470 @@ def test_skill_context_missing_skill_info_raises(tmp_path):
     from tao_automl.runner import SkillContext
     with pytest.raises(FileNotFoundError, match="skill_info.yaml"):
         SkillContext(skill_dir=tmp_path / "nonexistent", action="train")
+
+
+def test_generate_hyperparams_uses_selected_action_schema(monkeypatch):
+    """Non-train AutoML must read the action schema instead of train."""
+    from tao_automl.search_space import params
+
+    seen = {}
+
+    def fake_generate_schema(network, action):
+        seen["network"] = network
+        seen["action"] = action
+        return {
+            "default": {
+                "quantize": {"calibration_batches": 4},
+            },
+            "properties": {
+                "quantize": {
+                    "type": "object",
+                    "properties": {
+                        "calibration_batches": {
+                            "type": "integer",
+                            "default": 4,
+                            "minimum": 1,
+                            "maximum": 8,
+                            "automl_enabled": True,
+                        }
+                    },
+                }
+            },
+        }
+
+    monkeypatch.setattr(params, "generate_schema", fake_generate_schema)
+
+    records, names = params.generate_hyperparams_to_search(
+        network="fake-net",
+        action="quantize",
+        train_specs={"quantize": {"calibration_batches": 4}},
+        automl_hyperparameters=None,
+    )
+
+    assert seen == {"network": "fake-net", "action": "quantize"}
+    assert names == ["quantize.calibration_batches"]
+    assert records[0]["parameter"] == "quantize.calibration_batches"
+
+
+def test_quantize_mode_search_filters_static_ptq_for_fixed_torchao_backend(monkeypatch):
+    """TorchAO validates only weight_only_ptq, so AutoML should not suggest static_ptq."""
+    from tao_automl.search_space import params
+
+    def fake_generate_schema(network, action):
+        return {
+            "default": {
+                "quantize": {
+                    "backend": "torchao",
+                    "mode": "weight_only_ptq",
+                },
+            },
+            "properties": {
+                "quantize": {
+                    "type": "object",
+                    "properties": {
+                        "backend": {
+                            "type": "categorical",
+                            "default": "torchao",
+                            "enum": ["modelopt.pytorch", "torchao", "modelopt.onnx"],
+                        },
+                        "mode": {
+                            "type": "categorical",
+                            "default": "weight_only_ptq",
+                            "enum": ["static_ptq", "weight_only_ptq"],
+                        },
+                    },
+                },
+            },
+        }
+
+    monkeypatch.setattr(params, "generate_schema", fake_generate_schema)
+
+    records, names = params.generate_hyperparams_to_search(
+        network="fake-net",
+        action="quantize",
+        train_specs={"quantize": {"backend": "torchao", "mode": "weight_only_ptq"}},
+        automl_hyperparameters=["quantize.mode"],
+    )
+
+    assert names == ["quantize.mode"]
+    assert records[0]["valid_options"] == ["weight_only_ptq"]
+
+
+def test_quantize_algorithm_search_filters_invalid_modelopt_static_ptq_algorithms(monkeypatch):
+    """ModelOpt PyTorch static PTQ should not suggest unregistered algorithms."""
+    from tao_automl.search_space import params
+
+    def fake_generate_schema(network, action):
+        return {
+            "default": {
+                "quantize": {
+                    "backend": "modelopt.pytorch",
+                    "mode": "static_ptq",
+                    "algorithm": "max",
+                },
+            },
+            "properties": {
+                "quantize": {
+                    "type": "object",
+                    "properties": {
+                        "backend": {
+                            "type": "categorical",
+                            "default": "modelopt.pytorch",
+                            "enum": ["modelopt.pytorch", "torchao", "modelopt.onnx"],
+                        },
+                        "mode": {
+                            "type": "categorical",
+                            "default": "static_ptq",
+                            "enum": ["static_ptq", "weight_only_ptq"],
+                        },
+                        "algorithm": {
+                            "type": "categorical",
+                            "default": "max",
+                            "enum": [
+                                "minmax",
+                                "max",
+                                "entropy",
+                                "awq_clip",
+                                "awq_lite",
+                                "awq_full",
+                                "rtn_dq",
+                            ],
+                        },
+                    },
+                },
+            },
+        }
+
+    monkeypatch.setattr(params, "generate_schema", fake_generate_schema)
+
+    records, names = params.generate_hyperparams_to_search(
+        network="fake-net",
+        action="quantize",
+        train_specs={
+            "quantize": {
+                "backend": "modelopt.pytorch",
+                "mode": "static_ptq",
+                "algorithm": "max",
+            }
+        },
+        automl_hyperparameters=["quantize.algorithm"],
+    )
+
+    assert names == ["quantize.algorithm"]
+    assert records[0]["valid_options"] == ["max", "awq_lite", "awq_full"]
+
+
+def test_quantize_mode_and_algorithm_search_filters_for_fixed_torchao_backend(monkeypatch):
+    """Searching mode and algorithm together should stay valid for TorchAO."""
+    from tao_automl.search_space import params
+
+    def fake_generate_schema(network, action):
+        return {
+            "default": {
+                "quantize": {
+                    "backend": "torchao",
+                    "mode": "weight_only_ptq",
+                    "algorithm": "minmax",
+                },
+            },
+            "properties": {
+                "quantize": {
+                    "type": "object",
+                    "properties": {
+                        "backend": {
+                            "type": "categorical",
+                            "default": "torchao",
+                            "enum": ["modelopt.pytorch", "torchao", "modelopt.onnx"],
+                        },
+                        "mode": {
+                            "type": "categorical",
+                            "default": "weight_only_ptq",
+                            "enum": ["static_ptq", "weight_only_ptq"],
+                        },
+                        "algorithm": {
+                            "type": "categorical",
+                            "default": "minmax",
+                            "enum": [
+                                "minmax",
+                                "max",
+                                "entropy",
+                                "awq_clip",
+                                "awq_lite",
+                                "awq_full",
+                                "rtn_dq",
+                            ],
+                        },
+                    },
+                },
+            },
+        }
+
+    monkeypatch.setattr(params, "generate_schema", fake_generate_schema)
+
+    records, names = params.generate_hyperparams_to_search(
+        network="fake-net",
+        action="quantize",
+        train_specs={
+            "quantize": {
+                "backend": "torchao",
+                "mode": "weight_only_ptq",
+                "algorithm": "minmax",
+            }
+        },
+        automl_hyperparameters=["quantize.mode", "quantize.algorithm"],
+    )
+
+    ranges = {record["parameter"]: record["valid_options"] for record in records}
+    assert names == ["quantize.mode", "quantize.algorithm"]
+    assert ranges["quantize.mode"] == ["weight_only_ptq"]
+    assert ranges["quantize.algorithm"] == ["minmax"]
+
+
+def test_quantize_mode_and_algorithm_search_filters_for_fixed_modelopt_backend(monkeypatch):
+    """Searching mode and algorithm together should stay valid for ModelOpt PyTorch."""
+    from tao_automl.search_space import params
+
+    def fake_generate_schema(network, action):
+        return {
+            "default": {
+                "quantize": {
+                    "backend": "modelopt.pytorch",
+                    "mode": "static_ptq",
+                    "algorithm": "max",
+                },
+            },
+            "properties": {
+                "quantize": {
+                    "type": "object",
+                    "properties": {
+                        "backend": {
+                            "type": "categorical",
+                            "default": "modelopt.pytorch",
+                            "enum": ["modelopt.pytorch", "torchao", "modelopt.onnx"],
+                        },
+                        "mode": {
+                            "type": "categorical",
+                            "default": "static_ptq",
+                            "enum": ["static_ptq", "weight_only_ptq"],
+                        },
+                        "algorithm": {
+                            "type": "categorical",
+                            "default": "max",
+                            "enum": [
+                                "minmax",
+                                "max",
+                                "entropy",
+                                "awq_clip",
+                                "awq_lite",
+                                "awq_full",
+                                "rtn_dq",
+                            ],
+                        },
+                    },
+                },
+            },
+        }
+
+    monkeypatch.setattr(params, "generate_schema", fake_generate_schema)
+
+    records, names = params.generate_hyperparams_to_search(
+        network="fake-net",
+        action="quantize",
+        train_specs={
+            "quantize": {
+                "backend": "modelopt.pytorch",
+                "mode": "static_ptq",
+                "algorithm": "max",
+            }
+        },
+        automl_hyperparameters=["quantize.mode", "quantize.algorithm"],
+    )
+
+    ranges = {record["parameter"]: record["valid_options"] for record in records}
+    assert names == ["quantize.mode", "quantize.algorithm"]
+    assert ranges["quantize.mode"] == ["static_ptq"]
+    assert ranges["quantize.algorithm"] == ["max", "awq_lite", "awq_full"]
+
+
+def test_non_train_action_defaults_include_action_native_params():
+    from tao_automl.schema.generate_schema import generate_schema
+    from tao_automl.search_space import params
+
+    distill_schema = generate_schema("classification_pyt", "distill")
+    _distill_records, distill_names = params.generate_hyperparams_to_search(
+        network="classification_pyt",
+        action="distill",
+        train_specs=distill_schema["default"],
+        automl_hyperparameters=None,
+    )
+    assert {
+        "distill.loss_type",
+        "distill.loss_lambda",
+        "distill.mode",
+        "distill.use_mlp",
+        "distill.mlp_hidden_size",
+        "distill.mlp_num_inner",
+    }.issubset(set(distill_names))
+
+    prune_schema = generate_schema("ocrnet", "prune")
+    _prune_records, prune_names = params.generate_hyperparams_to_search(
+        network="ocrnet",
+        action="prune",
+        train_specs=prune_schema["default"],
+        automl_hyperparameters=None,
+    )
+    assert {
+        "prune.prune_setting.mode",
+        "prune.prune_setting.amount",
+        "prune.prune_setting.granularity",
+        "prune.prune_setting.raw_prune_score",
+    }.issubset(set(prune_names))
+
+    quantize_schema = generate_schema("classification_pyt", "quantize")
+    quantize_spec = quantize_schema["default"]
+    quantize_spec["quantize"]["backend"] = "torchao"
+    quantize_spec["quantize"]["mode"] = "weight_only_ptq"
+    _quantize_records, quantize_names = params.generate_hyperparams_to_search(
+        network="classification_pyt",
+        action="quantize",
+        train_specs=quantize_spec,
+        automl_hyperparameters=None,
+    )
+    assert "quantize.mode" in quantize_names
+    assert "quantize.algorithm" in quantize_names
+    assert "quantize.backend" not in quantize_names
+
+
+def test_custom_valid_options_cannot_reopen_schema_excluded_options():
+    from tao_automl.utils.math_utils import get_valid_options
+
+    options = get_valid_options(
+        {
+            "parameter": "quantize.mode",
+            "valid_options": ["weight_only_ptq"],
+        },
+        {
+            "quantize.mode": {
+                "valid_options": ["weight_only_ptq", "static_ptq"],
+            }
+        },
+    )
+
+    assert options == ["weight_only_ptq"]
+
+
+def test_custom_valid_options_cannot_reopen_invalid_modelopt_algorithms(monkeypatch, tmp_path):
+    import json
+
+    from tao_automl import AutoML
+    from tao_automl.search_space import params
+
+    def fake_generate_hyperparams_to_search(**kwargs):
+        return [
+            {
+                "parameter": "quantize.algorithm",
+                "value_type": "categorical",
+                "default_value": "max",
+                "valid_min": "",
+                "valid_max": "",
+                "valid_options": ["max", "awq_lite", "awq_full"],
+                "option_weights": None,
+                "math_cond": "",
+                "parent_param": "",
+                "depends_on": "",
+            }
+        ], ["quantize.algorithm"]
+
+    monkeypatch.setattr(
+        params,
+        "generate_hyperparams_to_search",
+        fake_generate_hyperparams_to_search,
+    )
+
+    AutoML(
+        workspace=str(tmp_path),
+        network="classification_pyt",
+        train_specs={
+            "quantize": {
+                "backend": "modelopt.pytorch",
+                "mode": "static_ptq",
+                "algorithm": "max",
+            }
+        },
+        settings={
+            "algorithm": "bayesian",
+            "metric": "val_acc_1",
+            "direction": "maximize",
+            "automl_max_recommendations": 1,
+            "session_id": "fixedsession",
+        },
+        automl_hyperparameters=["quantize.algorithm"],
+        custom_param_ranges={
+            "quantize.algorithm": {
+                "valid_options": ["minmax", "max", "entropy", "awq_lite"],
+            }
+        },
+        action="quantize",
+    )
+
+    ranges = json.loads(
+        (tmp_path / ".automl/custom_ranges/fixedsession.json").read_text()
+    )
+    assert ranges["quantize.algorithm"]["valid_options"] == ["max", "awq_lite"]
+
+
+def test_automl_persists_sanitized_custom_valid_options(monkeypatch, tmp_path):
+    import json
+
+    from tao_automl import AutoML
+    from tao_automl.search_space import params
+
+    def fake_generate_hyperparams_to_search(**kwargs):
+        return [
+            {
+                "parameter": "quantize.mode",
+                "value_type": "categorical",
+                "default_value": "weight_only_ptq",
+                "valid_min": "",
+                "valid_max": "",
+                "valid_options": ["weight_only_ptq"],
+                "option_weights": None,
+                "math_cond": "",
+                "parent_param": "",
+                "depends_on": "",
+            }
+        ], ["quantize.mode"]
+
+    monkeypatch.setattr(
+        params,
+        "generate_hyperparams_to_search",
+        fake_generate_hyperparams_to_search,
+    )
+
+    AutoML(
+        workspace=str(tmp_path),
+        network="classification_pyt",
+        train_specs={"quantize": {"backend": "torchao", "mode": "weight_only_ptq"}},
+        settings={
+            "algorithm": "bayesian",
+            "metric": "val_acc_1",
+            "direction": "maximize",
+            "automl_max_recommendations": 1,
+            "session_id": "fixedsession",
+        },
+        automl_hyperparameters=["quantize.mode"],
+        custom_param_ranges={
+            "quantize.mode": {
+                "valid_options": ["weight_only_ptq", "static_ptq"],
+            }
+        },
+        action="quantize",
+    )
+
+    ranges = json.loads(
+        (tmp_path / ".automl/custom_ranges/fixedsession.json").read_text()
+    )
+    assert ranges["quantize.mode"]["valid_options"] == ["weight_only_ptq"]
 
 
 def test_skill_context_resolves_python_script_execution_and_external_schema(tmp_path):
@@ -925,6 +1478,37 @@ def test_run_one_job_submits_nested_specs_to_python_script_sdk(tmp_path):
     assert metric == pytest.approx(0.875)
     assert status == "success"
 
+
+def test_runner_runs_real_subprocess_job_for_non_train_action(tmp_path):
+    """Exercise a real subprocess-backed SDK job for a non-train action."""
+    from tao_automl.runner import AutoMLRunner
+
+    skill_dir = _write_fake_action_skill(tmp_path, action="quantize")
+    runner = AutoMLRunner(
+        sdk=_CompletedProcessSDK(),
+        skill_dir=skill_dir,
+        action="quantize",
+        poll_interval=0,
+    )
+
+    result = runner.run(
+        automl_settings={
+            "algorithm": "bayesian",
+            "metric": "action_metric",
+            "direction": "maximize",
+            "automl_max_recommendations": 1,
+        },
+        automl_hyperparameters=["train.optim.lr"],
+        custom_param_ranges={
+            "train.optim.lr": {"valid_min": 1e-5, "valid_max": 1e-3},
+        },
+        workspace_path=str(tmp_path / "workspace"),
+        env_vars={"TAO_RESULTS_ROOT": str(tmp_path / "sdk-results")},
+    )
+
+    assert result["progress"]["completed"] == 1
+    assert result["best"]["metric_value"] == pytest.approx(0.73)
+    assert result["history"][0]["status"] == "success"
 
 def test_run_one_job_allows_completed_metric_with_cleanup_rendezvous(tmp_path):
     from tao_automl.runner import AutoMLRunner

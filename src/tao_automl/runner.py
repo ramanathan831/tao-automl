@@ -1748,6 +1748,7 @@ class AutoMLRunner:
             train_specs=base_specs, settings=automl_settings,
             automl_hyperparameters=automl_hyperparameters,
             custom_param_ranges=custom_param_ranges,
+            action=self.skill_ctx.action,
             search_schema=(
                 self.skill_ctx.schema if resolved_execution is not None else None
             ),
