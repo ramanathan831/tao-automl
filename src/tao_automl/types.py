@@ -54,6 +54,7 @@ class Recommendation:
         self.early_stop_epoch = None  # For PBT/Hyperband: epoch limit when this rec was launched
         self.failure_reason = None
         self.adjustments = []
+        self.feedback = None
 
         # Add timestamps for timeout tracking
         current_time = datetime.datetime.now(tz=datetime.timezone.utc).isoformat()
