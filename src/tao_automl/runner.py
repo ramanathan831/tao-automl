@@ -1,21 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""AutoML runner: wires the tao_automl brain to a platform SDK for HPO.
+"""AutoML runner: wires the tao_automl brain to an execution SDK for HPO.
 
-The runner is platform-agnostic: it accepts any of the 5 platform SDKs
-(Lepton/Slurm/Kubernetes/Docker/Brev). The caller picks the platform; the
-runner doesn't choose for them.
+The runner is platform-agnostic: it accepts the container platform SDKs
+(Lepton/Slurm/Kubernetes/Docker/Brev) or VirtualEnvSDK for direct Python
+scripts. The caller picks the runtime; the runner doesn't choose for them.
 
 Usage::
 
     from pathlib import Path
-    from tao_sdk.platforms.lepton import LeptonSDK   # or Slurm/K8s/Docker/Brev
+    from tao_sdk.platforms.docker import DockerSDK
     from tao_automl.runner import AutoMLRunner
 
-    sdk = LeptonSDK()                                 # reads creds from env
+    sdk = DockerSDK()
     runner = AutoMLRunner(
         sdk=sdk,
-        skill_dir=Path.home() / "tao-sdk/tao-skills-external/models/cosmos-rl",
+        skill_dir=(Path.home() / "tao-skills-external/skills/models/"
+                   "tao-finetune-cosmos-reason"),
         action="train",
     )
     result = runner.run(
@@ -81,9 +82,11 @@ class SkillContext:
     skill_info: dict[str, Any] = field(init=False)
     action_cfg: dict[str, Any] = field(init=False)
     default_specs: dict[str, Any] = field(init=False)
+    schema: dict[str, Any] | None = field(init=False)
     valid_spec_keys: set[str] = field(init=False)
     container_image: str = field(init=False)
     network_arch: str = field(init=False)
+    execution: "PythonScriptExecution | None" = field(init=False)
 
     def __post_init__(self):
         self.skill_dir = Path(self.skill_dir)
@@ -91,8 +94,8 @@ class SkillContext:
         if not info_path.exists():
             raise FileNotFoundError(
                 f"skill_info.yaml not found at {info_path}. "
-                f"skill_dir must point at a model directory inside "
-                f"tao-skills-external/models/<name>/."
+                f"skill_dir must point at a model directory containing "
+                f"references/skill_info.yaml."
             )
         self.skill_info = yaml.safe_load(info_path.read_text()) or {}
 
@@ -112,20 +115,45 @@ class SkillContext:
         schema_path = self.skill_dir / f"schemas/{self.action}.schema.json"
         if schema_path.exists():
             with open(schema_path) as f:
-                schema = json.load(f) or {}
-            self.valid_spec_keys = _schema_property_keys(schema) | _flatten_keys(
-                schema.get("default", {})
+                self.schema = json.load(f) or {}
+            if not isinstance(self.schema, dict):
+                raise TypeError(f"{schema_path}: schema must be a JSON object")
+            if not template_path.exists():
+                schema_defaults = self.schema.get("default")
+                if isinstance(schema_defaults, dict):
+                    self.default_specs = copy.deepcopy(schema_defaults)
+            self.valid_spec_keys = _schema_property_keys(self.schema) | _flatten_keys(
+                self.schema.get("default", {})
             ) | _flatten_keys(self.default_specs)
         else:
+            self.schema = None
             self.valid_spec_keys = _flatten_keys(self.default_specs)
 
+        self.execution = PythonScriptExecution.from_config(
+            self.action_cfg.get("execution"),
+            skill_dir=self.skill_dir,
+            default_config_format=self.action_cfg.get("config_format", "yaml"),
+        )
+        if self.execution is not None and self.schema is None:
+            raise FileNotFoundError(
+                "python_script actions require an external AutoML schema at "
+                f"{schema_path}"
+            )
+        if self.execution is not None:
+            _validate_external_automl_schema(self.schema, schema_path)
+
         # Container image: action-level image overrides win, then model-level.
-        # Values may be versions.yaml keys or absolute URIs.
-        from tao_sdk.versions import resolve_container_image
-        self.container_image = resolve_container_image(
+        # Python-script actions do not require an image, so an omitted image is
+        # valid and must not trigger versions.yaml resolution.
+        image_ref = (
             self.action_cfg.get("container_image")
             or self.skill_info.get("container_image", "")
         )
+        if self.execution is None and image_ref:
+            from tao_sdk.versions import resolve_container_image
+            self.container_image = resolve_container_image(image_ref)
+        else:
+            self.container_image = ""
 
     def validate_runtime(self) -> dict[str, Any]:
         """Validate that the model/action can be loaded by AutoML runtime code.
@@ -135,9 +163,11 @@ class SkillContext:
         catches issues such as ``cosmos-rl`` versus ``cosmos_rl`` package names
         before a long-running launch starts.
         """
-        from tao_automl.schema.generate_schema import generate_schema
-
-        schema = generate_schema(self.network_arch, self.action)
+        if self.execution is not None and self.schema is not None:
+            schema = self.schema
+        else:
+            from tao_automl.schema.generate_schema import generate_schema
+            schema = generate_schema(self.network_arch, self.action)
         return {
             "network_arch": self.network_arch,
             "action": self.action,
@@ -146,12 +176,150 @@ class SkillContext:
         }
 
 
+@dataclass(frozen=True)
+class PythonScriptExecution:
+    """Direct Python action metadata resolved relative to a model skill."""
+
+    script: Path
+    script_args: tuple[str, ...]
+    config_format: str
+    cwd: Path
+
+    @classmethod
+    def from_config(
+        cls,
+        config: dict[str, Any] | None,
+        *,
+        skill_dir: Path,
+        default_config_format: str,
+    ) -> "PythonScriptExecution | None":
+        if config is None:
+            return None
+        if not isinstance(config, dict):
+            raise TypeError("action execution must be a mapping")
+        execution_type = config.get("type")
+        if execution_type != "python_script":
+            raise ValueError(
+                f"Unsupported action execution type {execution_type!r}; "
+                "expected 'python_script'."
+            )
+
+        script_value = config.get("script")
+        if not isinstance(script_value, str) or not script_value.strip():
+            raise ValueError("python_script execution requires a non-empty 'script' path")
+        script = Path(script_value).expanduser()
+        if not script.is_absolute():
+            script = skill_dir / script
+        script = script.resolve()
+        if not script.is_file():
+            raise FileNotFoundError(f"Python action script not found: {script}")
+
+        args = config.get(
+            "args",
+            config.get("script_args", ["--config", "{config_path}"]),
+        )
+        if not isinstance(args, (list, tuple)) or not all(
+            isinstance(arg, str) for arg in args
+        ):
+            raise TypeError("python_script execution 'args' must be a list of strings")
+
+        config_format = config.get("config_format", default_config_format)
+        if config_format not in {"json", "yaml", "toml"}:
+            raise ValueError(
+                "python_script config_format must be one of: json, yaml, toml"
+            )
+
+        cwd_value = config.get("cwd", ".")
+        if not isinstance(cwd_value, str) or not cwd_value.strip():
+            raise ValueError("python_script execution 'cwd' must be a non-empty path")
+        cwd = Path(cwd_value).expanduser()
+        if not cwd.is_absolute():
+            cwd = skill_dir / cwd
+        cwd = cwd.resolve()
+        if not cwd.is_dir():
+            raise NotADirectoryError(f"Python action cwd not found: {cwd}")
+
+        return cls(
+            script=script,
+            script_args=tuple(args),
+            config_format=config_format,
+            cwd=cwd,
+        )
+
+
 def validate_skill_runtime(skill_dir: str | Path, action: str = "train") -> dict[str, Any]:
     """Load a skill directory and validate its AutoML runtime schema path."""
     return SkillContext(skill_dir=Path(skill_dir), action=action).validate_runtime()
 
 _DEFAULT_POLL_INTERVAL = 30
+_POLL_LOG_TAIL_LINES = 10_000
+_TERMINAL_LOG_OVERLAP_CHARS = 8 * 1024
+_TERMINAL_LOG_CONTEXT_CHARS = 64 * 1024
 _TERMINAL_STATUSES = {"Complete", "Error", "Canceled"}
+
+
+def _iter_terminal_log_chunks(sdk, job_id: str):
+    """Yield bounded terminal log snapshots, streaming when the SDK can."""
+    stream_method = getattr(type(sdk), "iter_job_log_chunks", None)
+    if callable(stream_method):
+        try:
+            yield from stream_method(sdk, job_id)
+        except Exception as exc:
+            logger.warning("Failed to stream terminal logs for job %s: %s", job_id, exc)
+        return
+    try:
+        # Preserve existing behavior for container SDKs that do not expose
+        # paged logs. VirtualEnvSDK always takes the bounded streaming path.
+        logs = sdk.get_job_logs(job_id)
+    except Exception:
+        return
+    if logs:
+        yield logs
+
+
+def _scan_terminal_logs(
+    sdk,
+    job_id: str,
+    metric_name: str,
+    extract_fn,
+    cached_metric: float | None,
+    cached_exec_status: str | None,
+) -> tuple[float | None, str | None, str]:
+    """Extract terminal signals without materializing an unbounded log."""
+    overlap = ""
+    context = ""
+    latest_explicit_status = None
+    cleanup_failure_seen = False
+    hard_failure_seen = False
+    for chunk in _iter_terminal_log_chunks(sdk, job_id):
+        if not isinstance(chunk, str) or not chunk:
+            continue
+        scan_text = overlap + chunk
+        try:
+            metric = extract_fn(scan_text, metric_name)
+        except Exception as exc:
+            logger.warning("metric_extractor raised for job %s: %s", job_id, exc)
+            metric = None
+        if metric is not None:
+            cached_metric = metric
+
+        explicit_status = _latest_explicit_execution_status(scan_text)
+        if explicit_status is not None:
+            latest_explicit_status = explicit_status
+        cleanup_failure_seen = cleanup_failure_seen or any(
+            pattern in scan_text for pattern in _CLEANUP_FATAL_PATTERNS
+        )
+        hard_failure_seen = hard_failure_seen or _has_hard_failure_pattern(
+            scan_text
+        )
+
+        context = (context + chunk)[-_TERMINAL_LOG_CONTEXT_CHARS:]
+        overlap = scan_text[-_TERMINAL_LOG_OVERLAP_CHARS:]
+    if latest_explicit_status is not None:
+        cached_exec_status = latest_explicit_status
+    elif hard_failure_seen or (cleanup_failure_seen and cached_metric is None):
+        cached_exec_status = "FAIL"
+    return cached_metric, cached_exec_status, context
 
 
 _COSMOS_RL_SFT_VAL_RE = re.compile(
@@ -409,6 +577,42 @@ def _extract_metric_from_best_score_file(
         return None
 
 
+def _extract_metric_from_metrics_payload(
+    payload: str | dict[str, Any], metric_name: str,
+) -> float | None:
+    """Read a requested metric from a direct script's ``metrics.json``."""
+    try:
+        data = json.loads(payload) if isinstance(payload, str) else payload
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    aliases = [metric_name, *_metric_aliases(metric_name)]
+    aliases.extend(alias.replace("/", "_") for alias in list(aliases))
+    for key in dict.fromkeys(aliases):
+        if key not in data:
+            continue
+        try:
+            value = float(data[key])
+        except (TypeError, ValueError):
+            continue
+        if value == value:
+            return value
+    return None
+
+
+def _extract_metric_from_metrics_file(
+    metrics_path: Path, metric_name: str,
+) -> float | None:
+    try:
+        return _extract_metric_from_metrics_payload(
+            metrics_path.read_text(encoding="utf-8"), metric_name
+        )
+    except OSError:
+        return None
+
+
 def _extract_metric_from_local_results(job_id: str, metric_name: str,
                                        platform_kwargs: dict | None) -> float | None:
     """Fallback for local runs whose metrics are written to result artifacts.
@@ -432,6 +636,10 @@ def _extract_metric_from_local_results(job_id: str, metric_name: str,
             )
             if metric is not None:
                 return metric
+        for metrics_path in sorted(job_root.rglob("metrics.json")):
+            metric = _extract_metric_from_metrics_file(metrics_path, metric_name)
+            if metric is not None:
+                return metric
         for status_path in sorted(job_root.rglob("status.json")):
             metric = _extract_metric_from_status_file(status_path, metric_name)
             if metric is not None:
@@ -451,6 +659,9 @@ def _extract_metric_from_sdk_results(sdk, job_id: str,
         "train_output_dir/best/best_score.json",
         "results_dir/best/best_score.json",
         "best/best_score.json",
+        "train_output_dir/metrics.json",
+        "results_dir/metrics.json",
+        "metrics.json",
     )
 
     read_remote = getattr(sdk, "read_job_result_file", None)
@@ -462,7 +673,10 @@ def _extract_metric_from_sdk_results(sdk, job_id: str,
                 payload = ""
             if not payload:
                 continue
-            metric = _extract_metric_from_best_score_payload(payload, metric_name)
+            if relative_path.endswith("metrics.json"):
+                metric = _extract_metric_from_metrics_payload(payload, metric_name)
+            else:
+                metric = _extract_metric_from_best_score_payload(payload, metric_name)
             if metric is not None:
                 return metric
 
@@ -476,6 +690,10 @@ def _extract_metric_from_sdk_results(sdk, job_id: str,
             metric = _extract_metric_from_best_score_file(
                 best_score_path, metric_name
             )
+            if metric is not None:
+                return metric
+        for metrics_path in sorted(results_path.rglob("metrics.json")):
+            metric = _extract_metric_from_metrics_file(metrics_path, metric_name)
             if metric is not None:
                 return metric
         for status_path in sorted(results_path.rglob("status.json")):
@@ -701,16 +919,24 @@ def _check_execution_status(
     """Check if logs contain Execution status: PASS or FAIL."""
     if not logs:
         return None
-    for line in reversed(logs.strip().splitlines()):
-        if "Execution status: PASS" in line:
-            return "PASS"
-        if "Execution status: FAIL" in line:
-            return "FAIL"
+    explicit_status = _latest_explicit_execution_status(logs)
+    if explicit_status is not None:
+        return explicit_status
     if not include_fatal_patterns:
         return None
     fatal_patterns = _CLEANUP_FATAL_PATTERNS + _HARD_FATAL_PATTERNS
     if any(pattern in logs for pattern in fatal_patterns):
         return "FAIL"
+    return None
+
+
+def _latest_explicit_execution_status(logs: str) -> str | None:
+    """Return the last explicit PASS/FAIL marker in a log snapshot."""
+    for line in reversed((logs or "").strip().splitlines()):
+        if "Execution status: PASS" in line:
+            return "PASS"
+        if "Execution status: FAIL" in line:
+            return "FAIL"
     return None
 
 
@@ -837,6 +1063,99 @@ def _schema_property_keys(schema: Any, prefix: str = "") -> set[str]:
         keys.add(indexed)
         keys |= _schema_property_keys(items, indexed)
     return keys
+
+
+def _validate_external_automl_schema(schema: Any, schema_path: Path) -> None:
+    """Fail early when a direct-script search schema is structurally unusable."""
+    if not isinstance(schema, dict):
+        raise TypeError(f"{schema_path}: schema must be a JSON object")
+    if schema.get("type", "object") != "object":
+        raise ValueError(f"{schema_path}: root schema type must be 'object'")
+    if "default" in schema and not isinstance(schema["default"], dict):
+        raise TypeError(f"{schema_path}: schema 'default' must be a JSON object")
+    properties = schema.get("properties")
+    if not isinstance(properties, dict) or not properties:
+        raise ValueError(
+            f"{schema_path}: schema requires a non-empty 'properties' object"
+        )
+
+    def validate_properties(nodes: dict, prefix: str = "") -> int:
+        leaf_count = 0
+        for name, node in nodes.items():
+            dotted = f"{prefix}.{name}" if prefix else str(name)
+            if not isinstance(name, str) or not name:
+                raise TypeError(f"{schema_path}: property names must be non-empty strings")
+            if not isinstance(node, dict):
+                raise TypeError(f"{schema_path}: property {dotted!r} must be an object")
+            raw_type = node.get("type")
+            object_like = (
+                isinstance(raw_type, str)
+                and raw_type in {"object", "collection", "dict"}
+            )
+            if object_like:
+                if "properties" not in node:
+                    raise ValueError(
+                        f"{schema_path}: object property {dotted!r} requires "
+                        "nested properties"
+                    )
+                nested = node["properties"]
+                if not isinstance(nested, dict) or not nested:
+                    raise ValueError(
+                        f"{schema_path}: property {dotted!r} requires non-empty "
+                        "nested properties"
+                    )
+                leaf_count += validate_properties(nested, dotted)
+            else:
+                if node.get("properties"):
+                    raise ValueError(
+                        f"{schema_path}: property {dotted!r} with nested properties "
+                        "must declare an object-like type"
+                    )
+                value_type = node.get("type")
+                if isinstance(value_type, list):
+                    raise ValueError(
+                        f"{schema_path}: property {dotted!r} uses an unsupported "
+                        "list-valued 'type'; use anyOf for optional values"
+                    )
+                if value_type is not None and not isinstance(value_type, str):
+                    raise TypeError(
+                        f"{schema_path}: property {dotted!r} 'type' must be a string"
+                    )
+                any_of = node.get("anyOf")
+                if any_of is not None:
+                    if (
+                        not isinstance(any_of, list)
+                        or not any_of
+                        or not all(isinstance(option, dict) for option in any_of)
+                    ):
+                        raise ValueError(
+                            f"{schema_path}: property {dotted!r} 'anyOf' must be "
+                            "a non-empty list of schema objects"
+                        )
+                    option_types = [option.get("type") for option in any_of]
+                    if not all(isinstance(option_type, str) for option_type in option_types):
+                        raise ValueError(
+                            f"{schema_path}: property {dotted!r} anyOf options "
+                            "must declare scalar string types"
+                        )
+                    non_null_types = [
+                        option_type for option_type in option_types
+                        if option_type != "null"
+                    ]
+                    if len(non_null_types) != 1:
+                        raise ValueError(
+                            f"{schema_path}: property {dotted!r} supports exactly "
+                            "one non-null anyOf type"
+                        )
+                if not value_type and any_of is None:
+                    raise ValueError(
+                        f"{schema_path}: property {dotted!r} requires 'type' or 'anyOf'"
+                    )
+                leaf_count += 1
+        return leaf_count
+
+    if validate_properties(properties) == 0:
+        raise ValueError(f"{schema_path}: schema does not declare any leaf parameters")
 
 
 def _validate_keys_against_schema(provided_keys, base_specs, kind, schema_keys=None):
@@ -1185,12 +1504,12 @@ def _load_active_jobs(workspace_path: str) -> list:
 class AutoMLRunner:
     """Wires AutoML brain to SDK execution for automated HPO loops.
 
-    The runner accepts any of the 5 platform SDKs (LeptonSDK / SlurmSDK /
-    KubernetesSDK / DockerSDK / BrevSDK). It does NOT pick a platform for
-    the caller — instantiate the SDK you want and pass it in.
+    The runner accepts any container platform SDK (LeptonSDK / SlurmSDK /
+    KubernetesSDK / DockerSDK / BrevSDK) or VirtualEnvSDK. It does NOT pick a
+    runtime for the caller — instantiate the SDK you want and pass it in.
 
-    ``skill_dir`` is the absolute path to a model directory inside the
-    skill bank (e.g. ``Path.home() / 'tao-sdk/tao-skills-external/models/dino'``).
+    ``skill_dir`` is the absolute path to a packaged or external model
+    directory (for example a directory under ``tao-skills-external/skills/models``).
     The runner reads ``references/skill_info.yaml`` and
     ``references/spec_template_<action>.yaml`` from there.
     """
@@ -1218,7 +1537,7 @@ class AutoMLRunner:
             eval_fn=None,
             baseline_fn=None,
             final_eval_fn=None,
-            on_recommendation=None, on_result=None,
+            on_recommendation=None, on_result=None, execution=None,
             **platform_kwargs) -> dict:
         """Run a full AutoML optimization loop.
 
@@ -1229,6 +1548,8 @@ class AutoMLRunner:
             workspace_id: Workspace ID (default: from SDK).
             image: Docker image override. Default: from skill_info.yaml's
                 ``container_image`` (resolved via tao_sdk.versions).
+                Invalid for ``python_script`` execution, which runs through
+                the virtual environment SDK without a container.
             automl_settings: Algorithm config (see AlgorithmParams).
             automl_hyperparameters: Param names to search, or None for schema defaults.
             custom_param_ranges: Per-param range overrides.
@@ -1237,14 +1558,19 @@ class AutoMLRunner:
                 AutoML starts. Dotted keys supported (e.g.
                 {"train.epoch": 5, "policy.model_max_length": 40960}).
             resume: If True, resume from persisted state in workspace_path.
+            execution: Optional ``python_script`` action mapping. This
+                overrides ``actions.<action>.execution`` from skill metadata.
+                Example: ``{"type": "python_script", "script":
+                "scripts/train.py", "args": ["--config", "{config_path}"]}``.
             **platform_kwargs: Forwarded to ``sdk.create_job(...)``. Pass
                 whichever kwargs your platform SDK accepts (Lepton:
                 ``dedicated_node_group``, ``resource_shape``, ``num_nodes``;
                 SLURM: ``partition``, ``account``, ``num_nodes``;
                 Kubernetes: ``namespace``, ``node_selector``, ``num_nodes``;
                 Docker: ``mounts``; Brev: ``instance_id``, ``gpu_type``).
+                Virtualenv: ``env_vars``, ``gpu_count``, and ``gpu_ids``.
                 Plus the platform-agnostic ``gpu_count`` (defaults to 1 if
-                not specified).
+                not specified by container SDKs).
             metric_extractor: Optional callable ``(logs: str, metric_name: str) -> float | None``
                 invoked on each poll of a rec's training logs to pull the
                 current/latest metric value. Return ``None`` if the metric
@@ -1308,8 +1634,39 @@ class AutoMLRunner:
         # the deleted SkillBank). action_cfg carries command/inputs/outputs/
         # config_format/upload_excludes — exactly what build_entrypoint takes.
         base_specs = copy.deepcopy(self.skill_ctx.default_specs)
-        resolved_image = image or self.skill_ctx.container_image
         action_cfg = self.skill_ctx.action_cfg
+        resolved_execution = (
+            PythonScriptExecution.from_config(
+                execution,
+                skill_dir=self.skill_ctx.skill_dir,
+                default_config_format=action_cfg.get("config_format", "yaml"),
+            )
+            if execution is not None
+            else self.skill_ctx.execution
+        )
+        if resolved_execution is not None:
+            schema_path = (
+                self.skill_ctx.skill_dir / f"schemas/{self.skill_ctx.action}.schema.json"
+            )
+            if self.skill_ctx.schema is None:
+                raise FileNotFoundError(
+                    "python_script actions require an external AutoML schema at "
+                    f"{schema_path}"
+                )
+            _validate_external_automl_schema(self.skill_ctx.schema, schema_path)
+            if image:
+                raise ValueError(
+                    "image cannot be used with python_script execution; "
+                    "the virtual environment is the runtime"
+                )
+            resolved_image = None
+        else:
+            resolved_image = image or self.skill_ctx.container_image
+            if not resolved_image:
+                raise ValueError(
+                    "Container execution requires an image in skill metadata "
+                    "or the run(image=...) override"
+                )
         data_format = self.skill_ctx.skill_info.get("data_format")
 
         # Tar-extraction note: the in-container script_runner now handles
@@ -1391,6 +1748,9 @@ class AutoMLRunner:
             train_specs=base_specs, settings=automl_settings,
             automl_hyperparameters=automl_hyperparameters,
             custom_param_ranges=custom_param_ranges,
+            search_schema=(
+                self.skill_ctx.schema if resolved_execution is not None else None
+            ),
             resume=resume,
         )
         logger.info("Starting AutoML loop: network=%s, algorithm=%s, "
@@ -1526,6 +1886,7 @@ class AutoMLRunner:
                 metric_value, status = self._run_one_job(
                     image=resolved_image, action_cfg=action_cfg,
                     specs=merged_specs, rec=rec, metric_name=metric_name,
+                    execution=resolved_execution,
                     metric_extractor=metric_extractor,
                     eval_fn=eval_fn,
                     workspace_path=workspace_path,
@@ -1684,34 +2045,55 @@ class AutoMLRunner:
         return result
 
     def _run_one_job(self, image, action_cfg, specs, rec, metric_name,
+                     execution=None,
                      metric_extractor=None,
                      eval_fn=None,
                      workspace_path=None,
                      platform_kwargs=None) -> tuple[float | None, str]:
         """Launch a single training job and wait for it to finish.
 
-        Builds a container command via ``tao_sdk.script_runner.build_entrypoint``
-        (inlines the in-container runner heredoc) and submits via the platform
-        SDK's ``create_job(image, command, **platform_kwargs)``. Output
-        destinations are resolved at runtime in the container from
-        ``TAO_RESULTS_ROOT`` / ``S3_BUCKET_NAME`` env vars the SDK injects.
+        Container actions use ``tao_sdk.script_runner.build_entrypoint`` and
+        ``sdk.create_job(image, command, ...)``. Python actions submit the
+        nested specs directly through ``sdk.create_python_job(...)``; the
+        virtualenv SDK writes the config and launches the script with its
+        environment's interpreter. Monitoring is shared by both paths.
         """
-        from tao_sdk.script_runner import build_entrypoint
-
         try:
-            ep = build_entrypoint(
-                command=action_cfg["command"],
-                specs=specs,
-                inputs=action_cfg.get("inputs"),
-                outputs=action_cfg.get("outputs"),
-                config_format=action_cfg.get("config_format", "toml"),
-                upload_excludes=action_cfg.get("upload_excludes", []),
-            )
-            job = self._sdk.create_job(
-                image=image,
-                command=ep["command"],
-                **(platform_kwargs or {}),
-            )
+            if execution is not None:
+                if not hasattr(self._sdk, "create_python_job"):
+                    raise TypeError(
+                        f"{type(self._sdk).__name__} does not support "
+                        "python_script execution; use VirtualEnvSDK"
+                    )
+                job = self._sdk.create_python_job(
+                    script=str(execution.script),
+                    specs=specs,
+                    config_format=execution.config_format,
+                    script_args=list(execution.script_args),
+                    inputs=action_cfg.get("inputs"),
+                    outputs=action_cfg.get("outputs"),
+                    upload_excludes=action_cfg.get("upload_excludes", []),
+                    cwd=str(execution.cwd),
+                    network_arch=self.skill_ctx.network_arch,
+                    action=self.skill_ctx.action,
+                    **(platform_kwargs or {}),
+                )
+            else:
+                from tao_sdk.script_runner import build_entrypoint
+
+                ep = build_entrypoint(
+                    command=action_cfg["command"],
+                    specs=specs,
+                    inputs=action_cfg.get("inputs"),
+                    outputs=action_cfg.get("outputs"),
+                    config_format=action_cfg.get("config_format", "toml"),
+                    upload_excludes=action_cfg.get("upload_excludes", []),
+                )
+                job = self._sdk.create_job(
+                    image=image,
+                    command=ep["command"],
+                    **(platform_kwargs or {}),
+                )
         except Exception as e:
             logger.error("Failed to create job for rec %d: %s", rec.id, e)
             rec.failure_reason = f"job_creation_failed: {e}"
@@ -1740,7 +2122,9 @@ class AutoMLRunner:
 
             # Read logs every poll cycle to cache metrics before they expire
             try:
-                logs = self._sdk.get_job_logs(job.id)
+                logs = self._sdk.get_job_logs(
+                    job.id, tail=_POLL_LOG_TAIL_LINES
+                )
                 if logs:
                     all_logs = logs  # Keep latest snapshot
                     try:
@@ -1807,30 +2191,16 @@ class AutoMLRunner:
             if job_status.status in _TERMINAL_STATUSES:
                 break
 
-        # Final log read (may be empty if Lepton already cleaned up)
-        try:
-            final_logs = self._sdk.get_job_logs(job.id)
-            if final_logs:
-                all_logs = final_logs
-                try:
-                    m = extract_fn(final_logs, metric_name)
-                except Exception as ex:
-                    logger.warning("metric_extractor raised for rec %d: %s",
-                                   rec.id, ex)
-                    m = None
-                if m is not None:
-                    cached_metric = m
-                es = _check_execution_status(
-                    final_logs,
-                    include_fatal_patterns=(
-                        cached_metric is None
-                        or _has_hard_failure_pattern(final_logs)
-                    ),
-                )
-                if es:
-                    cached_exec_status = es
-        except Exception:
-            pass
+        cached_metric, cached_exec_status, terminal_logs = _scan_terminal_logs(
+            self._sdk,
+            job.id,
+            metric_name,
+            extract_fn,
+            cached_metric,
+            cached_exec_status,
+        )
+        if terminal_logs:
+            all_logs = terminal_logs
 
         if cached_metric is None:
             artifact_metric = _recover_metric_from_artifacts(
@@ -1952,7 +2322,9 @@ class AutoMLRunner:
         while True:
             time.sleep(self._poll_interval)
             try:
-                logs = self._sdk.get_job_logs(job_id)
+                logs = self._sdk.get_job_logs(
+                    job_id, tail=_POLL_LOG_TAIL_LINES
+                )
                 if logs:
                     all_logs = logs
                     try:
@@ -2020,27 +2392,16 @@ class AutoMLRunner:
             if job_status.status in _TERMINAL_STATUSES:
                 break
 
-        # Final log read
-        try:
-            final_logs = self._sdk.get_job_logs(job_id)
-            if final_logs:
-                try:
-                    m = extract_fn(final_logs, metric_name)
-                except Exception:
-                    m = None
-                if m is not None:
-                    cached_metric = m
-                es = _check_execution_status(
-                    final_logs,
-                    include_fatal_patterns=(
-                        cached_metric is None
-                        or _has_hard_failure_pattern(final_logs)
-                    ),
-                )
-                if es:
-                    cached_exec_status = es
-        except Exception:
-            pass
+        cached_metric, cached_exec_status, terminal_logs = _scan_terminal_logs(
+            self._sdk,
+            job_id,
+            metric_name,
+            extract_fn,
+            cached_metric,
+            cached_exec_status,
+        )
+        if terminal_logs:
+            all_logs = terminal_logs
 
         if cached_metric is None:
             artifact_metric = _recover_metric_from_artifacts(
@@ -2381,31 +2742,36 @@ class AutoMLRunner:
         return merged
 
 
-_PLATFORMS = ("lepton", "slurm", "kubernetes", "docker", "brev")
+_PLATFORMS = (
+    "lepton", "slurm", "kubernetes", "docker", "brev", "virtualenv",
+)
 
 
-def _make_sdk(platform: str):
+def _make_sdk(platform: str, **sdk_kwargs):
     """Construct a platform SDK by name. No default — caller must pick.
 
     Matches platform/tao-sdk/SKILL.md's "It does not select platforms
-    automatically" stance: none of the 5 SDKs is a sensible default
+    automatically" stance: none of the SDKs is a sensible default
     (Lepton biases DGX Cloud, SLURM biases on-prem clusters, etc.).
     """
     if platform == "lepton":
         from tao_sdk.platforms.lepton import LeptonSDK
-        return LeptonSDK()
+        return LeptonSDK(**sdk_kwargs)
     if platform == "slurm":
         from tao_sdk.platforms.slurm import SlurmSDK
-        return SlurmSDK()
+        return SlurmSDK(**sdk_kwargs)
     if platform == "kubernetes":
         from tao_sdk.platforms.kubernetes import KubernetesSDK
-        return KubernetesSDK()
+        return KubernetesSDK(**sdk_kwargs)
     if platform == "docker":
         from tao_sdk.platforms.docker import DockerSDK
-        return DockerSDK()
+        return DockerSDK(**sdk_kwargs)
     if platform == "brev":
         from tao_sdk.platforms.brev import BrevSDK
-        return BrevSDK()
+        return BrevSDK(**sdk_kwargs)
+    if platform == "virtualenv":
+        from tao_sdk.platforms.virtualenv import VirtualEnvSDK
+        return VirtualEnvSDK(**sdk_kwargs)
     raise ValueError(
         f"Unknown platform {platform!r}. Choose one of: {', '.join(_PLATFORMS)}."
     )
@@ -2415,8 +2781,11 @@ def run_automl_plan(plan: dict, platform: str) -> dict:
     """Execute an AutoML plan file on the chosen platform.
 
     The plan JSON's ``params`` block must include ``skill_dir`` (absolute
-    path to a model directory inside tao-skills-external). Per-platform
-    create_job kwargs go under ``params.platform_kwargs``.
+    path to a packaged or external model metadata directory). Per-job kwargs
+    go under ``params.platform_kwargs``. SDK constructor
+    kwargs go under ``params.sdk_kwargs``; a virtualenv plan must provide at
+    least ``sdk_kwargs.venv_path``. Direct-script metadata may live in the
+    model action or in ``params.execution``.
     """
     if not plan.get("ready"):
         issues = plan.get("blocking_issues", ["Unknown issue"])
@@ -2432,11 +2801,12 @@ def run_automl_plan(plan: dict, platform: str) -> dict:
     skill_dir = params.get("skill_dir")
     if not skill_dir:
         raise ValueError("plan.steps[0].params.skill_dir is required "
-                         "(absolute path to a model dir in tao-skills-external).")
+                         "(absolute path to a model metadata directory).")
     action = params.get("action", "train")
     platform_kwargs = params.get("platform_kwargs") or {}
+    sdk_kwargs = params.get("sdk_kwargs") or {}
 
-    sdk = _make_sdk(platform)
+    sdk = _make_sdk(platform, **sdk_kwargs)
     runner = AutoMLRunner(sdk=sdk, skill_dir=skill_dir, action=action)
     global _runner
     _runner = runner
@@ -2451,6 +2821,7 @@ def run_automl_plan(plan: dict, platform: str) -> dict:
         custom_param_ranges=plan.get("custom_param_ranges"),
         workspace_path=plan.get("automl_workspace_path", "./automl_workspace"),
         spec_overrides=params.get("spec_overrides"),
+        execution=params.get("execution"),
         **platform_kwargs,
     )
     print(json.dumps(result, indent=2, default=str))

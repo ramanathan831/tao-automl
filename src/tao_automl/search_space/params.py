@@ -48,6 +48,7 @@ def generate_hyperparams_to_search(
     train_specs,
     automl_hyperparameters,
     override_automl_disabled_params=False,
+    schema=None,
 ):
     """Determine which hyperparameters to include in the AutoML search space.
 
@@ -63,6 +64,9 @@ def generate_hyperparams_to_search(
         automl_hyperparameters: List of parameter names to enable for search.
         override_automl_disabled_params: If True, include parameters even when
             their schema ``automl_enabled`` flag is False.
+        schema: Optional pre-built JSON schema. When supplied, it is used as
+            the search-space source instead of importing the built-in TAO
+            configuration module for ``network``.
 
     Returns:
         Tuple of ``(param_records, param_names)`` where *param_records* is a
@@ -79,12 +83,15 @@ def generate_hyperparams_to_search(
     if network_arch in AUTOML_DISABLED_NETWORKS:
         return [{}], []
 
-    try:
-        json_schema = generate_schema(network_arch, "train")
-    except Exception as e:
-        logger.info("Error generating schema for network: %s", network_arch)
-        logger.info("Network: %s, Action: %s", network, action)
-        raise Exception(e) from e
+    if schema is not None:
+        json_schema = schema
+    else:
+        try:
+            json_schema = generate_schema(network_arch, "train")
+        except Exception as e:
+            logger.info("Error generating schema for network: %s", network_arch)
+            logger.info("Network: %s, Action: %s", network, action)
+            raise Exception(e) from e
 
     # Flatten original (default) spec from the schema
     original_train_spec = json_schema.get("default", {})

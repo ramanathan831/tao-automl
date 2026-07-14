@@ -12,6 +12,7 @@ Validates:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -51,6 +52,71 @@ def _write_fake_skill(tmp_path: Path, action: str = "train") -> Path:
         "dataset:\n"
         "  num_classes: 80\n"
     )
+    return skill_dir
+
+
+def _write_python_skill(tmp_path: Path) -> Path:
+    """Create an external model skill backed by a direct Python script."""
+    skill_dir = tmp_path / "models" / "public-random-forest"
+    refs = skill_dir / "references"
+    schemas = skill_dir / "schemas"
+    scripts = skill_dir / "scripts"
+    refs.mkdir(parents=True)
+    schemas.mkdir()
+    scripts.mkdir()
+    (scripts / "train.py").write_text(
+        "import argparse\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--config', required=True)\n"
+        "parser.parse_args()\n"
+        "print('accuracy: 0.875', flush=True)\n"
+    )
+    (refs / "skill_info.yaml").write_text(
+        "network_arch: public_random_forest\n"
+        "actions:\n"
+        "  train:\n"
+        "    config_format: json\n"
+        "    execution:\n"
+        "      type: python_script\n"
+        "      script: scripts/train.py\n"
+        "      args: [--config, '{config_path}']\n"
+        "      cwd: .\n"
+        "    outputs:\n"
+        "      results_dir:\n"
+        "        type: folder\n"
+    )
+    default_specs = {
+        "model": {"n_estimators": 10, "max_depth": 3},
+        "results_dir": "",
+    }
+    (refs / "spec_template_train.yaml").write_text(
+        "model:\n"
+        "  n_estimators: 10\n"
+        "  max_depth: 3\n"
+        "results_dir: ''\n"
+    )
+    (schemas / "train.schema.json").write_text(json.dumps({
+        "type": "object",
+        "default": default_specs,
+        "properties": {
+            "model": {
+                "type": "object",
+                "properties": {
+                    "n_estimators": {
+                        "type": "integer", "default": 10,
+                        "minimum": 2, "maximum": 20,
+                        "automl_enabled": True,
+                    },
+                    "max_depth": {
+                        "type": "integer", "default": 3,
+                        "minimum": 1, "maximum": 6,
+                        "automl_enabled": True,
+                    },
+                },
+            },
+            "results_dir": {"type": "string", "default": ""},
+        },
+    }))
     return skill_dir
 
 
@@ -101,6 +167,129 @@ def test_skill_context_missing_skill_info_raises(tmp_path):
     from tao_automl.runner import SkillContext
     with pytest.raises(FileNotFoundError, match="skill_info.yaml"):
         SkillContext(skill_dir=tmp_path / "nonexistent", action="train")
+
+
+def test_skill_context_resolves_python_script_execution_and_external_schema(tmp_path):
+    from tao_automl.runner import SkillContext
+
+    skill_dir = _write_python_skill(tmp_path)
+    ctx = SkillContext(skill_dir=skill_dir, action="train")
+
+    assert ctx.container_image == ""
+    assert ctx.execution.script == (skill_dir / "scripts/train.py").resolve()
+    assert ctx.execution.script_args == ("--config", "{config_path}")
+    assert ctx.execution.config_format == "json"
+    assert ctx.execution.cwd == skill_dir.resolve()
+    assert ctx.schema["default"]["model"]["n_estimators"] == 10
+
+
+def test_skill_context_rejects_missing_python_script(tmp_path):
+    from tao_automl.runner import SkillContext
+
+    skill_dir = _write_python_skill(tmp_path)
+    (skill_dir / "scripts/train.py").unlink()
+
+    with pytest.raises(FileNotFoundError, match="Python action script not found"):
+        SkillContext(skill_dir=skill_dir, action="train")
+
+
+def test_skill_context_requires_external_schema_for_python_script(tmp_path):
+    from tao_automl.runner import SkillContext
+
+    skill_dir = _write_python_skill(tmp_path)
+    (skill_dir / "schemas/train.schema.json").unlink()
+
+    with pytest.raises(FileNotFoundError, match="require an external AutoML schema"):
+        SkillContext(skill_dir=skill_dir, action="train")
+
+
+@pytest.mark.parametrize(
+    ("schema", "message"),
+    [
+        ({}, "non-empty 'properties'"),
+        ({"type": "object", "default": [], "properties": {"x": {"type": "integer"}}},
+         "'default' must be a JSON object"),
+        ({"type": "object", "properties": {"model": {"type": "object", "properties": {}}}},
+         "requires non-empty nested properties"),
+        ({"type": "object", "properties": {"x": {"anyOf": True}}},
+         "'anyOf' must be a non-empty list"),
+        ({"type": "object", "properties": {"x": {"type": ["integer", "null"]}}},
+         "list-valued 'type'"),
+    ],
+)
+def test_skill_context_rejects_malformed_python_search_schema(
+    tmp_path, schema, message,
+):
+    from tao_automl.runner import SkillContext
+
+    skill_dir = _write_python_skill(tmp_path)
+    (skill_dir / "schemas/train.schema.json").write_text(json.dumps(schema))
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        SkillContext(skill_dir=skill_dir, action="train")
+
+
+def test_optional_anyof_schema_uses_non_null_search_type(tmp_path):
+    from tao_automl.runner import SkillContext
+    from tao_automl.search_space.params import generate_hyperparams_to_search
+
+    skill_dir = _write_python_skill(tmp_path)
+    schema_path = skill_dir / "schemas/train.schema.json"
+    schema = json.loads(schema_path.read_text())
+    n_estimators = schema["properties"]["model"]["properties"]["n_estimators"]
+    n_estimators.pop("type")
+    n_estimators["anyOf"] = [{"type": "null"}, {"type": "integer"}]
+    n_estimators["properties"] = {}
+    schema_path.write_text(json.dumps(schema))
+
+    ctx = SkillContext(skill_dir=skill_dir, action="train")
+    _, names = generate_hyperparams_to_search(
+        ctx.network_arch,
+        "train",
+        ctx.default_specs,
+        ["model.n_estimators"],
+        schema=ctx.schema,
+    )
+
+    assert names == ["model.n_estimators"]
+
+
+def test_runtime_python_execution_override_requires_external_schema(tmp_path):
+    from tao_automl.runner import AutoMLRunner
+
+    skill_dir = _write_fake_skill(tmp_path)
+    script = skill_dir / "train.py"
+    script.write_text("print('accuracy: 1.0')\n")
+    runner = AutoMLRunner(sdk=MagicMock(), skill_dir=skill_dir, action="train")
+
+    with pytest.raises(FileNotFoundError, match="external AutoML schema"):
+        runner.run(
+            execution={"type": "python_script", "script": str(script)},
+            workspace_path=str(tmp_path / "workspace"),
+        )
+
+
+def test_external_schema_defaults_are_used_when_template_is_absent(tmp_path):
+    from tao_automl.runner import SkillContext
+
+    skill_dir = _write_python_skill(tmp_path)
+    (skill_dir / "references/spec_template_train.yaml").unlink()
+
+    ctx = SkillContext(skill_dir=skill_dir, action="train")
+    assert ctx.default_specs["model"] == {"n_estimators": 10, "max_depth": 3}
+
+
+def test_python_script_action_does_not_resolve_unused_container_image(tmp_path):
+    from tao_automl.runner import SkillContext
+
+    skill_dir = _write_python_skill(tmp_path)
+    info_path = skill_dir / "references/skill_info.yaml"
+    info_path.write_text(
+        "container_image: key.that.does.not.exist\n" + info_path.read_text()
+    )
+
+    ctx = SkillContext(skill_dir=skill_dir, action="train")
+    assert ctx.container_image == ""
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +354,92 @@ def test_extract_metric_reads_cosmos_best_score_json(tmp_path):
     )
 
     assert metric == pytest.approx(0.8927091135965706)
+
+
+def test_extract_metric_reads_direct_script_metrics_json(tmp_path):
+    from tao_automl.runner import _extract_metric_from_sdk_results
+
+    results_dir = tmp_path / "job-results"
+    metrics_path = results_dir / "results_dir" / "metrics.json"
+    metrics_path.parent.mkdir(parents=True)
+    metrics_path.write_text('{"accuracy": 0.9375, "score": 0.4}\n')
+
+    class ResultsSDK:
+        def get_job_results_dir(self, job_id):
+            return str(results_dir)
+
+    assert _extract_metric_from_sdk_results(
+        ResultsSDK(), "job-1", "accuracy"
+    ) == pytest.approx(0.9375)
+
+
+def test_streamed_terminal_scan_uses_latest_explicit_status_marker():
+    from tao_automl.runner import _extract_metric_from_logs, _scan_terminal_logs
+
+    class StreamingSDK:
+        def iter_job_log_chunks(self, job_id, chunk_size=256 * 1024):
+            yield "Execution status: FAIL\n"
+            yield "noise\n" * 2_000
+            yield "accuracy: 0.9\nExecution status: PASS\n"
+
+    metric, status, _ = _scan_terminal_logs(
+        StreamingSDK(), "job-1", "accuracy", _extract_metric_from_logs, None, None
+    )
+
+    assert metric == pytest.approx(0.9)
+    assert status == "PASS"
+
+
+def test_non_streaming_sdk_retains_full_terminal_log_compatibility():
+    from tao_automl.runner import _extract_metric_from_logs, _scan_terminal_logs
+
+    full_logs = "accuracy: 0.875\n" + "noise\n" * 10_001
+
+    class LegacySDK:
+        def __init__(self):
+            self.requested_tails = []
+
+        def get_job_logs(self, job_id, tail=None):
+            self.requested_tails.append(tail)
+            if tail is None:
+                return full_logs
+            return "".join(full_logs.splitlines(keepends=True)[-tail:])
+
+    sdk = LegacySDK()
+    metric, status, _ = _scan_terminal_logs(
+        sdk, "job-1", "accuracy", _extract_metric_from_logs, None, None
+    )
+
+    assert metric == pytest.approx(0.875)
+    assert status is None
+    assert sdk.requested_tails == [None]
+
+
+def test_non_streaming_terminal_scan_finds_early_fail_with_cached_metric():
+    from tao_automl.runner import _extract_metric_from_logs, _scan_terminal_logs
+
+    full_logs = (
+        "Execution status: FAIL\n"
+        + "noise\n" * 10_001
+        + "accuracy: 0.9\n"
+    )
+
+    class LegacySDK:
+        def get_job_logs(self, job_id, tail=None):
+            assert tail is None
+            return full_logs
+
+    metric, status, _ = _scan_terminal_logs(
+        LegacySDK(),
+        "job-1",
+        "accuracy",
+        _extract_metric_from_logs,
+        0.9,
+        None,
+    )
+
+    assert metric == pytest.approx(0.9)
+    assert status == "FAIL"
 
 
 def test_llm_config_accepts_provider_aliases():
@@ -512,14 +787,33 @@ def test_make_sdk_rejects_unknown_platform():
         _make_sdk("aws-batch")
 
 
-def test_make_sdk_lists_all_5_platforms_in_error():
+def test_make_sdk_lists_all_platforms_in_error():
     from tao_automl.runner import _make_sdk, _PLATFORMS
-    assert set(_PLATFORMS) == {"lepton", "slurm", "kubernetes", "docker", "brev"}
+    assert set(_PLATFORMS) == {
+        "lepton", "slurm", "kubernetes", "docker", "brev", "virtualenv",
+    }
     try:
         _make_sdk("nope")
     except ValueError as e:
         for p in _PLATFORMS:
             assert p in str(e)
+
+
+def test_make_sdk_constructs_virtualenv_with_sdk_kwargs(tmp_path):
+    from tao_automl.runner import _make_sdk
+
+    with patch("tao_sdk.platforms.virtualenv.VirtualEnvSDK") as sdk_cls:
+        instance = _make_sdk(
+            "virtualenv",
+            venv_path=str(tmp_path / "venv"),
+            work_dir=str(tmp_path / "jobs"),
+        )
+
+    assert instance is sdk_cls.return_value
+    sdk_cls.assert_called_once_with(
+        venv_path=str(tmp_path / "venv"),
+        work_dir=str(tmp_path / "jobs"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -530,7 +824,7 @@ def test_run_one_job_calls_build_entrypoint_with_action_cfg(tmp_path):
     """_run_one_job should pass the action's command/inputs/outputs/config_format/
     upload_excludes to build_entrypoint, and the resulting command string to
     sdk.create_job. No old kwargs (specs=, script_runner=, network_arch=)."""
-    from tao_automl.runner import AutoMLRunner
+    from tao_automl.runner import AutoMLRunner, _POLL_LOG_TAIL_LINES
 
     skill_dir = _write_fake_skill(tmp_path)
     fake_sdk = MagicMock()
@@ -576,6 +870,60 @@ def test_run_one_job_calls_build_entrypoint_with_action_cfg(tmp_path):
     for legacy in ("specs", "script_runner", "network_arch", "data_format",
                    "backend_details", "workspace_id", "train_dataset_uri"):
         assert legacy not in create_kwargs, f"legacy kwarg {legacy!r} leaked"
+    assert fake_sdk.get_job_logs.call_count >= 1
+    assert any(
+        call.kwargs.get("tail") == _POLL_LOG_TAIL_LINES
+        for call in fake_sdk.get_job_logs.call_args_list
+    )
+    assert any(not call.kwargs for call in fake_sdk.get_job_logs.call_args_list)
+
+
+def test_run_one_job_submits_nested_specs_to_python_script_sdk(tmp_path):
+    """Python actions bypass the container entrypoint and image API."""
+    from tao_automl.runner import AutoMLRunner
+
+    skill_dir = _write_python_skill(tmp_path)
+    fake_sdk = MagicMock()
+    fake_sdk.create_python_job.return_value = MagicMock(
+        id="job-python", backend_job_id="12345"
+    )
+    fake_sdk.get_job_status.return_value = MagicMock(status="Complete")
+    fake_sdk.get_job_logs.return_value = "accuracy: 0.875\n"
+
+    runner = AutoMLRunner(sdk=fake_sdk, skill_dir=skill_dir, action="train")
+    runner._poll_interval = 0
+    rec = MagicMock(id=3)
+
+    with patch(
+        "tao_sdk.script_runner.build_entrypoint",
+        side_effect=AssertionError("container entrypoint must not be built"),
+    ) as build:
+        metric, status = runner._run_one_job(
+            image=None,
+            action_cfg=runner.skill_ctx.action_cfg,
+            specs={"model": {"n_estimators": 17, "max_depth": 4}},
+            rec=rec,
+            metric_name="accuracy",
+            execution=runner.skill_ctx.execution,
+            workspace_path=str(tmp_path / "workspace"),
+            platform_kwargs={"gpu_count": 0},
+        )
+
+    build.assert_not_called()
+    fake_sdk.create_job.assert_not_called()
+    create_kwargs = fake_sdk.create_python_job.call_args.kwargs
+    assert create_kwargs["script"] == str(skill_dir / "scripts/train.py")
+    assert create_kwargs["specs"] == {
+        "model": {"n_estimators": 17, "max_depth": 4}
+    }
+    assert create_kwargs["config_format"] == "json"
+    assert create_kwargs["script_args"] == ["--config", "{config_path}"]
+    assert create_kwargs["cwd"] == str(skill_dir)
+    assert create_kwargs["network_arch"] == "public_random_forest"
+    assert create_kwargs["action"] == "train"
+    assert create_kwargs["gpu_count"] == 0
+    assert metric == pytest.approx(0.875)
+    assert status == "success"
 
 
 def test_run_one_job_allows_completed_metric_with_cleanup_rendezvous(tmp_path):
@@ -613,6 +961,59 @@ def test_run_one_job_allows_completed_metric_with_cleanup_rendezvous(tmp_path):
     assert metric == pytest.approx(0.951012)
     assert status == "success"
     fake_sdk.cancel_job.assert_not_called()
+
+
+def test_terminal_streaming_recovers_metric_before_noisy_tail(tmp_path):
+    from tao_automl.runner import AutoMLRunner
+
+    skill_dir = _write_fake_skill(tmp_path)
+    full_logs = "accuracy: 0.875\n" + "noise\n" * 10_001
+
+    class StreamingSDK:
+        def __init__(self):
+            self.create_job = MagicMock(
+                return_value=MagicMock(id="job-noisy", backend_job_id="be")
+            )
+            self.log_tails = []
+
+        def get_job_status(self, job_id):
+            return MagicMock(status="Complete")
+
+        def get_job_logs(self, job_id, tail=None):
+            self.log_tails.append(tail)
+            assert tail is not None
+            return "".join(full_logs.splitlines(keepends=True)[-tail:])
+
+        def iter_job_log_chunks(self, job_id, chunk_size=256 * 1024):
+            for offset in range(0, len(full_logs), 31):
+                yield full_logs[offset:offset + 31]
+
+        def cancel_job(self, job_id):
+            return False
+
+    fake_sdk = StreamingSDK()
+    runner = AutoMLRunner(sdk=fake_sdk, skill_dir=skill_dir, action="train")
+    runner._poll_interval = 0
+    rec = MagicMock(id=10)
+
+    with patch(
+        "tao_sdk.script_runner.build_entrypoint",
+        return_value={"command": "BAKED", "args_template": ""},
+    ):
+        metric, status = runner._run_one_job(
+            image="nvcr.io/test:1",
+            action_cfg=runner.skill_ctx.action_cfg,
+            specs={"train": {"num_epochs": 1}},
+            rec=rec,
+            metric_name="accuracy",
+            workspace_path=str(tmp_path),
+            platform_kwargs={},
+        )
+
+    assert metric == pytest.approx(0.875)
+    assert status == "success"
+    assert fake_sdk.log_tails
+    assert all(tail is not None for tail in fake_sdk.log_tails)
 
 
 def test_run_one_job_cancels_hard_failure_and_recovers_remote_best_score(tmp_path):
@@ -697,6 +1098,67 @@ def test_runner_init_replaces_skillbank_with_skillcontext(tmp_path):
     # Old API would've worked without skill_dir; new API is explicit.
     with pytest.raises(TypeError):
         AutoMLRunner(sdk=fake_sdk)  # missing skill_dir
+
+
+def test_execution_parameter_is_appended_after_existing_positional_callbacks():
+    """Adding Python execution must not rebind legacy positional arguments."""
+    import inspect
+
+    from tao_automl.runner import AutoMLRunner
+
+    parameters = list(inspect.signature(AutoMLRunner.run).parameters)
+    assert parameters.index("execution") > parameters.index("on_result")
+
+
+def test_container_run_preserves_builtin_search_schema_source(tmp_path, monkeypatch):
+    """Packaged schemas must not change existing container recommendations."""
+    from types import SimpleNamespace
+
+    from tao_automl.runner import AutoMLRunner
+
+    skill_dir = _write_fake_skill(tmp_path)
+    schemas = skill_dir / "schemas"
+    schemas.mkdir()
+    (schemas / "train.schema.json").write_text(json.dumps({
+        "type": "object",
+        "default": {"external_only": 1},
+        "properties": {
+            "external_only": {
+                "type": "integer",
+                "default": 1,
+                "minimum": 1,
+                "maximum": 2,
+                "automl_enabled": True,
+            },
+        },
+    }))
+    captured = {}
+    best = SimpleNamespace(id=0, result=0.5, specs={})
+
+    class CompleteAutoML:
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+        def is_complete(self):
+            return True
+
+        def get_best(self):
+            return best
+
+        def get_progress(self):
+            return {"completed": 0, "best_metric": 0.5}
+
+        def get_history(self):
+            return []
+
+    monkeypatch.setattr("tao_automl.AutoML", CompleteAutoML)
+    runner = AutoMLRunner(sdk=MagicMock(), skill_dir=skill_dir, action="train")
+    runner.run(
+        automl_settings={"algorithm": "bayesian", "metric": "loss"},
+        workspace_path=str(tmp_path / "workspace"),
+    )
+
+    assert captured["search_schema"] is None
 
 
 # ---------------------------------------------------------------------------
