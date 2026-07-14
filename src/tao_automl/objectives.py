@@ -4,8 +4,11 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Iterable
+
+from tao_automl.utils.value_utils import normalize_finite_number, normalize_json_value
 
 
 _MINIMIZE_TOKENS = (
@@ -80,10 +83,16 @@ class ObjectiveSpec:
             raise ValueError("Objective dictionary must include 'metric' or 'name'")
 
         direction = normalize_direction(raw.get("direction", fallback_direction), metric)
-        weight = float(raw.get("weight", 1.0))
-        scale = float(raw.get("scale", 1.0))
-        if scale == 0.0:
-            raise ValueError(f"Objective {metric!r} has scale=0")
+        weight = normalize_finite_number(
+            raw.get("weight", 1.0),
+            path=f"objective[{metric}].weight",
+        )
+        scale = normalize_finite_number(
+            raw.get("scale", 1.0),
+            path=f"objective[{metric}].scale",
+        )
+        if scale <= 0.0:
+            raise ValueError(f"Objective {metric!r} must have scale > 0")
         if weight < 0.0:
             raise ValueError(f"Objective {metric!r} has negative weight={weight}")
         return cls(metric=str(metric), direction=direction, weight=weight, scale=scale)
@@ -135,7 +144,10 @@ class ObjectiveConfig:
     def coerce_values(self, metric_value: float | int | dict[str, Any]) -> dict[str, float]:
         """Convert a reported scalar/dict into raw objective values."""
         if isinstance(metric_value, dict):
-            raw = dict(metric_value)
+            raw = normalize_json_value(
+                metric_value,
+                path="objective_values",
+            )
             if self.primary_metric not in raw:
                 for alias in ("metric", "metric_value", "value", "score"):
                     if alias in raw:
@@ -145,10 +157,16 @@ class ObjectiveConfig:
             for spec in self.objectives:
                 if spec.metric not in raw:
                     continue
-                values[spec.metric] = float(raw[spec.metric])
+                values[spec.metric] = normalize_finite_number(
+                    raw[spec.metric],
+                    path=f"objective_values.{spec.metric}",
+                )
             return values
 
-        value = float(metric_value)
+        value = normalize_finite_number(
+            metric_value,
+            path=f"objective_values.{self.primary_metric}",
+        )
         return {self.primary_metric: value}
 
     def validate_complete(self, values: dict[str, float]) -> None:
@@ -176,6 +194,8 @@ class ObjectiveConfig:
             value = float(values[spec.metric]) / spec.scale
             contribution = value if spec.direction == "maximize" else -value
             score += spec.weight * contribution
+        if not math.isfinite(score):
+            raise ValueError("Objective score must be finite")
         return float(score)
 
     def is_better_score(self, left: float, right: float) -> bool:

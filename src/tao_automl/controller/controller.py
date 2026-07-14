@@ -13,6 +13,7 @@ import os
 
 from tao_automl.objectives import parse_objective_config
 from tao_automl.types import Recommendation, ResumeRecommendation, JobStates
+from tao_automl.utils.value_utils import normalize_json_value
 
 logger = logging.getLogger(__name__)
 
@@ -119,17 +120,21 @@ class Controller:
                 continue
 
             if isinstance(raw_rec, ResumeRecommendation):
+                normalized_specs = normalize_json_value(
+                    raw_rec.specs,
+                    path=f"recommendation[{raw_rec.id}].specs",
+                )
                 rec = self._find_rec(raw_rec.id)
                 if rec is None:
                     rec = Recommendation(
                         identifier=int(raw_rec.id),
-                        specs=raw_rec.specs,
+                        specs=normalized_specs,
                         metric=self.metric,
                     )
                     self.history.append(rec)
                     self._next_id = max(self._next_id, rec.id + 1)
                 else:
-                    rec.specs = raw_rec.specs
+                    rec.specs = normalized_specs
                 rec.status = JobStates.pending
                 rec.resume_from_job_id = raw_rec.resume_from_job_id or raw_rec.job_id
                 rec.resume_from_epoch = getattr(raw_rec, "resume_from_epoch", None)
@@ -137,7 +142,10 @@ class Controller:
                 recommendations.append(rec)
                 continue
 
-            spec_dict = raw_rec
+            spec_dict = normalize_json_value(
+                raw_rec,
+                path=f"recommendation[{self._next_id}].specs",
+            )
             rec = Recommendation(
                 identifier=self._next_id,
                 specs=spec_dict,
@@ -505,21 +513,21 @@ class Controller:
             for rec_dict in saved:
                 rec = Recommendation(
                     identifier=int(rec_dict["id"]),
-                    specs=rec_dict.get("specs", {}),
+                    specs=normalize_json_value(
+                        rec_dict.get("specs", {}),
+                        path=f"recommendation[{rec_dict['id']}].specs",
+                    ),
                     metric=metric,
                 )
                 rec.job_id = rec_dict.get("job_id")
                 rec.status = rec_dict.get("status", JobStates.pending)
-                rec.result = float(rec_dict.get("result", 0.0))
-                rec.objective_values = {
-                    str(k): float(v)
-                    for k, v in rec_dict.get("objective_values", {}).items()
-                }
-                if not rec.objective_values:
-                    rec.objective_values = {metric: rec.result}
-                rec.objective_score = float(
-                    rec_dict.get("objective_score", rec.result)
-                )
+                rec.update_result(rec_dict.get("result", 0.0))
+                objective_values = rec_dict.get("objective_values", {})
+                if objective_values:
+                    rec.update_objectives(
+                        objective_values,
+                        rec_dict.get("objective_score", rec.result),
+                    )
                 rec.best_epoch_number = rec_dict.get("best_epoch_number", "")
                 rec.resume_from_job_id = rec_dict.get("resume_from_job_id")
                 rec.resume_from_epoch = rec_dict.get("resume_from_epoch")

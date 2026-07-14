@@ -5,6 +5,11 @@
 import datetime
 from dataclasses import dataclass
 
+from tao_automl.utils.value_utils import (
+    normalize_finite_number,
+    normalize_json_value,
+)
+
 
 class JobStates():
     """Various states of an automl job"""
@@ -73,23 +78,33 @@ class Recommendation:
 
     def update_result(self, result):
         """Update the result value"""
-        result = float(result)
-        assert type(result) is float, f"Result must be a float value, got {type(result)}"
+        result = normalize_finite_number(result, path="recommendation.result")
         self.result = result
         self.objective_score = result
-        if not self.objective_values:
-            self.objective_values = {self.metric: result}
+        self.objective_values = {self.metric: result}
 
     def update_objectives(self, objective_values, objective_score):
         """Update raw objective values and the scalar optimization score."""
-        assert type(objective_values) is dict, (
-            f"Objective values must be a dictionary, got {type(objective_values)}"
+        normalized_values = normalize_json_value(
+            objective_values,
+            path="recommendation.objective_values",
         )
+        if not isinstance(normalized_values, dict):
+            raise TypeError(
+                "Recommendation objective values must be a dictionary, "
+                f"got {type(normalized_values).__name__}"
+            )
         self.objective_values = {
-            str(key): float(value)
-            for key, value in objective_values.items()
+            key: normalize_finite_number(
+                value,
+                path=f"recommendation.objective_values.{key}",
+            )
+            for key, value in normalized_values.items()
         }
-        score = float(objective_score)
+        score = normalize_finite_number(
+            objective_score,
+            path="recommendation.objective_score",
+        )
         self.objective_score = score
         self.result = score
 

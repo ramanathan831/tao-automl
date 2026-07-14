@@ -768,6 +768,21 @@ def test_skill_context_requires_external_schema_for_python_script(tmp_path):
          "'anyOf' must be a non-empty list"),
         ({"type": "object", "properties": {"x": {"type": ["integer", "null"]}}},
          "list-valued 'type'"),
+        ({"type": "object", "properties": {"x": {
+            "type": "integer", "default": True, "minimum": 1,
+            "maximum": 2, "automl_enabled": True,
+        }}}, "expected an integer"),
+        ({"type": "object", "properties": {"x": {
+            "type": "number", "default": 1.0, "minimum": 2.0,
+            "maximum": 1.0, "automl_enabled": True,
+        }}}, "minimum cannot exceed maximum"),
+        ({"type": "object", "properties": {"x": {
+            "type": "string", "default": "x", "automl_enabled": True,
+        }}}, "requires an enum"),
+        ({"type": "object", "properties": {"x": {
+            "anyOf": [{"type": "integer"}, {"type": "number"}],
+            "automl_enabled": True,
+        }}}, "exactly one non-null anyOf type"),
     ],
 )
 def test_skill_context_rejects_malformed_python_search_schema(
@@ -805,6 +820,59 @@ def test_optional_anyof_schema_uses_non_null_search_type(tmp_path):
     )
 
     assert names == ["model.n_estimators"]
+
+
+def test_optional_anyof_schema_uses_branch_search_metadata(tmp_path):
+    from tao_automl.runner import SkillContext
+    from tao_automl.search_space.params import generate_hyperparams_to_search
+
+    skill_dir = _write_python_skill(tmp_path)
+    schema_path = skill_dir / "schemas/train.schema.json"
+    schema = json.loads(schema_path.read_text())
+    parameter = schema["properties"]["model"]["properties"]["n_estimators"]
+    parameter.clear()
+    parameter["anyOf"] = [
+        {"type": "null"},
+        {
+            "type": "integer",
+            "default": 10,
+            "minimum": 2,
+            "maximum": 20,
+            "automl_enabled": True,
+        },
+    ]
+    schema_path.write_text(json.dumps(schema))
+
+    ctx = SkillContext(skill_dir=skill_dir, action="train")
+    records, names = generate_hyperparams_to_search(
+        ctx.network_arch,
+        "train",
+        ctx.default_specs,
+        [],
+        schema=ctx.schema,
+    )
+
+    assert "model.n_estimators" in names
+    record = next(r for r in records if r["parameter"] == "model.n_estimators")
+    assert record["default_value"] == 10
+    assert record["valid_min"] == 2
+    assert record["valid_max"] == 20
+
+
+def test_python_script_run_rejects_invalid_merged_spec_override(tmp_path):
+    from tao_automl.runner import AutoMLRunner
+
+    runner = AutoMLRunner(
+        sdk=MagicMock(), skill_dir=_write_python_skill(tmp_path), action="train"
+    )
+
+    with pytest.raises(TypeError, match="expected an integer"):
+        runner.run(
+            automl_settings={"algorithm": "bayesian", "metric": "accuracy"},
+            automl_hyperparameters=["model.n_estimators"],
+            spec_overrides={"model.n_estimators": "many"},
+            workspace_path=str(tmp_path / "workspace"),
+        )
 
 
 def test_runtime_python_execution_override_requires_external_schema(tmp_path):
@@ -855,6 +923,45 @@ def test_extract_metric_allows_val_prefix_for_sparse4d_map():
     assert _extract_metric_from_logs(logs, "val_mAP") == 0.0
 
 
+def test_extract_metric_supports_signed_values_and_exact_aliases():
+    from tao_automl.runner import _extract_metric_from_logs
+
+    logs = (
+        "val_loss: 0.9\n"
+        "loss_scale: 1024\n"
+        "loss: -2.5e-1\n"
+        "val_loss: 0.1\n"
+    )
+
+    assert _extract_metric_from_logs(logs, "loss") == pytest.approx(-0.25)
+    assert _extract_metric_from_logs("val_loss: 0.2\n", "loss") is None
+    assert _extract_metric_from_logs("loss: 0.2\n", "val_loss") is None
+
+
+def test_cosmos_validation_loss_competes_by_log_position():
+    from tao_automl.runner import _extract_metric_from_logs
+
+    logs = "[SFT] Validation loss: 0.9\nval_loss: 0.2\n"
+
+    assert _extract_metric_from_logs(logs, "val_loss") == pytest.approx(0.2)
+
+
+def test_cosmos_validation_loss_does_not_satisfy_other_validation_metrics():
+    from tao_automl.runner import _extract_metric_from_logs
+
+    logs = "[SFT] Validation loss: 0.9\n"
+
+    assert _extract_metric_from_logs(logs, "val_accuracy") is None
+
+
+def test_extract_metric_uses_globally_latest_matching_format():
+    from tao_automl.runner import _extract_metric_from_logs
+
+    logs = "accuracy: 0.8\nnoise\nkpi: -1.25e-2\n"
+
+    assert _extract_metric_from_logs(logs, "accuracy") == pytest.approx(-0.0125)
+
+
 def test_extract_metric_reads_sparse4d_status_kpi_alias(tmp_path):
     from tao_automl.runner import _extract_metric_from_status_file
 
@@ -864,6 +971,66 @@ def test_extract_metric_reads_sparse4d_status_kpi_alias(tmp_path):
     )
 
     assert _extract_metric_from_status_file(status_path, "val_mAP") == 0.125
+
+
+def test_status_metric_ignores_non_objects_and_nonfinite_values(tmp_path):
+    from tao_automl.runner import _extract_metric_from_status_file
+
+    status_path = tmp_path / "status.json"
+    status_path.write_text(
+        '{"kpi": {"accuracy": 0.75}}\n'
+        '[]\n'
+        '{"kpi": {"accuracy": true}}\n'
+        '{"kpi": {"accuracy": Infinity}}\n'
+    )
+
+    assert _extract_metric_from_status_file(status_path, "accuracy") == 0.75
+
+
+@pytest.mark.parametrize("bad_metric", [True, float("nan"), float("inf"), -float("inf")])
+def test_structured_metric_payloads_reject_boolean_and_nonfinite_values(bad_metric):
+    from tao_automl.runner import (
+        _extract_metric_from_best_score_payload,
+        _extract_metric_from_metrics_payload,
+        _merge_metric_payload,
+    )
+
+    assert _extract_metric_from_best_score_payload(
+        {"best_score": bad_metric}, "accuracy"
+    ) is None
+    assert _extract_metric_from_metrics_payload(
+        {"accuracy": bad_metric}, "accuracy"
+    ) is None
+    target = {}
+    assert not _merge_metric_payload(target, {"metric_value": bad_metric})
+    assert "metric_value" not in target
+
+
+def test_multi_objective_callback_payload_requires_all_finite_values():
+    from tao_automl.runner import _callback_metric_payload
+
+    assert _callback_metric_payload(
+        {"accuracy": 0.8, "latency": 12},
+        "eval_fn",
+    ) == {"accuracy": 0.8, "latency": 12.0}
+    assert _callback_metric_payload(
+        {"accuracy": 0.8, "latency": True},
+        "eval_fn",
+    ) is None
+    assert _callback_metric_payload(
+        {"accuracy": 0.8, "latency": float("nan")},
+        "eval_fn",
+    ) is None
+
+
+def test_generic_log_metric_only_satisfies_primary_objective():
+    from tao_automl.runner import _extract_metric_from_logs, _extract_metric_values
+
+    assert _extract_metric_values(
+        "kpi: 0.8\n",
+        ["accuracy", "latency"],
+        _extract_metric_from_logs,
+    ) == {"accuracy": 0.8}
 
 
 def test_extract_latency_aliases_from_logs_and_status(tmp_path):
@@ -891,6 +1058,15 @@ def test_latency_does_not_fall_back_to_primary_best_score():
     assert _extract_metric_from_best_score_payload(
         payload_with_latency, "latency"
     ) == pytest.approx(18.0)
+    assert _extract_metric_from_best_score_payload(
+        {"metric": "val_mAP", "val_mAP": 0.93},
+        "latency",
+    ) is None
+    assert _extract_metric_from_best_score_payload(
+        {"best_score": 0.93},
+        "latency",
+        allow_generic=False,
+    ) is None
 
 
 def test_execution_status_can_ignore_fatal_cleanup_patterns():
@@ -1061,6 +1237,108 @@ def test_algorithm_params_parse_hybrid_range_narrowing_flag():
     assert not AlgorithmParams.from_dict({}).hybrid_enable_llm_range_narrowing
 
 
+def _install_sequential_fake_automl(monkeypatch, count=3):
+    from tao_automl.types import Recommendation
+
+    reports = []
+
+    class FakeAutoML:
+        def __init__(self, *args, **kwargs):
+            self.recs = [
+                Recommendation(i, {"train.num_epochs": i + 1}, "accuracy")
+                for i in range(count)
+            ]
+            self.index = 0
+
+        def is_complete(self):
+            return self.index >= count
+
+        def next_recommendation(self):
+            return [self.recs[self.index]]
+
+        def report_result(self, rec_id, metric_value, best_epoch=None, status="success"):
+            rec = self.recs[self.index]
+            rec.update_result(metric_value)
+            rec.update_status(status)
+            reports.append((rec_id, metric_value, status))
+            self.index += 1
+
+        def get_best(self):
+            return None
+
+        def get_progress(self):
+            return {"completed": self.index, "best_metric": None}
+
+        def get_history(self):
+            return self.recs
+
+    monkeypatch.setattr("tao_automl.AutoML", FakeAutoML)
+    return reports
+
+
+def test_job_creation_failures_do_not_count_as_missing_metrics(tmp_path, monkeypatch):
+    from tao_automl.runner import AutoMLRunner
+
+    reports = _install_sequential_fake_automl(monkeypatch)
+    monkeypatch.setattr(
+        AutoMLRunner, "_run_one_job", lambda self, *args, **kwargs: (None, "failure")
+    )
+    runner = AutoMLRunner(
+        sdk=MagicMock(), skill_dir=_write_fake_skill(tmp_path), action="train"
+    )
+
+    with pytest.raises(RuntimeError, match="without a successful recommendation"):
+        runner.run(
+            image="nvcr.io/test:1",
+            automl_settings={
+                "algorithm": "bayesian",
+                "metric": "accuracy",
+                "run_baseline": False,
+            },
+            workspace_path=str(tmp_path / "workspace"),
+        )
+
+    assert len(reports) == 3
+    assert {status for _, _, status in reports} == {"failure"}
+    assert runner._consecutive_none_metrics == 0
+
+
+def test_metric_missing_fail_fast_reports_third_failure_before_raising(
+    tmp_path, monkeypatch,
+):
+    from tao_automl.runner import AutoMLRunner, MetricExtractorError
+
+    reports = _install_sequential_fake_automl(monkeypatch)
+    callbacks = []
+    monkeypatch.setattr(
+        AutoMLRunner,
+        "_run_one_job",
+        lambda self, *args, **kwargs: (None, "metric_missing"),
+    )
+    runner = AutoMLRunner(
+        sdk=MagicMock(), skill_dir=_write_fake_skill(tmp_path), action="train"
+    )
+
+    with pytest.raises(MetricExtractorError, match="3 consecutive recs"):
+        runner.run(
+            image="nvcr.io/test:1",
+            automl_settings={
+                "algorithm": "bayesian",
+                "metric": "accuracy",
+                "run_baseline": False,
+            },
+            on_result=lambda rec, metric, status: callbacks.append(
+                (rec.id, metric, status)
+            ),
+            workspace_path=str(tmp_path / "workspace"),
+        )
+
+    assert len(reports) == 3
+    assert len(callbacks) == 3
+    assert reports[-1] == (2, 0.0, "failure")
+    assert callbacks[-1] == (2, None, "failure")
+
+
 def test_promoted_metric_missing_checkpoint_carries_forward_prior_metric(
     tmp_path, monkeypatch
 ):
@@ -1179,6 +1457,87 @@ def test_run_reports_baseline_metric_and_comparison(tmp_path, monkeypatch):
     assert result["baseline"]["metric_value"] == 0.5
     assert result["baseline"]["comparison_to_best"]["delta"] == pytest.approx(0.12)
     assert result["baseline"]["comparison_to_best"]["improved"] is True
+
+
+def test_run_preserves_multi_objective_payload_and_explicit_primary_metric(
+    tmp_path, monkeypatch,
+):
+    from tao_automl.runner import AutoMLRunner
+    from tao_automl.types import JobStates, Recommendation
+
+    captured = {}
+
+    class FakeAutoML:
+        def __init__(self, *args, **kwargs):
+            self.rec = Recommendation(0, {"train.num_epochs": 2}, "accuracy")
+            self.complete = False
+
+        def is_complete(self):
+            return self.complete
+
+        def next_recommendation(self):
+            return [self.rec]
+
+        def report_result(self, rec_id, metric_value, best_epoch=None, status="success"):
+            assert metric_value == {"accuracy": 0.8, "latency": 12.0}
+            self.rec.update_objectives(metric_value, 0.68)
+            self.rec.update_status(status)
+            self.complete = True
+
+        def get_best(self):
+            return self.rec if self.rec.status == JobStates.success else None
+
+        def get_progress(self):
+            return {"completed": int(self.complete), "best_metric": 0.8}
+
+        def get_history(self):
+            return [self.rec]
+
+        def get_status(self):
+            return {"pareto_front": [{"rec_id": self.rec.id}]}
+
+    def fake_run_one_job(self, *args, **kwargs):
+        captured["metric_name"] = kwargs["metric_name"]
+        captured["objective_names"] = kwargs["objective_names"]
+        return {"accuracy": 0.8, "latency": 12}, "success"
+
+    monkeypatch.setattr("tao_automl.AutoML", FakeAutoML)
+    monkeypatch.setattr(AutoMLRunner, "_run_one_job", fake_run_one_job)
+
+    runner = AutoMLRunner(
+        sdk=MagicMock(),
+        skill_dir=_write_fake_skill(tmp_path),
+        action="train",
+    )
+    result = runner.run(
+        image="nvcr.io/test:1",
+        automl_settings={
+            "algorithm": "bayesian",
+            "objectives": [
+                {"metric": "accuracy", "direction": "maximize"},
+                {
+                    "metric": "latency",
+                    "direction": "minimize",
+                    "scale": 100,
+                },
+            ],
+            "run_baseline": False,
+            "run_final_evaluation": False,
+        },
+        workspace_path=str(tmp_path / "workspace"),
+    )
+
+    assert captured == {
+        "metric_name": "accuracy",
+        "objective_names": ["accuracy", "latency"],
+    }
+    assert result["best"]["metric_value"] == pytest.approx(0.8)
+    assert result["best"]["objective_score"] == pytest.approx(0.68)
+    assert result["best"]["objective_values"] == {
+        "accuracy": 0.8,
+        "latency": 12.0,
+    }
+    assert result["pareto_front"] == [{"rec_id": 0}]
 
 
 def test_run_reports_runner_owned_final_evaluation(tmp_path, monkeypatch):
@@ -1488,6 +1847,47 @@ def test_run_one_job_returns_multi_objective_values(tmp_path):
 
     assert status == "success"
     assert metric == {"val_mAP": pytest.approx(0.75), "latency": pytest.approx(21.0)}
+
+
+def test_run_one_job_accepts_multi_objective_eval_callback(tmp_path):
+    from tao_automl.runner import AutoMLRunner
+
+    skill_dir = _write_fake_skill(tmp_path)
+    fake_sdk = MagicMock()
+    fake_sdk.create_job.return_value = MagicMock(
+        id="job-mo-eval",
+        backend_job_id="be-mo-eval",
+    )
+    fake_sdk.get_job_status.return_value = MagicMock(status="Complete")
+    fake_sdk.get_job_logs.return_value = ""
+    fake_sdk.get_job_results_dir.return_value = ""
+    fake_sdk.read_job_result_file.return_value = ""
+
+    runner = AutoMLRunner(sdk=fake_sdk, skill_dir=skill_dir, action="train")
+    runner._poll_interval = 0
+    rec = MagicMock(id=4)
+
+    with patch(
+        "tao_sdk.script_runner.build_entrypoint",
+        return_value={"command": "BAKED_HEREDOC_COMMAND", "args_template": ""},
+    ):
+        metric, status = runner._run_one_job(
+            image="nvcr.io/test:1",
+            action_cfg=runner.skill_ctx.action_cfg,
+            specs={"train": {"num_epochs": 1}},
+            rec=rec,
+            metric_name="val_mAP",
+            objective_names=["val_mAP", "latency"],
+            eval_fn=lambda recommendation, job_id: {
+                "val_mAP": 0.76,
+                "latency": 20,
+            },
+            workspace_path=str(tmp_path),
+            platform_kwargs={},
+        )
+
+    assert status == "success"
+    assert metric == {"val_mAP": pytest.approx(0.76), "latency": 20.0}
 
 
 def test_run_one_job_submits_nested_specs_to_python_script_sdk(tmp_path):

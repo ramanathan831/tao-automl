@@ -4,6 +4,11 @@ AutoML actions can run a Python script directly from a virtual environment.
 This is an alternative to building an in-container command with
 `tao_sdk.script_runner.build_entrypoint`.
 
+Install the direct-execution dependencies with
+`pip install "nvidia-tao-automl[virtualenv]"`. The extra includes the SDK's
+TOML writer so JSON, YAML, and TOML support does not depend on ambient
+packages.
+
 This contract is consumed directly by `AutoMLRunner` and can live in a local
 external model directory. Existing packaged TAO model actions remain
 container-backed until their skill metadata explicitly adopts
@@ -98,6 +103,12 @@ config, combined stdout/stderr log, and results directory. Declared output
 spec keys are rewritten into that results directory. Declared inputs must be
 local paths in this initial implementation; remote URIs are rejected before
 the process starts rather than being silently ignored.
+
+Recommendation values are normalized to finite Python scalar, mapping, and
+sequence values before persistence and submission. This preserves numeric and
+boolean types across live execution and resume, including values produced by
+NumPy-based search algorithms. TOML actions reject null values because TOML
+has no null representation.
 
 For GPU scripts, pass explicit `gpu_ids` when device ownership matters. The
 SDK sets `CUDA_VISIBLE_DEVICES` from those IDs. A count without IDs does not

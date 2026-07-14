@@ -38,6 +38,7 @@ import argparse
 import copy
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -49,6 +50,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import yaml
 from tao_automl.objectives import is_latency_metric, parse_objective_config
 from tao_sdk.checkpoints import (
@@ -56,6 +58,7 @@ from tao_sdk.checkpoints import (
     checkpoint_epoch as sdk_checkpoint_epoch,
     select_checkpoint_path,
 )
+from tao_automl.utils.spec_utils import resolve_schema_leaf
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +145,13 @@ class SkillContext:
             )
         if self.execution is not None:
             _validate_external_automl_schema(self.schema, schema_path)
+            _validate_specs_against_schema(
+                self.default_specs,
+                self.schema,
+                schema_path,
+                require_all=False,
+                source=str(template_path if template_path.exists() else "schema.default"),
+            )
 
         # Container image: action-level image overrides win, then model-level.
         # Python-script actions do not require an image, so an omitted image is
@@ -259,6 +269,59 @@ _TERMINAL_LOG_CONTEXT_CHARS = 64 * 1024
 _TERMINAL_STATUSES = {"Complete", "Error", "Canceled"}
 
 
+def _finite_metric(value: Any) -> float | None:
+    """Convert a metric to float only when it is non-boolean and finite."""
+    if value is None or isinstance(value, (bool, np.bool_)):
+        return None
+    try:
+        metric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return metric if math.isfinite(metric) else None
+
+
+def _require_finite_metric(value: Any, source: str) -> float:
+    metric = _finite_metric(value)
+    if metric is None:
+        raise ValueError(
+            f"{source} must be a finite numeric metric; booleans, NaN, and "
+            "infinite values are not valid metrics"
+        )
+    return metric
+
+
+def _callback_metric(value: Any, source: str) -> float | None:
+    metric = _finite_metric(value)
+    if value is not None and metric is None:
+        logger.warning("%s returned an invalid non-finite or boolean metric: %r", source, value)
+    return metric
+
+
+def _callback_metric_payload(value: Any, source: str):
+    """Validate a callback result containing one or multiple metrics."""
+    if not isinstance(value, dict):
+        return _callback_metric(value, source)
+    if not value:
+        logger.warning("%s returned an empty metric dictionary", source)
+        return None
+    metrics = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            logger.warning("%s returned a non-string metric key: %r", source, key)
+            return None
+        metric = _finite_metric(item)
+        if metric is None:
+            logger.warning(
+                "%s returned an invalid non-finite or boolean metric for %s: %r",
+                source,
+                key,
+                item,
+            )
+            return None
+        metrics[key] = metric
+    return metrics
+
+
 def _iter_terminal_log_chunks(sdk, job_id: str):
     """Yield bounded terminal log snapshots, streaming when the SDK can."""
     stream_method = getattr(type(sdk), "iter_job_log_chunks", None)
@@ -287,6 +350,7 @@ def _scan_terminal_logs(
     cached_exec_status: str | None,
 ) -> tuple[float | None, str | None, str]:
     """Extract terminal signals without materializing an unbounded log."""
+    cached_metric = _finite_metric(cached_metric)
     overlap = ""
     context = ""
     latest_explicit_status = None
@@ -301,6 +365,7 @@ def _scan_terminal_logs(
         except Exception as exc:
             logger.warning("metric_extractor raised for job %s: %s", job_id, exc)
             metric = None
+        metric = _callback_metric(metric, "metric_extractor")
         if metric is not None:
             cached_metric = metric
 
@@ -321,6 +386,9 @@ def _scan_terminal_logs(
     elif hard_failure_seen or (cleanup_failure_seen and cached_metric is None):
         cached_exec_status = "FAIL"
     return cached_metric, cached_exec_status, context
+
+
+_METRIC_NUMBER_RE = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
 
 
 def _scan_terminal_metric_values(
@@ -366,9 +434,8 @@ def _scan_terminal_metric_values(
         cached_exec_status = "FAIL"
     return cached_metrics, cached_exec_status, context
 
-
 _COSMOS_RL_SFT_VAL_RE = re.compile(
-    r'\[SFT\]\s+Validation loss:\s*([0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)',
+    rf'\[SFT\]\s+Validation loss:\s*(?P<value>{_METRIC_NUMBER_RE})',
     re.IGNORECASE,
 )
 
@@ -390,10 +457,15 @@ _HARD_FATAL_PATTERNS = (
 )
 
 
-def _extract_metric_from_logs(logs: str, metric_name: str) -> float | None:
+def _extract_metric_from_logs(
+    logs: str,
+    metric_name: str,
+    *,
+    allow_generic: bool = True,
+) -> float | None:
     """Extract the final metric value from TAO training logs.
 
-    Searches logs in reverse (last occurrence = final value). Handles:
+    Returns the globally latest matching finite value. Handles:
     - Cosmos-RL validation: "[SFT] Validation loss: 0.12 for train step ..."
     - Generic: "loss: 0.123" or "best loss: 0.123"
     - Cosmos-RL: "Step: 107/107, Loss: 8.27675, Grad norm: ..."
@@ -408,101 +480,56 @@ def _extract_metric_from_logs(logs: str, metric_name: str) -> float | None:
     """
     if not logs:
         return None
-    lines = logs.strip().splitlines()
 
-    # Cosmos-RL validation line: only triggers if the literal "[SFT] Validation
-    # loss:" marker is present in the logs. We do NOT hijack on the substring
-    # "val" in metric_name (that was a bug: it silently failed for any non-
-    # cosmos model with metric_name like "val_loss" or "val_acc").
-    if "val" in metric_name.lower():
-        for line in reversed(lines):
-            m = _COSMOS_RL_SFT_VAL_RE.search(line)
-            if m:
-                try:
-                    return float(m.group(1))
-                except ValueError:
-                    continue
-        # Fall through to the generic patterns instead of returning None — a
-        # PyTorch-Lightning container emitting "val_loss: 0.12" on stdout
-        # should still match Pattern 2 below.
+    candidates: list[tuple[int, float]] = []
 
-    # Pattern 1: Cosmos-RL step format "Step: N/M, Loss: X.XXXX" (most specific)
-    step_pattern = re.compile(
-        r'Step:\s*\d+/\d+.*?Loss:\s*([0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)',
-        re.IGNORECASE,
-    )
-    for line in reversed(lines):
-        match = step_pattern.search(line)
-        if match:
-            try:
-                val = float(match.group(1))
-                if val > 0:  # Skip 0.0 values (empty validation)
-                    return val
-            except ValueError:
-                continue
+    # Cosmos-RL's specialized marker represents validation loss only. Treat it
+    # as a position-aware alias, so it neither satisfies val_accuracy nor
+    # overrides a newer named validation-loss value.
+    normalized_metric = metric_name.lower().replace("/", "_").replace(" ", "_")
+    if normalized_metric in {"val_loss", "validation_loss"}:
+        for match in _COSMOS_RL_SFT_VAL_RE.finditer(logs):
+            value = _finite_metric(match.group("value"))
+            if value is not None:
+                candidates.append((match.start("value"), value))
 
-    # Pattern 2: direct metric match (case-insensitive). Lightning progress
-    # output may print metrics as ``train_loss_epoch: 18.901`` or split the
-    # label and value across wrapped terminal lines, so also scan a
-    # whitespace-normalized view of the full log.
+    # Direct metric matches are boundary-delimited so requesting ``loss`` does
+    # not accidentally read ``val_loss`` or ``loss_scale``. ``\s*`` around the
+    # delimiter still handles terminal wrapping without losing source offsets.
     metric_aliases = _metric_aliases(metric_name)
     for suffix in ("_epoch", "_step"):
         if not metric_name.endswith(suffix):
             metric_aliases.append(f"{metric_name}{suffix}")
     if metric_name.lower().startswith("val_"):
         bare_metric = metric_name[4:]
-        metric_aliases.extend([
-            bare_metric,
-            "Validation " + bare_metric.replace("_", " "),
-        ])
-    normalized_logs = re.sub(r"\s+", " ", logs)
-    for alias in metric_aliases:
+        metric_aliases.append("Validation " + bare_metric.replace("_", " "))
+    for alias in dict.fromkeys(metric_aliases):
+        escaped_alias = re.escape(alias).replace(r"\ ", r"\s+")
         metric_pattern = re.compile(
-            rf'(?:best\s+)?{re.escape(alias)}\s*[:=]\s*([0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)',
+            rf'(?<![A-Za-z0-9_/\-])(?:best\s+)?{escaped_alias}'
+            rf'(?![A-Za-z0-9_/\-])\s*[:=]\s*(?P<value>{_METRIC_NUMBER_RE})',
             re.IGNORECASE,
         )
-        for line in reversed(lines):
-            match = metric_pattern.search(line)
-            if match:
-                try:
-                    val = float(match.group(1))
-                    if val >= 0:
-                        return val
-                except ValueError:
-                    continue
-        matches = list(metric_pattern.finditer(normalized_logs))
-        for match in reversed(matches):
-            try:
-                val = float(match.group(1))
-                if val >= 0:
-                    return val
-            except ValueError:
-                continue
+        for match in metric_pattern.finditer(logs):
+            value = _finite_metric(match.group("value"))
+            if value is not None:
+                candidates.append((match.start("value"), value))
 
-    # Pattern 3: KPI
-    kpi_pattern = re.compile(
-        r'kpi\s*[:=]\s*([0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)', re.IGNORECASE,
-    )
-    for line in reversed(lines):
-        match = kpi_pattern.search(line)
-        if match:
-            try:
-                return float(match.group(1))
-            except ValueError:
-                continue
+    # ``kpi:`` is the generic TAO metric contract when no metric label is
+    # emitted. Treat it as another candidate instead of giving it fixed
+    # priority over newer named values.
+    if allow_generic:
+        kpi_pattern = re.compile(
+            rf'(?<![A-Za-z0-9_/\-])kpi(?![A-Za-z0-9_/\-])\s*[:=]\s*'
+            rf'(?P<value>{_METRIC_NUMBER_RE})',
+            re.IGNORECASE,
+        )
+        for match in kpi_pattern.finditer(logs):
+            value = _finite_metric(match.group("value"))
+            if value is not None:
+                candidates.append((match.start("value"), value))
 
-    # Pattern 4: Epoch line
-    epoch_pattern = re.compile(
-        r'[Ee]poch\s+\d+.*?(?:loss|accuracy|mIoU)\s*[:=]\s*([0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)',
-    )
-    for line in reversed(lines):
-        match = epoch_pattern.search(line)
-        if match:
-            try:
-                return float(match.group(1))
-            except ValueError:
-                continue
-    return None
+    return max(candidates, default=(0, None), key=lambda item: item[0])[1]
 
 
 def _metric_aliases(metric_name: str) -> list[str]:
@@ -519,6 +546,7 @@ def _metric_aliases(metric_name: str) -> list[str]:
         aliases.append(metric_name.replace("_", "/"))
     normalized = metric_name.lower().replace("/", "_")
     if normalized in {"map", "val_map"}:
+        aliases.append("mAP")
         aliases.append("img_bbox_NuScenes/mAP")
     if normalized == "train_loss_epoch":
         aliases.append("train_loss")
@@ -561,17 +589,16 @@ def _extract_metric_from_status_file(status_path: Path, metric_name: str) -> flo
             payload = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if not isinstance(payload, dict):
+            continue
         kpi = payload.get("kpi")
         if not isinstance(kpi, dict):
             continue
         for alias in aliases:
             if alias not in kpi:
                 continue
-            try:
-                value = float(kpi[alias])
-            except (TypeError, ValueError):
-                continue
-            if value == value:
+            value = _finite_metric(kpi[alias])
+            if value is not None:
                 return value
     return None
 
@@ -579,6 +606,8 @@ def _extract_metric_from_status_file(status_path: Path, metric_name: str) -> flo
 def _extract_metric_from_best_score_payload(
     payload: str | dict[str, Any],
     metric_name: str,
+    *,
+    allow_generic: bool = True,
 ) -> float | None:
     """Read TAO/Cosmos best-score artifacts.
 
@@ -593,42 +622,47 @@ def _extract_metric_from_best_score_payload(
     if not isinstance(data, dict):
         return None
 
-    aliases = set(_metric_aliases(metric_name))
-    aliases.update(alias.replace("/", "_") for alias in list(aliases))
+    aliases = _metric_aliases(metric_name)
+    aliases.extend(alias.replace("/", "_") for alias in list(aliases))
+    aliases = list(dict.fromkeys(aliases))
     requested_aliases = set(aliases)
-    metric_label = data.get("metric")
-    if isinstance(metric_label, str):
-        aliases.add(metric_label)
-        aliases.add(metric_label.replace("/", "_"))
 
     for key in aliases:
         if key not in data:
             continue
-        try:
-            value = float(data[key])
-        except (TypeError, ValueError):
-            continue
-        if value == value:
+        value = _finite_metric(data[key])
+        if value is not None:
             return value
 
-    if is_latency_metric(metric_name):
-        if not isinstance(metric_label, str):
+    metric_label = data.get("metric")
+    if isinstance(metric_label, str):
+        label_aliases = [metric_label, metric_label.replace("/", "_")]
+        label_matches = any(alias in requested_aliases for alias in label_aliases)
+        label_matches = label_matches or (
+            is_latency_metric(metric_name) and is_latency_metric(metric_label)
+        )
+        requested_normalized = metric_name.lower().replace("/", "_")
+        label_normalized = metric_label.lower().replace("/", "_")
+        label_matches = label_matches or (
+            "loss" in requested_normalized and "loss" in label_normalized
+        )
+        if not label_matches:
             return None
-        if (
-            metric_label not in requested_aliases
-            and metric_label.replace("/", "_") not in requested_aliases
-            and not is_latency_metric(metric_label)
-        ):
-            return None
+        for key in dict.fromkeys(label_aliases):
+            if key not in data:
+                continue
+            value = _finite_metric(data[key])
+            if value is not None:
+                return value
+
+    if not allow_generic:
+        return None
 
     for key in ("best_score", "best_metric", "metric_value", "score", "value"):
         if key not in data:
             continue
-        try:
-            value = float(data[key])
-        except (TypeError, ValueError):
-            continue
-        if value == value:
+        value = _finite_metric(data[key])
+        if value is not None:
             return value
     return None
 
@@ -636,6 +670,8 @@ def _extract_metric_from_best_score_payload(
 def _extract_metric_from_best_score_file(
     best_score_path: Path,
     metric_name: str,
+    *,
+    allow_generic: bool = True,
 ) -> float | None:
     if not best_score_path.exists():
         return None
@@ -643,6 +679,7 @@ def _extract_metric_from_best_score_file(
         return _extract_metric_from_best_score_payload(
             best_score_path.read_text(encoding="utf-8"),
             metric_name,
+            allow_generic=allow_generic,
         )
     except OSError:
         return None
@@ -664,11 +701,8 @@ def _extract_metric_from_metrics_payload(
     for key in dict.fromkeys(aliases):
         if key not in data:
             continue
-        try:
-            value = float(data[key])
-        except (TypeError, ValueError):
-            continue
-        if value == value:
+        value = _finite_metric(data[key])
+        if value is not None:
             return value
     return None
 
@@ -684,8 +718,13 @@ def _extract_metric_from_metrics_file(
         return None
 
 
-def _extract_metric_from_local_results(job_id: str, metric_name: str,
-                                       platform_kwargs: dict | None) -> float | None:
+def _extract_metric_from_local_results(
+    job_id: str,
+    metric_name: str,
+    platform_kwargs: dict | None,
+    *,
+    allow_generic: bool = True,
+) -> float | None:
     """Fallback for local runs whose metrics are written to result artifacts.
 
     The platform SDK mounts a host results directory at ``/results``. When logs
@@ -703,7 +742,9 @@ def _extract_metric_from_local_results(job_id: str, metric_name: str,
         job_root = Path(host_root) / job_id
         for best_score_path in sorted(job_root.rglob("best_score.json")):
             metric = _extract_metric_from_best_score_file(
-                best_score_path, metric_name
+                best_score_path,
+                metric_name,
+                allow_generic=allow_generic,
             )
             if metric is not None:
                 return metric
@@ -718,8 +759,13 @@ def _extract_metric_from_local_results(job_id: str, metric_name: str,
     return None
 
 
-def _extract_metric_from_sdk_results(sdk, job_id: str,
-                                     metric_name: str) -> float | None:
+def _extract_metric_from_sdk_results(
+    sdk,
+    job_id: str,
+    metric_name: str,
+    *,
+    allow_generic: bool = True,
+) -> float | None:
     """Recover metrics from SDK-managed result artifacts.
 
     Slurm jobs write results on Lustre, which may not be mounted on the local
@@ -747,7 +793,11 @@ def _extract_metric_from_sdk_results(sdk, job_id: str,
             if relative_path.endswith("metrics.json"):
                 metric = _extract_metric_from_metrics_payload(payload, metric_name)
             else:
-                metric = _extract_metric_from_best_score_payload(payload, metric_name)
+                metric = _extract_metric_from_best_score_payload(
+                    payload,
+                    metric_name,
+                    allow_generic=allow_generic,
+                )
             if metric is not None:
                 return metric
 
@@ -759,7 +809,9 @@ def _extract_metric_from_sdk_results(sdk, job_id: str,
     if results_path and results_path.exists():
         for best_score_path in sorted(results_path.rglob("best_score.json")):
             metric = _extract_metric_from_best_score_file(
-                best_score_path, metric_name
+                best_score_path,
+                metric_name,
+                allow_generic=allow_generic,
             )
             if metric is not None:
                 return metric
@@ -779,13 +831,23 @@ def _recover_metric_from_artifacts(
     job_id: str,
     metric_name: str,
     platform_kwargs: dict | None,
+    *,
+    allow_generic: bool = True,
 ) -> float | None:
     local_metric = _extract_metric_from_local_results(
-        job_id, metric_name, platform_kwargs
+        job_id,
+        metric_name,
+        platform_kwargs,
+        allow_generic=allow_generic,
     )
     if local_metric is not None:
         return local_metric
-    return _extract_metric_from_sdk_results(sdk, job_id, metric_name)
+    return _extract_metric_from_sdk_results(
+        sdk,
+        job_id,
+        metric_name,
+        allow_generic=allow_generic,
+    )
 
 
 def _extract_metric_values(
@@ -795,13 +857,21 @@ def _extract_metric_values(
 ) -> dict[str, float]:
     """Extract all requested objective metrics from a log snapshot."""
     values = {}
-    for name in metric_names:
+    for index, name in enumerate(metric_names):
         try:
-            value = extract_fn(logs, name)
+            if extract_fn is _extract_metric_from_logs:
+                value = extract_fn(
+                    logs,
+                    name,
+                    allow_generic=index == 0,
+                )
+            else:
+                value = extract_fn(logs, name)
         except Exception:
             raise
+        value = _callback_metric(value, "metric_extractor")
         if value is not None:
-            values[name] = float(value)
+            values[name] = value
     return values
 
 
@@ -813,9 +883,13 @@ def _recover_metric_values_from_artifacts(
 ) -> dict[str, float]:
     """Recover all requested objective metrics from result artifacts."""
     values = {}
-    for name in metric_names:
+    for index, name in enumerate(metric_names):
         metric = _recover_metric_from_artifacts(
-            sdk, job_id, name, platform_kwargs
+            sdk,
+            job_id,
+            name,
+            platform_kwargs,
+            allow_generic=index == 0,
         )
         if metric is not None:
             values[name] = float(metric)
@@ -1217,8 +1291,137 @@ def _schema_property_keys(schema: Any, prefix: str = "") -> set[str]:
     return keys
 
 
+_EXTERNAL_SEARCH_TYPES = {
+    "integer", "int", "number", "float", "boolean", "bool", "string",
+    "ordered_int", "ordered", "categorical",
+}
+_INTEGER_SCHEMA_TYPES = {"integer", "int", "ordered_int"}
+_NUMBER_SCHEMA_TYPES = {"number", "float"}
+_BOOLEAN_SCHEMA_TYPES = {"boolean", "bool"}
+
+
+def _schema_search_enabled(metadata: dict[str, Any]) -> bool:
+    enabled = metadata.get("automl_enabled", False)
+    return enabled is True or (
+        isinstance(enabled, str) and enabled.upper() == "TRUE"
+    )
+
+
+def _enum_contains(options: list[Any], value: Any) -> bool:
+    for option in options:
+        if isinstance(value, bool) or isinstance(option, bool):
+            if type(value) is type(option) and value == option:
+                return True
+        elif value == option:
+            return True
+    return False
+
+
+def _validate_schema_value(
+    value: Any,
+    value_type: str,
+    metadata: dict[str, Any],
+    nullable: bool,
+    location: str,
+) -> None:
+    if value is None:
+        if nullable:
+            return
+        raise TypeError(f"{location}: null is not allowed")
+
+    if value_type in _INTEGER_SCHEMA_TYPES:
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+            raise TypeError(f"{location}: expected an integer, got {type(value).__name__}")
+    elif value_type in _NUMBER_SCHEMA_TYPES:
+        if isinstance(value, (bool, np.bool_)) or not isinstance(
+            value, (int, float, np.integer, np.floating)
+        ):
+            raise TypeError(f"{location}: expected a number, got {type(value).__name__}")
+        if not math.isfinite(float(value)):
+            raise ValueError(f"{location}: numeric values must be finite")
+    elif value_type in _BOOLEAN_SCHEMA_TYPES:
+        if not isinstance(value, (bool, np.bool_)):
+            raise TypeError(f"{location}: expected a boolean, got {type(value).__name__}")
+    elif value_type == "string":
+        if not isinstance(value, str):
+            raise TypeError(f"{location}: expected a string, got {type(value).__name__}")
+    elif value_type == "array":
+        if not isinstance(value, list):
+            raise TypeError(f"{location}: expected an array, got {type(value).__name__}")
+
+    options = metadata.get("enum")
+    if options is not None and not _enum_contains(options, value):
+        raise ValueError(f"{location}: value {value!r} is not in enum {options!r}")
+
+    for bound_name in ("minimum", "maximum"):
+        if bound_name not in metadata:
+            continue
+        bound = metadata[bound_name]
+        if isinstance(bound, bool) or not isinstance(bound, (int, float)):
+            raise TypeError(f"{location}: {bound_name} must be a finite number")
+        if not math.isfinite(float(bound)):
+            raise ValueError(f"{location}: {bound_name} must be finite")
+        if value_type not in _INTEGER_SCHEMA_TYPES | _NUMBER_SCHEMA_TYPES:
+            raise ValueError(
+                f"{location}: {bound_name} is only valid for numeric properties"
+            )
+        if bound_name == "minimum" and value < bound:
+            raise ValueError(f"{location}: value {value!r} is below minimum {bound!r}")
+        if bound_name == "maximum" and value > bound:
+            raise ValueError(f"{location}: value {value!r} exceeds maximum {bound!r}")
+
+
+def _validate_specs_against_schema(
+    specs: Any,
+    schema: dict[str, Any],
+    schema_path: Path,
+    *,
+    require_all: bool,
+    source: str = "spec",
+) -> None:
+    """Validate concrete direct-script specs against their declared schema."""
+    if not isinstance(specs, dict):
+        raise TypeError(f"{source}: expected an object")
+
+    def validate_object(values: dict, node: dict, prefix: str) -> None:
+        properties = node.get("properties", {})
+        unknown = sorted(set(values) - set(properties))
+        if unknown:
+            location = prefix or "<root>"
+            raise ValueError(
+                f"{source}: keys {unknown!r} at {location} are not declared in "
+                f"{schema_path}"
+            )
+
+        required = node.get("required", [])
+        if not isinstance(required, list) or not all(isinstance(k, str) for k in required):
+            raise TypeError(f"{schema_path}: 'required' must be a list of property names")
+        if require_all:
+            missing = sorted(set(required) - set(values))
+            if missing:
+                location = prefix or "<root>"
+                raise ValueError(f"{source}: missing required keys {missing!r} at {location}")
+
+        for name, value in values.items():
+            child = properties[name]
+            dotted = f"{prefix}.{name}" if prefix else name
+            value_type, metadata, nullable = resolve_schema_leaf(child)
+            if value_type in {"object", "collection", "dict"}:
+                if not isinstance(value, dict):
+                    raise TypeError(
+                        f"{source}.{dotted}: expected an object, got {type(value).__name__}"
+                    )
+                validate_object(value, child, dotted)
+            else:
+                _validate_schema_value(
+                    value, value_type, metadata, nullable, f"{source}.{dotted}"
+                )
+
+    validate_object(specs, schema, "")
+
+
 def _validate_external_automl_schema(schema: Any, schema_path: Path) -> None:
-    """Fail early when a direct-script search schema is structurally unusable."""
+    """Fail early when a direct-script search schema is unusable or unsafe."""
     if not isinstance(schema, dict):
         raise TypeError(f"{schema_path}: schema must be a JSON object")
     if schema.get("type", "object") != "object":
@@ -1235,82 +1438,133 @@ def _validate_external_automl_schema(schema: Any, schema_path: Path) -> None:
         leaf_count = 0
         for name, node in nodes.items():
             dotted = f"{prefix}.{name}" if prefix else str(name)
+            location = f"{schema_path}: property {dotted!r}"
             if not isinstance(name, str) or not name:
                 raise TypeError(f"{schema_path}: property names must be non-empty strings")
             if not isinstance(node, dict):
-                raise TypeError(f"{schema_path}: property {dotted!r} must be an object")
+                raise TypeError(f"{location} must be an object")
+
             raw_type = node.get("type")
-            object_like = (
-                isinstance(raw_type, str)
-                and raw_type in {"object", "collection", "dict"}
-            )
+            if isinstance(raw_type, list):
+                raise ValueError(
+                    f"{location} uses an unsupported list-valued 'type'; use "
+                    "anyOf for optional values"
+                )
+            if raw_type is not None and not isinstance(raw_type, str):
+                raise TypeError(f"{location} 'type' must be a string")
+
+            any_of = node.get("anyOf")
+            if raw_type and any_of is not None:
+                raise ValueError(f"{location} cannot declare both 'type' and 'anyOf'")
+            if any_of is not None:
+                if (
+                    not isinstance(any_of, list)
+                    or not any_of
+                    or not all(isinstance(option, dict) for option in any_of)
+                ):
+                    raise ValueError(
+                        f"{location} 'anyOf' must be a non-empty list of schema objects"
+                    )
+                option_types = [option.get("type") for option in any_of]
+                if not all(isinstance(option_type, str) for option_type in option_types):
+                    raise ValueError(
+                        f"{location} anyOf options must declare scalar string types"
+                    )
+                non_null = [option_type for option_type in option_types if option_type != "null"]
+                if len(non_null) != 1:
+                    raise ValueError(f"{location} supports exactly one non-null anyOf type")
+            if not raw_type and any_of is None:
+                raise ValueError(f"{location} requires 'type' or 'anyOf'")
+
+            value_type, metadata, nullable = resolve_schema_leaf(node)
+            object_like = value_type in {"object", "collection", "dict"}
             if object_like:
-                if "properties" not in node:
-                    raise ValueError(
-                        f"{schema_path}: object property {dotted!r} requires "
-                        "nested properties"
-                    )
-                nested = node["properties"]
+                nested = node.get("properties")
                 if not isinstance(nested, dict) or not nested:
-                    raise ValueError(
-                        f"{schema_path}: property {dotted!r} requires non-empty "
-                        "nested properties"
-                    )
+                    raise ValueError(f"{location} requires non-empty nested properties")
                 leaf_count += validate_properties(nested, dotted)
-            else:
-                if node.get("properties"):
+                continue
+            if node.get("properties"):
+                raise ValueError(
+                    f"{location} with nested properties must declare an object-like type"
+                )
+
+            options = metadata.get("enum")
+            if options is not None and (not isinstance(options, list) or not options):
+                raise ValueError(f"{location} 'enum' must be a non-empty list")
+            minimum = metadata.get("minimum")
+            maximum = metadata.get("maximum")
+            for bound_name, bound in (("minimum", minimum), ("maximum", maximum)):
+                if bound is not None and (
+                    isinstance(bound, bool)
+                    or not isinstance(bound, (int, float))
+                    or not math.isfinite(float(bound))
+                ):
+                    raise ValueError(f"{location} {bound_name} must be a finite number")
+            if minimum is not None and maximum is not None and minimum > maximum:
+                raise ValueError(f"{location} minimum cannot exceed maximum")
+
+            if options is not None:
+                for index, option in enumerate(options):
+                    _validate_schema_value(
+                        option,
+                        value_type,
+                        {key: value for key, value in metadata.items() if key != "enum"},
+                        nullable,
+                        f"{location} enum[{index}]",
+                    )
+
+            if _schema_search_enabled(metadata):
+                if value_type not in _EXTERNAL_SEARCH_TYPES:
                     raise ValueError(
-                        f"{schema_path}: property {dotted!r} with nested properties "
-                        "must declare an object-like type"
+                        f"{location} uses unsupported searchable type {value_type!r}"
                     )
-                value_type = node.get("type")
-                if isinstance(value_type, list):
+                numeric = value_type in _INTEGER_SCHEMA_TYPES | _NUMBER_SCHEMA_TYPES
+                if numeric and options is None and (minimum is None or maximum is None):
                     raise ValueError(
-                        f"{schema_path}: property {dotted!r} uses an unsupported "
-                        "list-valued 'type'; use anyOf for optional values"
+                        f"{location} requires both minimum and maximum, or an enum"
                     )
-                if value_type is not None and not isinstance(value_type, str):
-                    raise TypeError(
-                        f"{schema_path}: property {dotted!r} 'type' must be a string"
-                    )
-                any_of = node.get("anyOf")
-                if any_of is not None:
-                    if (
-                        not isinstance(any_of, list)
-                        or not any_of
-                        or not all(isinstance(option, dict) for option in any_of)
-                    ):
-                        raise ValueError(
-                            f"{schema_path}: property {dotted!r} 'anyOf' must be "
-                            "a non-empty list of schema objects"
-                        )
-                    option_types = [option.get("type") for option in any_of]
-                    if not all(isinstance(option_type, str) for option_type in option_types):
-                        raise ValueError(
-                            f"{schema_path}: property {dotted!r} anyOf options "
-                            "must declare scalar string types"
-                        )
-                    non_null_types = [
-                        option_type for option_type in option_types
-                        if option_type != "null"
-                    ]
-                    if len(non_null_types) != 1:
-                        raise ValueError(
-                            f"{schema_path}: property {dotted!r} supports exactly "
-                            "one non-null anyOf type"
-                        )
-                if not value_type and any_of is None:
-                    raise ValueError(
-                        f"{schema_path}: property {dotted!r} requires 'type' or 'anyOf'"
-                    )
-                leaf_count += 1
+                if value_type in {"string", "ordered_int", "ordered", "categorical"} \
+                        and options is None:
+                    raise ValueError(f"{location} requires an enum for discrete search")
+
+            weights = metadata.get("option_weights")
+            if weights is not None:
+                if options is None or not isinstance(weights, list) or len(weights) != len(options):
+                    raise ValueError(f"{location} option_weights must align with enum")
+                if any(
+                    isinstance(weight, bool)
+                    or not isinstance(weight, (int, float))
+                    or not math.isfinite(float(weight))
+                    or weight < 0
+                    for weight in weights
+                ) or not any(weight > 0 for weight in weights):
+                    raise ValueError(f"{location} option_weights must be finite and non-negative")
+
+            if "default" in metadata:
+                _validate_schema_value(
+                    metadata["default"], value_type, metadata, nullable, f"{location} default"
+                )
+            leaf_count += 1
         return leaf_count
 
     if validate_properties(properties) == 0:
         raise ValueError(f"{schema_path}: schema does not declare any leaf parameters")
+    if "default" in schema:
+        _validate_specs_against_schema(
+            schema["default"], schema, schema_path, require_all=False,
+            source="schema.default",
+        )
 
 
-def _validate_keys_against_schema(provided_keys, base_specs, kind, schema_keys=None):
+def _validate_keys_against_schema(
+    provided_keys,
+    base_specs,
+    kind,
+    schema_keys=None,
+    *,
+    allow_unknown=True,
+):
     """Raise ValueError on provided keys that look like typos of existing
     schema keys. Accepts genuinely-new keys (logs a warning) so users who
     intentionally add a new spec field aren't blocked.
@@ -1326,6 +1580,10 @@ def _validate_keys_against_schema(provided_keys, base_specs, kind, schema_keys=N
                 f"but looks very close to existing key {close[0]!r} — "
                 "did you mean that? (remove the typo; if you really "
                 "intended a brand-new key, rename it so it doesn't collide.)"
+            )
+        if not allow_unknown:
+            raise ValueError(
+                f"{kind} key {k!r} is not declared in the external AutoML schema"
             )
         logger.warning(
             "%s key %r is not in the skill's spec schema. "
@@ -1616,9 +1874,10 @@ def _merge_metric_payload(target: dict[str, Any], payload) -> bool:
         metric = payload.get("metric_value", payload.get("metric"))
     else:
         metric = payload
+    metric = _finite_metric(metric)
     if metric is None:
         return False
-    target["metric_value"] = float(metric)
+    target["metric_value"] = metric
     return True
 
 
@@ -1762,10 +2021,9 @@ class AutoMLRunner:
                 overrides the implicit "metric name contains 'loss' → minimize,
                 else maximize" rule. Useful when your metric name doesn't hint
                 at the direction (e.g. ``"bleu_score"``, ``"perplexity"``,
-                ``"wer"``). Under the hood the runner negates reported values
-                when the explicit direction disagrees with the implicit rule,
-                then flips them back in the returned result — callers always
-                see their original metric scale.
+                ``"wer"``). The objective configuration handles direction and
+                scalarization while reported values remain on their original
+                scale.
 
         Returns:
             Dict with keys: best, progress, baseline, final_evaluation, history.
@@ -1847,19 +2105,30 @@ class AutoMLRunner:
         if spec_overrides:
             _validate_keys_against_schema(
                 list(spec_overrides.keys()), base_specs, "spec_override",
-                self.skill_ctx.valid_spec_keys)
+                self.skill_ctx.valid_spec_keys,
+                allow_unknown=resolved_execution is None,
+            )
             base_specs = self._merge_specs(base_specs, spec_overrides)
         if automl_hyperparameters:
             _validate_keys_against_schema(
                 list(automl_hyperparameters), base_specs, "automl_hyperparameter",
-                self.skill_ctx.valid_spec_keys)
+                self.skill_ctx.valid_spec_keys,
+                allow_unknown=resolved_execution is None,
+            )
+        if resolved_execution is not None:
+            _validate_specs_against_schema(
+                base_specs,
+                self.skill_ctx.schema,
+                schema_path,
+                require_all=True,
+                source="merged train spec",
+            )
 
         # Validate explicit direction. Direction is now honored by AutoML's
         # objective config, so the runner keeps reported values on their
         # original scale.
-        metric_name = automl_settings.get("metric", "loss")
-        _effective_dir, _ = _resolve_direction(
-            metric_name, automl_settings.get("direction"))
+        metric_name = objective_config.primary_metric
+        _effective_dir = objective_config.primary_direction
 
         baseline = {
             "enabled": bool(automl_settings.get("run_baseline", True)),
@@ -1869,7 +2138,10 @@ class AutoMLRunner:
         }
         if baseline["enabled"]:
             if automl_settings.get("baseline_metric") is not None:
-                baseline["metric_value"] = float(automl_settings["baseline_metric"])
+                baseline["metric_value"] = _require_finite_metric(
+                    automl_settings["baseline_metric"],
+                    "automl_settings['baseline_metric']",
+                )
                 baseline["status"] = "provided"
             elif baseline_fn is not None:
                 try:
@@ -1880,8 +2152,18 @@ class AutoMLRunner:
                     baseline["failure_reason"] = str(ex)
                 else:
                     if baseline_metric is not None:
-                        baseline["metric_value"] = float(baseline_metric)
-                        baseline["status"] = "measured"
+                        validated_metric = _callback_metric(
+                            baseline_metric, "baseline_fn"
+                        )
+                        if validated_metric is None:
+                            baseline["status"] = "failure"
+                            baseline["failure_reason"] = (
+                                "baseline_fn returned an invalid non-finite or "
+                                "boolean metric"
+                            )
+                        else:
+                            baseline["metric_value"] = validated_metric
+                            baseline["status"] = "measured"
                     else:
                         baseline["status"] = "metric_missing"
             else:
@@ -1999,12 +2281,16 @@ class AutoMLRunner:
                 previous_metric = None
                 if getattr(rec, "resume_from_job_id", None):
                     if objective_config.is_multi_objective and rec.objective_values:
-                        previous_metric = dict(rec.objective_values)
+                        previous_metric = _callback_metric_payload(
+                            _metric_payload_from_values(
+                                dict(rec.objective_values),
+                                metric_name,
+                                objective_names,
+                            ),
+                            "resumed recommendation",
+                        )
                     else:
-                        try:
-                            previous_metric = float(rec.result)
-                        except (TypeError, ValueError):
-                            previous_metric = None
+                        previous_metric = _finite_metric(rec.result)
                 # Safety net: if a user hardcoded a local *.results_dir /
                 # *.output_dir / *.save_dir in the spec, every rec would
                 # write to the same path and overwrite the previous one.
@@ -2033,6 +2319,14 @@ class AutoMLRunner:
                     if on_result:
                         on_result(rec, None, "failure")
                     continue
+                if resolved_execution is not None:
+                    _validate_specs_against_schema(
+                        merged_specs,
+                        self.skill_ctx.schema,
+                        schema_path,
+                        require_all=True,
+                        source=f"recommendation {rec.id} merged spec",
+                    )
                 metric_value, status = self._run_one_job(
                     image=resolved_image, action_cfg=action_cfg,
                     specs=merged_specs, rec=rec, metric_name=metric_name,
@@ -2043,8 +2337,12 @@ class AutoMLRunner:
                     objective_names=objective_names,
                     platform_kwargs=job_platform_kwargs,
                 )
+                metric_value = _callback_metric_payload(metric_value, "training metric")
+                if status == "success" and metric_value is None:
+                    status = "metric_missing"
+                metric_missing = status == "metric_missing"
                 if (
-                    status == "metric_missing"
+                    metric_missing
                     and previous_metric is not None
                     and getattr(rec, "job_id", None)
                     and _job_has_checkpoint_artifact(
@@ -2058,30 +2356,20 @@ class AutoMLRunner:
                     )
                     metric_value = previous_metric
                     status = "success"
-                elif status == "metric_missing":
+                    metric_missing = False
+                elif metric_missing:
                     status = "failure"
                 # Fail-loud on a broken extractor: if the configured metric
                 # extractor (and eval_fn) both return None for N consecutive
                 # recs, we're not measuring anything — raise instead of
                 # letting the brain see all-failures for hours.
-                if metric_value is None:
+                if metric_missing:
                     self._consecutive_none_metrics += 1
-                    if (self._consecutive_none_metrics
-                            >= self._MAX_CONSECUTIVE_NONE_METRICS):
-                        raise MetricExtractorError(
-                            f"No metric extracted for "
-                            f"{self._consecutive_none_metrics} consecutive "
-                            f"recs (metric_name={metric_name!r}). Likely "
-                            f"causes: (1) the container only emits this "
-                            f"metric via <results_dir>/train/status.json, "
-                            f"not stdout — pass eval_fn= with a status.json "
-                            f"reader; (2) metric_name doesn't match what "
-                            f"the container actually emits; (3) the regex "
-                            f"in _extract_metric_from_logs needs a new "
-                            f"pattern for this model. Inspect the last "
-                            f"job's logs to confirm.")
                 else:
                     self._consecutive_none_metrics = 0
+                metric_error = self._consecutive_none_metrics >= (
+                    self._MAX_CONSECUTIVE_NONE_METRICS
+                )
                 # Report raw values; AutoML objective config handles direction
                 # and scalarization.
                 automl.report_result(
@@ -2096,6 +2384,20 @@ class AutoMLRunner:
                             _metric_payload_primary(metric_value, metric_name)
                             if metric_value is not None else 0.0,
                             status)
+                if metric_error:
+                    raise MetricExtractorError(
+                        f"No metric extracted for "
+                        f"{self._consecutive_none_metrics} consecutive "
+                        f"recs (metric_name={metric_name!r}). Likely "
+                        f"causes: (1) the container only emits this "
+                        f"metric via <results_dir>/train/status.json, "
+                        f"not stdout — pass eval_fn= with a status.json "
+                        f"reader; (2) metric_name doesn't match what "
+                        f"the container actually emits; (3) the regex "
+                        f"in _extract_metric_from_logs needs a new "
+                        f"pattern for this model. Inspect the last "
+                        f"job's logs to confirm."
+                    )
 
         best = automl.get_best()
         progress = automl.get_progress()
@@ -2126,13 +2428,12 @@ class AutoMLRunner:
                 if _merge_metric_payload(final_evaluation, provided_payload):
                     final_evaluation["status"] = provided_payload.get("status", "provided")
                 else:
-                    final_evaluation["status"] = provided_payload.get(
-                        "status", "metric_missing"
-                    )
+                    final_evaluation["status"] = "metric_missing"
                 final_evaluation["source"] = provided_payload.get("source", "provided")
             elif automl_settings.get("final_evaluation_metric") is not None:
-                final_evaluation["metric_value"] = float(
-                    automl_settings["final_evaluation_metric"]
+                final_evaluation["metric_value"] = _require_finite_metric(
+                    automl_settings["final_evaluation_metric"],
+                    "automl_settings['final_evaluation_metric']",
                 )
                 final_evaluation["status"] = "provided"
                 final_evaluation["source"] = "automl_settings.final_evaluation_metric"
@@ -2422,7 +2723,9 @@ class AutoMLRunner:
         eval_metric_used = False
         if eval_fn is not None:
             try:
-                eval_metric = eval_fn(rec, job.id)
+                eval_metric = _callback_metric_payload(
+                    eval_fn(rec, job.id), "eval_fn"
+                )
             except Exception as ex:
                 logger.warning("eval_fn raised for rec %d: %s; falling back "
                                 "to log-extracted metric", rec.id, ex)
@@ -2451,9 +2754,12 @@ class AutoMLRunner:
                 eval_metric_used = True
         if not eval_metric_used:
             local_metrics = {}
-            for name in metric_names:
+            for index, name in enumerate(metric_names):
                 local_metric = _extract_metric_from_local_results(
-                    job.id, name, platform_kwargs
+                    job.id,
+                    name,
+                    platform_kwargs,
+                    allow_generic=index == 0,
                 )
                 if local_metric is not None:
                     local_metrics[name] = float(local_metric)
@@ -2658,7 +2964,7 @@ class AutoMLRunner:
             eval_metric_used = False
             if eval_fn is not None:
                 try:
-                    em = eval_fn(rec, job_id)
+                    em = _callback_metric_payload(eval_fn(rec, job_id), "eval_fn")
                 except Exception as ex:
                     logger.warning("eval_fn raised during resume for rec %d: %s",
                                     rec_id, ex)
@@ -2674,9 +2980,12 @@ class AutoMLRunner:
                     eval_metric_used = True
             if not eval_metric_used:
                 local_metrics = {}
-                for name in metric_names:
+                for index, name in enumerate(metric_names):
                     local_metric = _extract_metric_from_local_results(
-                        job_id, name, platform_kwargs
+                        job_id,
+                        name,
+                        platform_kwargs,
+                        allow_generic=index == 0,
                     )
                     if local_metric is not None:
                         local_metrics[name] = float(local_metric)
