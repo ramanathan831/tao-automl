@@ -4,6 +4,8 @@
 
 from unittest.mock import patch
 
+import pytest
+
 from tao_automl import AutoML
 from tao_automl.schema.generate_schema import generate_schema
 from tao_automl.search_space.params import generate_hyperparams_to_search
@@ -116,3 +118,93 @@ def test_automl_tunes_arbitrary_network_from_external_schema(tmp_path):
     assert set(specs) == {"model.n_estimators", "model.max_depth"}
     assert 2 <= specs["model.n_estimators"] <= 20
     assert 1 <= specs["model.max_depth"] <= 6
+
+
+def test_external_schema_preserves_standard_scalar_enums():
+    schema = {
+        "type": "object",
+        "default": {"mode": "fast", "depth": 2},
+        "properties": {
+            "mode": {
+                "type": "string",
+                "default": "fast",
+                "enum": ["fast", "accurate"],
+                "automl_enabled": True,
+            },
+            "depth": {
+                "type": "integer",
+                "default": 2,
+                "enum": [2, 4, 8],
+                "automl_enabled": True,
+            },
+        },
+    }
+
+    records, names = generate_hyperparams_to_search(
+        network="external_enum_model",
+        action="train",
+        train_specs=schema["default"],
+        automl_hyperparameters=[],
+        schema=schema,
+    )
+
+    by_name = {record["parameter"]: record for record in records}
+    assert names == ["mode", "depth"]
+    assert by_name["mode"]["value_type"] == "categorical"
+    assert by_name["mode"]["valid_options"] == ["fast", "accurate"]
+    assert by_name["depth"]["value_type"] == "ordered_int"
+    assert by_name["depth"]["valid_options"] == [2, 4, 8]
+
+
+def test_external_schema_uses_metadata_from_concrete_anyof_branch():
+    schema = {
+        "type": "object",
+        "default": {"width": 3},
+        "properties": {
+            "width": {
+                "anyOf": [
+                    {"type": "null"},
+                    {
+                        "type": "integer",
+                        "default": 3,
+                        "minimum": 1,
+                        "maximum": 5,
+                        "automl_enabled": True,
+                    },
+                ],
+            },
+        },
+    }
+
+    records, names = generate_hyperparams_to_search(
+        network="external_optional_model",
+        action="train",
+        train_specs=schema["default"],
+        automl_hyperparameters=[],
+        schema=schema,
+    )
+
+    assert names == ["width"]
+    assert records[0]["value_type"] == "integer"
+    assert records[0]["default_value"] == 3
+    assert records[0]["valid_min"] == 1
+    assert records[0]["valid_max"] == 5
+
+
+def test_automl_rejects_empty_external_search_space(tmp_path):
+    schema = {
+        "type": "object",
+        "default": {"name": "fixed"},
+        "properties": {
+            "name": {"type": "string", "default": "fixed"},
+        },
+    }
+
+    with pytest.raises(ValueError, match="No searchable parameters"):
+        AutoML(
+            workspace=str(tmp_path),
+            network="external_fixed_model",
+            train_specs=schema["default"],
+            settings={"algorithm": "bayesian", "metric": "accuracy"},
+            search_schema=schema,
+        )

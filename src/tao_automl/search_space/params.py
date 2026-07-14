@@ -23,7 +23,7 @@ AUTOML_DISABLED_NETWORKS = []
 _VALID_TYPES = [
     "int", "integer",
     "float",
-    "ordered_int", "bool",
+    "ordered_int", "bool", "string",
     "ordered", "categorical",
     "list_1_backbone", "list_1_normal", "list_2", "list_3",
     "subset_list", "optional_list",
@@ -175,6 +175,18 @@ def generate_hyperparams_to_search(
         automl_params,
         updated_spec_with_keys_flattened,
     )
+
+    if schema is not None and automl_hyperparameters:
+        requested = set(automl_hyperparameters)
+        selected = set(automl_params["parameter"])
+        missing = sorted(requested - selected)
+        if missing:
+            raise ValueError(
+                "External AutoML schema cannot search the requested parameter(s): "
+                f"{missing}. Each requested parameter must exist in the merged "
+                "training spec, use a supported scalar type, and not set "
+                "automl_enabled=false."
+            )
 
     # Sort: parameters that depend on other parameters go last
     automl_params = automl_params.sort_values(by=["depends_on"], na_position="first")

@@ -30,9 +30,9 @@ slurm      = ["nvidia-tao-sdk[slurm] @ git+https://gitlab-master.nvidia.com/nvid
 kubernetes = ["nvidia-tao-sdk[kubernetes] @ git+https://gitlab-master.nvidia.com/nvidia-tao-toolkit/tao-sdk.git"]
 docker     = ["nvidia-tao-sdk[docker] @ git+https://gitlab-master.nvidia.com/nvidia-tao-toolkit/tao-sdk.git"]
 brev       = ["nvidia-tao-sdk[brev] @ git+https://gitlab-master.nvidia.com/nvidia-tao-toolkit/tao-sdk.git"]
-# Direct Python execution uses only the SDK's base dependencies. The named
-# extra keeps installation symmetric with the container platform choices.
-virtualenv = ["nvidia-tao-sdk @ git+https://gitlab-master.nvidia.com/nvidia-tao-toolkit/tao-sdk.git"]
+# Direct Python execution supports JSON, YAML, and TOML action specs. Pull the
+# SDK's declared TOML writer so format support never depends on ambient packages.
+virtualenv = ["nvidia-tao-sdk[toml] @ git+https://gitlab-master.nvidia.com/nvidia-tao-toolkit/tao-sdk.git"]
 
 llm = [
     "openai>=1.0",

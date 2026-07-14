@@ -251,6 +251,23 @@ def test_controller_multi_objective_score_and_pareto_front():
             "latency": 10.0,
         }
 
+        loaded = Controller.load_state(
+            brain=MockBrain(4),
+            context=ctx,
+            state_store=store,
+            settings=settings,
+            metric="accuracy",
+            algorithm="bayesian",
+            objective_config=objective_config,
+        )
+        loaded_best = loaded.get_best()
+        assert loaded_best.id == 1
+        assert loaded_best.objective_score == pytest.approx(0.78)
+        assert loaded_best.objective_values == {
+            "accuracy": 0.88,
+            "latency": 10.0,
+        }
+
 
 def test_controller_accepts_resume_recommendations():
     from tao_automl.controller.controller import Controller

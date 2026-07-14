@@ -290,8 +290,8 @@ class AutoML:
             raise ValueError("settings must include at least an 'algorithm' key")
 
         algorithm = settings["algorithm"]
-        metric = settings.get("metric", "loss")
         objective_config = parse_objective_config(settings)
+        metric = objective_config.primary_metric
         brain_metric = objective_config.brain_metric
 
         # 1. State store
@@ -336,10 +336,19 @@ class AutoML:
             )
 
         if not param_records or param_records == [{}]:
-            logger.warning(
-                "No searchable parameters found for network '%s'. "
-                "Check that automl_hyperparameters match the schema.", network
+            requested = sorted(set(automl_hyperparameters))
+            requested_detail = (
+                f" Requested parameters: {requested}." if requested else ""
             )
+            message = (
+                f"No searchable parameters found for network {network!r}. Check "
+                "that the schema declares at least one supported parameter with "
+                "automl_enabled=true and that the parameter exists in train_specs."
+                f"{requested_detail}"
+            )
+            if search_schema is not None:
+                raise ValueError(message)
+            logger.warning(message)
 
         # 6. Algorithm params
         algo_params = AlgorithmParams.from_dict(settings)
