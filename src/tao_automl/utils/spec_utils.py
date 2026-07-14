@@ -32,8 +32,16 @@ def flatten_properties(data, parent_key='', sep='.'):
                 # For union types, determine the primary type from anyOf
                 any_of_types = v.get('anyOf', [])
                 if any_of_types:
-                    # Use the first type as the primary type for AutoML
-                    first_type = any_of_types[0].get('type', '')
+                    # Optional schemas may put ``null`` first. Use the first
+                    # concrete type as the primary AutoML value type.
+                    first_type = next(
+                        (
+                            option.get('type', '')
+                            for option in any_of_types
+                            if option.get('type') != 'null'
+                        ),
+                        '',
+                    )
                     if first_type == 'integer':
                         dtype = 'int'
                     elif first_type == 'number':
