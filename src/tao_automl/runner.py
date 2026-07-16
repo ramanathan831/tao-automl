@@ -2283,6 +2283,7 @@ class AutoMLRunner:
 
         while True:
             time.sleep(self._poll_interval)
+            hard_failure = False
 
             # Read logs every poll cycle to cache metrics before they expire
             try:
@@ -2336,23 +2337,29 @@ class AutoMLRunner:
                     if es:
                         cached_exec_status = es
                         if es == "FAIL":
+                            if hard_failure:
+                                logger.warning(
+                                    "Rec %d: job %s logs show a hard execution "
+                                    "failure; canceling backend job",
+                                    rec.id, job.id,
+                                )
+                                try:
+                                    self._sdk.cancel_job(job.id)
+                                except Exception as ex:
+                                    logger.warning(
+                                        "Failed to cancel failed job %s for rec %d: %s",
+                                        job.id, rec.id, ex,
+                                    )
+                                break
                             logger.warning(
-                                "Rec %d: job %s logs show execution failure; "
-                                "canceling backend job",
+                                "Rec %d: job %s reported execution failure; "
+                                "waiting for terminal state to preserve diagnostics",
                                 rec.id, job.id,
                             )
-                            try:
-                                self._sdk.cancel_job(job.id)
-                            except Exception as ex:
-                                logger.warning(
-                                    "Failed to cancel failed job %s for rec %d: %s",
-                                    job.id, rec.id, ex,
-                                )
-                            break
             except Exception:
                 pass
 
-            if cached_exec_status == "FAIL":
+            if cached_exec_status == "FAIL" and hard_failure:
                 break
 
             try:

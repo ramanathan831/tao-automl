@@ -1697,6 +1697,43 @@ def test_run_one_job_cancels_hard_failure_and_recovers_remote_best_score(tmp_pat
     fake_sdk.cancel_job.assert_called_once_with("job-hard")
 
 
+def test_run_one_job_waits_for_terminal_state_after_non_hard_fail_marker(tmp_path):
+    from tao_automl.runner import AutoMLRunner
+
+    skill_dir = _write_fake_skill(tmp_path)
+    fake_sdk = MagicMock()
+    fake_sdk.create_job.return_value = MagicMock(
+        id="job-fail-marker", backend_job_id="be-fail-marker"
+    )
+    fake_sdk.get_job_status.return_value = MagicMock(status="Error")
+    fake_sdk.get_job_logs.return_value = (
+        "RuntimeError: invalid resumed optimizer state\n"
+        "Execution status: FAIL\n"
+    )
+
+    runner = AutoMLRunner(sdk=fake_sdk, skill_dir=skill_dir, action="train")
+    runner._poll_interval = 0
+    rec = MagicMock(id=9)
+
+    with patch(
+        "tao_sdk.script_runner.build_entrypoint",
+        return_value={"command": "BAKED_HEREDOC_COMMAND", "args_template": ""},
+    ):
+        _, status = runner._run_one_job(
+            image="nvcr.io/test:1",
+            action_cfg=runner.skill_ctx.action_cfg,
+            specs={"train": {"num_epochs": 2}},
+            rec=rec,
+            metric_name="val_mAP50",
+            workspace_path=str(tmp_path),
+            platform_kwargs={},
+        )
+
+    assert status == "failure"
+    fake_sdk.get_job_status.assert_called()
+    fake_sdk.cancel_job.assert_not_called()
+
+
 def test_run_one_job_preserves_metric_when_slurm_reports_canceled(tmp_path):
     from tao_automl.runner import AutoMLRunner
 
