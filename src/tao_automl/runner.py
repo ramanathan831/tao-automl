@@ -2586,6 +2586,7 @@ class AutoMLRunner:
             "history": [
                 {
                     "rec_id": r.id,
+                    "job_id": getattr(r, "job_id", None),
                     "metric": _recommendation_primary_metric(r, metric_name),
                     "objective_score": getattr(r, "objective_score", None),
                     "objective_values": _recommendation_objective_values(r),
