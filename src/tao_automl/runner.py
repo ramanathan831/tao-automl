@@ -2829,7 +2829,10 @@ class AutoMLRunner:
 
         # fix #4: if an eval_fn is provided, run it post-training and let its
         # return override the log-extracted metric. Errors are isolated.
-        metric_values = dict(cached_metrics)
+        # An explicit evaluator is authoritative for checkpoint selection.
+        # Never relabel a training KPI as an evaluation metric when evaluation
+        # fails or returns no value.
+        metric_values = {} if eval_fn is not None else dict(cached_metrics)
         eval_metric_used = False
         if eval_fn is not None:
             try:
@@ -2837,8 +2840,8 @@ class AutoMLRunner:
                     eval_fn(rec, job.id), "eval_fn"
                 )
             except Exception as ex:
-                logger.warning("eval_fn raised for rec %d: %s; falling back "
-                                "to log-extracted metric", rec.id, ex)
+                logger.warning("eval_fn raised for rec %d: %s; evaluation "
+                               "metric is unavailable", rec.id, ex)
                 eval_metric = None
             if eval_metric is not None:
                 if isinstance(eval_metric, dict):
@@ -2862,6 +2865,12 @@ class AutoMLRunner:
                                 )
                             ))
                 eval_metric_used = True
+        if eval_fn is not None and not eval_metric_used:
+            logger.warning(
+                "Rec %d: eval_fn produced no metric; refusing training-metric fallback",
+                rec.id,
+            )
+            return None, "metric_missing"
         if not eval_metric_used:
             local_metrics = {}
             for index, name in enumerate(metric_names):
@@ -3070,7 +3079,7 @@ class AutoMLRunner:
             report_status = "failure"
             rec.failure_reason = "job_canceled"
         else:
-            metric_values = dict(cached_metrics)
+            metric_values = {} if eval_fn is not None else dict(cached_metrics)
             eval_metric_used = False
             if eval_fn is not None:
                 try:
@@ -3088,6 +3097,21 @@ class AutoMLRunner:
                     else:
                         metric_values[metric_name] = float(em)
                     eval_metric_used = True
+            if eval_fn is not None and not eval_metric_used:
+                metric_value = None
+                report_status = "failure"
+                rec.failure_reason = "evaluation_metric_missing"
+                automl.report_result(
+                    rec_id=rec_id,
+                    metric_value=0.0,
+                    status=report_status,
+                )
+                if on_result:
+                    try:
+                        on_result(rec, metric_value, report_status)
+                    except Exception as ex:
+                        logger.warning("on_result callback failed for rec %d: %s", rec_id, ex)
+                return
             if not eval_metric_used:
                 local_metrics = {}
                 for index, name in enumerate(metric_names):
