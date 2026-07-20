@@ -63,6 +63,16 @@ from tao_automl.utils.spec_utils import resolve_schema_leaf
 logger = logging.getLogger(__name__)
 
 
+# TAO NV-Panoptix3D Lightning checkpoints store the completed epoch using a
+# one-based internal counter while their filenames remain zero-based.  Passing
+# the next Hyperband-family resource budget verbatim therefore makes Lightning
+# stop immediately after restore (for example, epoch-0 checkpoint +
+# ``num_epochs=2`` executes no epoch-1 batches).  The terminal budget must be
+# advanced by one for resumed jobs so the requested additional epoch actually
+# runs and emits a fresh metric/checkpoint.
+_RESUME_EPOCH_BUDGET_OFFSETS = {"nvpanoptix3d": 1}
+
+
 # ---------------------------------------------------------------------------
 # SkillContext — replaces the deleted SkillBank. Reads skill_info.yaml and
 # spec_template_<action>.yaml directly from the skill bank dir, the same way
@@ -627,7 +637,17 @@ def _extract_metric_from_best_score_payload(
     aliases = list(dict.fromkeys(aliases))
     requested_aliases = set(aliases)
 
-    for key in aliases:
+    if is_latency_metric(metric_name):
+        if not isinstance(metric_label, str):
+            return None
+        if (
+            metric_label not in requested_aliases
+            and metric_label.replace("/", "_") not in requested_aliases
+            and not is_latency_metric(metric_label)
+        ):
+            return None
+
+    for key in ("best_score", "best_metric", "metric_value", "score", "value"):
         if key not in data:
             continue
         value = _finite_metric(data[key])
@@ -890,6 +910,87 @@ def _recover_metric_values_from_artifacts(
             name,
             platform_kwargs,
             allow_generic=index == 0,
+        )
+        if metric is not None:
+            values[name] = float(metric)
+    return values
+
+
+def _metric_payload_from_values(
+    values: dict[str, float],
+    metric_name: str,
+    metric_names: list[str],
+):
+    """Return a legacy scalar for one metric or a dict for objectives."""
+    if len(metric_names) == 1:
+        return values.get(metric_name)
+    missing = [name for name in metric_names if name not in values]
+    if missing:
+        return None
+    return {name: values[name] for name in metric_names}
+
+
+def _metric_payload_primary(payload, metric_name: str):
+    if isinstance(payload, dict):
+        return payload.get(metric_name)
+    return payload
+
+
+def _recommendation_primary_metric(rec, metric_name: str):
+    if rec is None:
+        return None
+    getter = getattr(rec, "primary_metric_value", None)
+    if callable(getter):
+        return getter()
+    objective_values = getattr(rec, "objective_values", None)
+    if isinstance(objective_values, dict) and metric_name in objective_values:
+        return objective_values[metric_name]
+    return _metric_payload_primary(getattr(rec, "result", None), metric_name)
+
+
+def _recommendation_objective_values(rec) -> dict:
+    objective_values = getattr(rec, "objective_values", None)
+    if isinstance(objective_values, dict):
+        return dict(objective_values)
+    return {}
+
+
+def _format_metric_payload(payload) -> str:
+    if payload is None:
+        return "None"
+    if isinstance(payload, dict):
+        return json.dumps(payload, sort_keys=True)
+    return f"{float(payload):.6f}"
+
+
+def _extract_metric_values(
+    logs: str,
+    metric_names: list[str],
+    extract_fn,
+) -> dict[str, float]:
+    """Extract all requested objective metrics from a log snapshot."""
+    values = {}
+    for name in metric_names:
+        try:
+            value = extract_fn(logs, name)
+        except Exception:
+            raise
+        if value is not None:
+            values[name] = float(value)
+    return values
+
+
+def _recover_metric_values_from_artifacts(
+    sdk,
+    job_id: str,
+    metric_names: list[str],
+    platform_kwargs: dict | None,
+) -> dict[str, float]:
+    """Recover all requested objective metrics from result artifacts."""
+    values = {}
+    for name in metric_names:
+        metric = _recover_metric_from_artifacts(
+            sdk, job_id, name, platform_kwargs
         )
         if metric is not None:
             values[name] = float(metric)
@@ -2472,6 +2573,7 @@ class AutoMLRunner:
         result = {
             "best": {
                 "rec_id": best.id if best else None,
+                "job_id": getattr(best, "job_id", None) if best else None,
                 "specs": best.specs if best else {},
                 "metric_value": best_metric,
                 "objective_score": getattr(best, "objective_score", None),
@@ -2584,6 +2686,7 @@ class AutoMLRunner:
 
         while True:
             time.sleep(self._poll_interval)
+            hard_failure = False
 
             # Read logs every poll cycle to cache metrics before they expire
             try:
@@ -2637,23 +2740,29 @@ class AutoMLRunner:
                     if es:
                         cached_exec_status = es
                         if es == "FAIL":
+                            if hard_failure:
+                                logger.warning(
+                                    "Rec %d: job %s logs show a hard execution "
+                                    "failure; canceling backend job",
+                                    rec.id, job.id,
+                                )
+                                try:
+                                    self._sdk.cancel_job(job.id)
+                                except Exception as ex:
+                                    logger.warning(
+                                        "Failed to cancel failed job %s for rec %d: %s",
+                                        job.id, rec.id, ex,
+                                    )
+                                break
                             logger.warning(
-                                "Rec %d: job %s logs show execution failure; "
-                                "canceling backend job",
+                                "Rec %d: job %s reported execution failure; "
+                                "waiting for terminal state to preserve diagnostics",
                                 rec.id, job.id,
                             )
-                            try:
-                                self._sdk.cancel_job(job.id)
-                            except Exception as ex:
-                                logger.warning(
-                                    "Failed to cancel failed job %s for rec %d: %s",
-                                    job.id, rec.id, ex,
-                                )
-                            break
             except Exception:
                 pass
 
-            if cached_exec_status == "FAIL":
+            if cached_exec_status == "FAIL" and hard_failure:
                 break
 
             try:
@@ -3158,6 +3267,22 @@ class AutoMLRunner:
                 "(epoch=%s step=%s)",
                 rec.id, parent_job_id, bool_or_path_key, artifact,
                 resume_epoch, resume_step,
+            )
+
+        epoch_offset = _RESUME_EPOCH_BUDGET_OFFSETS.get(
+            self.skill_ctx.network_arch, 0
+        )
+        requested_epochs = self._get_nested(specs, "train.num_epochs")
+        if epoch_offset and isinstance(requested_epochs, int):
+            effective_epochs = requested_epochs + epoch_offset
+            self._set_nested(specs, "train.num_epochs", effective_epochs)
+            logger.info(
+                "Rec %d adjusted resumed %s epoch budget from %d to %d so "
+                "the requested terminal epoch executes",
+                rec.id,
+                self.skill_ctx.network_arch,
+                requested_epochs,
+                effective_epochs,
             )
         return specs
 
