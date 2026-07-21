@@ -438,6 +438,18 @@ class AutoML:
         """Get all Recommendation objects generated so far."""
         return self._controller.get_history()
 
+    def get_pareto_front(self):
+        """Get non-dominated successful recommendations for all objectives."""
+        return self._controller.get_pareto_front()
+
+    def get_required_checkpoint_job_ids(self):
+        """Get job IDs whose checkpoints are still needed by the search."""
+        return self._controller.get_required_checkpoint_job_ids()
+
+    def get_verified_full_fidelity_best(self):
+        """Get a verified largest-budget winner when one can be proven."""
+        return self._controller.get_verified_full_fidelity_best()
+
     def get_status(self):
         """Get a full status snapshot of the experiment.
 

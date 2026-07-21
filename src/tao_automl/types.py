@@ -51,6 +51,10 @@ class Recommendation:
         self.resume_from_job_id = None  # For PBT: job ID to resume checkpoint from
         self.resume_from_epoch = None
         self.resume_from_step = None
+        # Monotonically increasing batch/window assigned by Controller.  The
+        # latest window must remain available until a multi-fidelity brain has
+        # made its next promotion decision.
+        self.checkpoint_window = 0
         self.early_stop_epoch = None  # For PBT/Hyperband: epoch limit when this rec was launched
         self.failure_reason = None
         self.adjustments = []

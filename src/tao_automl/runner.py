@@ -36,6 +36,7 @@ Or execute a plan file::
 
 import argparse
 import copy
+import functools
 import json
 import logging
 import math
@@ -266,7 +267,147 @@ _DEFAULT_POLL_INTERVAL = 30
 _POLL_LOG_TAIL_LINES = 10_000
 _TERMINAL_LOG_OVERLAP_CHARS = 8 * 1024
 _TERMINAL_LOG_CONTEXT_CHARS = 64 * 1024
-_TERMINAL_STATUSES = {"Complete", "Error", "Canceled"}
+_SUCCESS_PLATFORM_STATUSES = frozenset({
+    "complete", "completed", "success", "succeeded",
+})
+_FAILURE_PLATFORM_STATUSES = frozenset({"error", "failed", "failure"})
+_CANCELED_PLATFORM_STATUSES = frozenset({
+    "canceled", "cancelled", "stopped", "terminated",
+})
+_QUIESCENT_PLATFORM_STATUSES = frozenset({"deleted", "notfound", "not_found"})
+_CANCEL_CONFIRM_TIMEOUT_SECONDS = 30.0
+_CANCEL_CONFIRM_POLL_SECONDS = 0.5
+_TERMINAL_REC_STATUSES = {"success", "done", "failure", "error", "canceled"}
+_SUCCESS_REC_STATUSES = {"success", "done"}
+_DEFER_ARTIFACT_PRUNING_ALGORITHMS = frozenset({
+    "hyperband", "h", "bohb", "asha", "dehb", "hyperband_es", "hes", "pbt",
+    "hybrid",
+})
+_CHECKPOINT_RETENTION_STRATEGIES = frozenset({"auto", "best", "terminal"})
+
+
+def _bool_setting(value: Any) -> bool:
+    """Parse bool-like values accepted in AutoML settings."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "y", "on")
+    return bool(value)
+
+
+def _apply_checkpoint_retention_strategy(
+    specs: dict[str, Any],
+    *,
+    enabled: bool,
+    strategy: str,
+    metric: str,
+    direction: str,
+) -> str | None:
+    """Bound checkpoints written inside one AutoML trial.
+
+    Whole-job artifact cleanup cannot reclaim periodic checkpoints inside the
+    surviving trial.  This launch-time policy complements that cleanup without
+    changing the recommendation's effective epoch budget:
+
+    * ``best`` asks compatible trainers to keep one monitored checkpoint and
+      replace periodic saving.
+    * ``terminal`` makes the periodic interval equal the recommendation's
+      effective ``train.num_epochs`` so only its terminal epoch is saved.
+    * ``auto`` uses ``best`` only when the merged spec already exposes a
+      ``train.checkpointer`` mapping; otherwise it uses the portable terminal
+      fallback.
+
+    Returns the effective strategy, or ``None`` when retention is disabled.
+    ``specs`` is intentionally untouched in the disabled case.
+    """
+    if not enabled:
+        return None
+
+    normalized = str(strategy or "auto").strip().lower()
+    if normalized not in _CHECKPOINT_RETENTION_STRATEGIES:
+        raise ValueError(
+            "automl_checkpoint_retention_strategy must be one of: "
+            + ", ".join(sorted(_CHECKPOINT_RETENTION_STRATEGIES))
+        )
+    if not isinstance(specs, dict):
+        raise TypeError("AutoML trial specs must be a dictionary")
+    train = specs.get("train")
+    if not isinstance(train, dict):
+        raise ValueError(
+            "checkpoint retention requires a train configuration mapping"
+        )
+
+    existing_checkpointer = train.get("checkpointer")
+    if existing_checkpointer is not None and not isinstance(
+        existing_checkpointer, dict
+    ):
+        raise TypeError("train.checkpointer must be a mapping when provided")
+
+    effective = normalized
+    if effective == "auto":
+        effective = "best" if isinstance(existing_checkpointer, dict) else "terminal"
+
+    if effective == "best":
+        normalized_direction = str(direction).strip().lower()
+        if normalized_direction in {"min", "minimize"}:
+            checkpoint_mode = "min"
+        elif normalized_direction in {"max", "maximize"}:
+            checkpoint_mode = "max"
+        else:
+            raise ValueError(
+                "best checkpoint retention requires objective direction "
+                "'minimize' or 'maximize'"
+            )
+        checkpointer = copy.deepcopy(existing_checkpointer or {})
+        # A model can expose an AutoML objective through status artifacts
+        # without registering that key in Lightning's callback metrics (Visual
+        # ChangeNet classification reports val_acc this way). Preserve the
+        # trainer-declared monitor/mode and use the objective only as fallback.
+        checkpointer.setdefault("monitor", metric)
+        checkpointer.setdefault("mode", checkpoint_mode)
+        checkpointer.update({
+            "enable_topk": True,
+            "replace_periodic": True,
+            "save_top_k": 1,
+        })
+        train["checkpointer"] = checkpointer
+    else:
+        num_epochs = train.get("num_epochs")
+        if (
+            not isinstance(num_epochs, int)
+            or isinstance(num_epochs, bool)
+            or num_epochs < 1
+        ):
+            raise ValueError(
+                "terminal checkpoint retention requires a positive integer "
+                "train.num_epochs"
+            )
+        train["checkpoint_interval_unit"] = "epoch"
+        train["checkpoint_interval"] = num_epochs
+
+    return effective
+
+
+def _confirmed_platform_status(status_result: Any) -> str | None:
+    """Return a canonical terminal status, or ``None`` if still active.
+
+    ``Unknown`` is never proof of quiescence: it commonly means the SDK's
+    local recovery row is missing while a remote writer may still exist.
+    Explicit backend-authenticated deletion statuses are treated as canceled.
+    """
+    raw_status = getattr(status_result, "status", status_result)
+    if not isinstance(raw_status, str) or not raw_status.strip():
+        return None
+    normalized = raw_status.strip().lower().replace(" ", "_").replace("-", "_")
+    if normalized in _SUCCESS_PLATFORM_STATUSES:
+        return "Complete"
+    if normalized in _FAILURE_PLATFORM_STATUSES:
+        return "Error"
+    if normalized in _CANCELED_PLATFORM_STATUSES:
+        return "Canceled"
+    if normalized in _QUIESCENT_PLATFORM_STATUSES:
+        return "Canceled"
+    return None
 
 
 def _finite_metric(value: Any) -> float | None:
@@ -1189,6 +1330,7 @@ class MetricExtractorError(RuntimeError):
 # driven output routing) is unaffected because it kicks in for keys with
 # remote URIs or empty strings.
 _OUTPUT_DIR_KEY_SUFFIXES = ("results_dir", "output_dir", "save_dir")
+_DECLARED_OUTPUT_INTERPOLATION_RE = re.compile(r"^\$\{([^{}]+)\}(?:/|$)")
 
 
 def _iter_dotted_keys(d: dict, prefix: str = ""):
@@ -1208,8 +1350,10 @@ def _auto_suffix_output_dirs(specs: dict, rec_id, declared_outputs: set) -> list
 
     Skips keys that are declared in the skill's ``script_runner["outputs"]``
     (those are SDK-routed at runtime via env vars). Skips values that are
-    already remote URIs (treats `://` as the URI marker). Returns the list
-    of dotted keys we rewrote, for logging.
+    already remote URIs (treats `://` as the URI marker). A nested path derived
+    from a declared output, such as ``${results_dir}/train``, is already rooted
+    below the SDK's per-job destination and must not be suffixed. Returns the
+    list of dotted keys we rewrote, for logging.
     """
     rewritten: list[str] = []
     # Snapshot first; mutating during traversal of a nested dict is fragile.
@@ -1224,6 +1368,9 @@ def _auto_suffix_output_dirs(specs: dict, rec_id, declared_outputs: set) -> list
             continue
         if "://" in value:
             continue  # remote URI — user opted into a specific destination
+        interpolation = _DECLARED_OUTPUT_INTERPOLATION_RE.match(value)
+        if interpolation and interpolation.group(1) in declared_outputs:
+            continue  # Derived from an SDK-routed per-job output root.
         new_value = f"{value.rstrip('/')}/rec_{rec_id}"
         # Walk into specs and set
         cursor = specs
@@ -1891,14 +2038,34 @@ def _active_jobs_path(workspace_path: str):
     return Path(workspace_path) / "active_jobs.json"
 
 
+def _atomic_write_json(path: Path, payload: Any) -> None:
+    """Atomically and durably replace a small runner recovery ledger."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as stream:
+        json.dump(payload, stream, indent=2, sort_keys=True)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(tmp, path)
+    try:
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        try:
+            os.fsync(directory_fd)
+        except OSError:
+            # Some filesystems/platforms do not support directory fsync. The
+            # file itself was still flushed before the atomic replacement.
+            pass
+    finally:
+        os.close(directory_fd)
+
+
 def _save_active_jobs(workspace_path: str, active: dict) -> None:
     """Atomic write of {rec_id: {rec_id, job_id, submitted_at}} to disk."""
-    from pathlib import Path
     p = _active_jobs_path(workspace_path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(list(active.values()), indent=2))
-    tmp.replace(p)
+    _atomic_write_json(p, list(active.values()))
 
 
 def _load_active_jobs(workspace_path: str) -> list:
@@ -1906,10 +2073,108 @@ def _load_active_jobs(workspace_path: str) -> list:
     if not p.exists():
         return []
     try:
-        return json.loads(p.read_text())
+        data = json.loads(p.read_text())
     except Exception as e:
-        logger.warning("Couldn't read active_jobs.json: %s; starting fresh", e)
-        return []
+        raise RuntimeError(
+            f"Couldn't read active_jobs.json; refusing to launch additional "
+            f"jobs while a backend writer may be active: {e}"
+        ) from e
+    if not isinstance(data, list):
+        raise RuntimeError(
+            "active_jobs.json is not a list; refusing to launch additional jobs"
+        )
+    validated = []
+    for index, entry in enumerate(data):
+        if not isinstance(entry, dict):
+            raise RuntimeError(f"active_jobs.json entry {index} is not an object")
+        rec_id = entry.get("rec_id")
+        job_id = entry.get("job_id")
+        if not isinstance(rec_id, int) or not isinstance(job_id, str) or not job_id:
+            raise RuntimeError(
+                f"active_jobs.json entry {index} has an invalid rec_id/job_id"
+            )
+        validated.append(entry)
+    return validated
+
+
+def _artifact_jobs_path(workspace_path: str):
+    return Path(workspace_path) / "artifact_jobs.json"
+
+
+def _save_artifact_jobs(workspace_path: str, jobs: dict[str, str]) -> None:
+    """Persist terminal artifact cleanup candidates and deletion tombstones."""
+    p = _artifact_jobs_path(workspace_path)
+    _atomic_write_json(p, jobs)
+
+
+def _load_artifact_jobs(workspace_path: str) -> dict[str, str]:
+    p = _artifact_jobs_path(workspace_path)
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text())
+    except Exception as ex:
+        logger.warning("Couldn't read artifact_jobs.json: %s; rebuilding from state", ex)
+        return {}
+    if not isinstance(data, dict):
+        logger.warning("artifact_jobs.json is not an object; rebuilding from state")
+        return {}
+    return {
+        str(job_id): str(status)
+        for job_id, status in data.items()
+        if job_id
+    }
+
+
+def _managed_runner_run(method):
+    """Install scoped signal handling and cancel jobs while unwinding a run."""
+    @functools.wraps(method)
+    def wrapped(self, *args, **kwargs):
+        global _runner
+        previous_runner = _runner
+        previous_signal_handlers = {}
+        _runner = self
+        self._signal_cleanup_performed = False
+        self._pending_signal = None
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            try:
+                previous_signal_handlers[signum] = signal.getsignal(signum)
+                signal.signal(signum, _signal_handler)
+            except ValueError:
+                # Python permits signal installation only from the main
+                # thread. Programmatic worker-thread runs still receive the
+                # BaseException cleanup below.
+                logger.debug(
+                    "Skipping signal handler installation outside the main thread"
+                )
+        try:
+            return method(self, *args, **kwargs)
+        except BaseException:
+            if not self._signal_cleanup_performed:
+                reason = (
+                    f"received signal {self._pending_signal}"
+                    if self._pending_signal is not None
+                    else "AutoML runner interrupted"
+                )
+                try:
+                    self.cancel_active_jobs(reason=reason)
+                except BaseException:
+                    logger.exception("AutoML cancellation sweep failed while unwinding")
+                finally:
+                    self._signal_cleanup_performed = True
+            raise
+        finally:
+            for signum, previous_handler in previous_signal_handlers.items():
+                try:
+                    signal.signal(signum, previous_handler)
+                except ValueError:
+                    logger.debug(
+                        "Could not restore signal handler outside the main thread"
+                    )
+            if _runner is self:
+                _runner = previous_runner
+
+    return wrapped
 
 
 class AutoMLRunner:
@@ -1937,7 +2202,708 @@ class AutoMLRunner:
         self._poll_interval = poll_interval
         self._active_jobs = {}
         self._consecutive_none_metrics = 0
+        self._delete_intermediate_ckpt = False
+        self._algorithm = ""
+        self._retain_pareto_front = False
+        self._terminal_job_ids = {}
+        self._deleted_job_ids = set()
+        self._cleanup_capability_warned = False
+        self._workspace_path = None
+        self._automl = None
+        self._cancel_requests = {}
+        self._cancel_confirmation_timeout = _CANCEL_CONFIRM_TIMEOUT_SECONDS
+        self._cancel_confirmation_poll_interval = _CANCEL_CONFIRM_POLL_SECONDS
+        self._signal_cleanup_performed = False
+        self._pending_signal = None
 
+    def _record_terminal_job(self, job_id, status: str) -> bool:
+        """Remember a terminal job so later best-selection can prune it."""
+        if not isinstance(job_id, str) or not job_id:
+            return True
+        if self._terminal_job_ids.get(job_id) == "deleted":
+            return True
+        self._terminal_job_ids[job_id] = str(status or "failure")
+        return self._persist_artifact_jobs()
+
+    def _persist_artifact_jobs(self) -> bool:
+        if not self._workspace_path:
+            return True
+        try:
+            _save_artifact_jobs(self._workspace_path, self._terminal_job_ids)
+        except Exception as ex:
+            logger.warning("Failed to persist artifact_jobs.json: %s", ex)
+            return False
+        return True
+
+    def _collect_terminal_jobs(self, automl) -> tuple[set[str], list]:
+        """Merge persisted controller jobs into this run's cleanup candidates."""
+        try:
+            history = list(automl.get_history())
+        except Exception as ex:
+            logger.warning("Could not inspect AutoML history for artifact cleanup: %s", ex)
+            return {
+                job_id for job_id, status in self._terminal_job_ids.items()
+                if status != "deleted"
+            }, []
+
+        candidates = {
+            job_id for job_id, status in self._terminal_job_ids.items()
+            if status != "deleted"
+        }
+        for rec in history:
+            job_id = getattr(rec, "job_id", None)
+            status = str(getattr(rec, "status", ""))
+            if isinstance(job_id, str) and job_id and status in _TERMINAL_REC_STATUSES:
+                self._terminal_job_ids.setdefault(job_id, status)
+                if self._terminal_job_ids[job_id] != "deleted":
+                    candidates.add(job_id)
+            # Do not adopt arbitrary resume parents as cleanup-owned. A
+            # restored/custom recommendation may reference an external job;
+            # only IDs already recorded by this runner (or represented as a
+            # terminal recommendation above) are eligible candidates.
+        if not self._persist_artifact_jobs():
+            logger.warning(
+                "Skipping artifact cleanup because its ownership ledger is not durable"
+            )
+            return set(), history
+        return candidates, history
+
+    def _delete_job_artifacts(self, job_id: str, reason: str) -> bool:
+        """Delete one job's artifacts when the SDK exposes that capability."""
+        if job_id in self._deleted_job_ids:
+            return True
+        delete_fn = getattr(self._sdk, "delete_job_artifacts", None)
+        if not callable(delete_fn):
+            if not self._cleanup_capability_warned:
+                logger.warning(
+                    "automl_delete_intermediate_ckpt is enabled, but %s does "
+                    "not provide delete_job_artifacts(job_id); retaining artifacts",
+                    type(self._sdk).__name__,
+                )
+                self._cleanup_capability_warned = True
+            return False
+        try:
+            deleted = delete_fn(job_id)
+        except Exception as ex:
+            logger.warning("Failed to delete artifacts for job %s: %s", job_id, ex)
+            return False
+        if deleted is not True:
+            logger.warning("Platform did not delete artifacts for job %s", job_id)
+            return False
+        previous_status = self._terminal_job_ids.get(job_id)
+        self._terminal_job_ids[job_id] = "deleted"
+        if not self._persist_artifact_jobs():
+            if previous_status is None:
+                self._terminal_job_ids.pop(job_id, None)
+            else:
+                self._terminal_job_ids[job_id] = previous_status
+            logger.warning(
+                "Artifacts for job %s were deleted, but the deletion tombstone "
+                "was not durable; cleanup will retry idempotently",
+                job_id,
+            )
+            return False
+        self._deleted_job_ids.add(job_id)
+        logger.info("Deleted artifacts for job %s (%s)", job_id, reason)
+        return True
+
+    def _validate_artifact_retention_config(self, platform_kwargs: dict) -> None:
+        """Fail before launch when the selected SDK cannot reclaim its outputs.
+
+        Resolve the capability on the concrete SDK class rather than through
+        dynamic instance attribute lookup. This keeps legacy SDKs compatible
+        and prevents mocks with arbitrary attributes from looking like a real
+        retention implementation.
+        """
+        validator = getattr(
+            type(self._sdk), "validate_artifact_retention", None
+        )
+        if callable(validator):
+            validator(self._sdk, **platform_kwargs)
+
+    @staticmethod
+    def _verified_hybrid_best_job_id(automl, best) -> str | None:
+        """Return an explicitly verified full-fidelity Hybrid winner, if exposed."""
+        verifier = getattr(automl, "get_verified_full_fidelity_best", None)
+        if not callable(verifier):
+            return None
+        try:
+            verified = verifier()
+        except Exception as ex:
+            logger.warning(
+                "Could not verify Hybrid full-fidelity winner for cleanup: %s", ex
+            )
+            return None
+        verified_job_id = getattr(verified, "job_id", None)
+        if isinstance(verified_job_id, str) and verified_job_id:
+            return verified_job_id
+        return None
+
+    def _prune_intermediate_artifacts(self, automl, *, completed: bool) -> None:
+        """Prune safe terminal artifacts while retaining best/resume inputs."""
+        if not self._delete_intermediate_ckpt or automl is None:
+            return
+
+        candidates, history = self._collect_terminal_jobs(automl)
+        protected = {
+            job_id for job_id in self._active_jobs.values()
+            if isinstance(job_id, str) and job_id
+        }
+        try:
+            best = automl.get_best()
+        except Exception as ex:
+            logger.warning("Could not determine best job for artifact cleanup: %s", ex)
+            return
+        best_job_id = getattr(best, "job_id", None) if best is not None else None
+        if isinstance(best_job_id, str) and best_job_id:
+            protected.add(best_job_id)
+        elif best is None:
+            # Failed jobs remain safe to prune, but without a selected best we
+            # cannot safely distinguish successful candidates from the model
+            # artifact the caller may ultimately need.
+            protected.update(
+                job_id for job_id, status in self._terminal_job_ids.items()
+                if status in _SUCCESS_REC_STATUSES
+            )
+
+        if self._retain_pareto_front:
+            try:
+                pareto_front = list(automl.get_pareto_front())
+            except Exception as ex:
+                # A multi-objective controller that cannot expose its frontier
+                # cannot safely prove any successful checkpoint is dominated.
+                logger.warning(
+                    "Could not determine Pareto-front jobs for artifact cleanup: "
+                    "%s; retaining successful artifacts",
+                    ex,
+                )
+                protected.update(
+                    job_id for job_id, status in self._terminal_job_ids.items()
+                    if status in _SUCCESS_REC_STATUSES
+                )
+            else:
+                protected.update(
+                    job_id
+                    for rec in pareto_front
+                    for job_id in [getattr(rec, "job_id", None)]
+                    if isinstance(job_id, str) and job_id
+                )
+
+        if not completed:
+            # A parent may be selected only after its result is reported. Keep
+            # explicit resume dependencies and the controller's current
+            # promotion/population decision set, while releasing eliminated
+            # successes instead of retaining the whole search indefinitely.
+            for rec in history:
+                if str(getattr(rec, "status", "")) not in {
+                    "pending", "started", "running",
+                }:
+                    continue
+                parent_job_id = getattr(rec, "resume_from_job_id", None)
+                if isinstance(parent_job_id, str) and parent_job_id:
+                    protected.add(parent_job_id)
+            if self._algorithm in _DEFER_ARTIFACT_PRUNING_ALGORITHMS:
+                required_fn = getattr(
+                    automl, "get_required_checkpoint_job_ids", None
+                )
+                if callable(required_fn):
+                    try:
+                        protected.update(
+                            job_id for job_id in required_fn()
+                            if isinstance(job_id, str) and job_id
+                        )
+                    except Exception as ex:
+                        logger.warning(
+                            "Could not determine required promotion checkpoints: "
+                            "%s; retaining successful artifacts",
+                            ex,
+                        )
+                        protected.update(
+                            job_id for job_id, status
+                            in self._terminal_job_ids.items()
+                            if status in _SUCCESS_REC_STATUSES
+                        )
+                else:
+                    protected.update(
+                        job_id for job_id, status
+                        in self._terminal_job_ids.items()
+                        if status in _SUCCESS_REC_STATUSES
+                    )
+        elif (
+            self._algorithm == "hybrid"
+            and self._verified_hybrid_best_job_id(automl, best) is None
+        ):
+            # Hybrid may have delegated different phases to multi-fidelity
+            # brains. Its outer get_best() does not prove that the selected
+            # record ran at full fidelity, so retain every successful artifact
+            # unless the controller exposes an explicitly verified winner.
+            protected.update(
+                job_id for job_id, status in self._terminal_job_ids.items()
+                if status in _SUCCESS_REC_STATUSES
+            )
+        elif self._algorithm == "hybrid":
+            protected.add(self._verified_hybrid_best_job_id(automl, best))
+
+        protected.discard(None)
+
+        reason = "search complete; retaining final best" if completed else "terminal non-best job"
+        for job_id in sorted(candidates - protected - self._deleted_job_ids):
+            self._delete_job_artifacts(job_id, reason)
+
+    def _finalize_terminal_job(
+        self,
+        *,
+        automl,
+        rec,
+        job_id: str | None,
+        metric_value,
+        status: str,
+        workspace_path: str | None,
+        report_result: bool = True,
+        require_failure: bool = False,
+    ) -> None:
+        """Durably report, ledger, clear, then prune one terminal job."""
+        if report_result:
+            automl.report_result(
+                rec_id=rec.id,
+                metric_value=metric_value if metric_value is not None else 0.0,
+                status=status,
+            )
+            if require_failure and str(getattr(rec, "status", "")) != "failure":
+                raise RuntimeError(
+                    f"recommendation {rec.id} was not persisted as failure"
+                )
+
+        if isinstance(job_id, str) and job_id:
+            if not self._record_terminal_job(job_id, status):
+                raise RuntimeError(
+                    f"terminal artifact ledger was not persisted for job {job_id}"
+                )
+
+            previous_active = self._active_jobs.pop(rec.id, None)
+            previous_cancel_request = self._cancel_requests.pop(rec.id, None)
+            state_changed = (
+                previous_active is not None or previous_cancel_request is not None
+            )
+            active_path = workspace_path or self._workspace_path
+            if state_changed and active_path and not self._persist_active_jobs(active_path):
+                if previous_active is not None:
+                    self._active_jobs[rec.id] = previous_active
+                if previous_cancel_request is not None:
+                    self._cancel_requests[rec.id] = previous_cancel_request
+                raise RuntimeError(
+                    f"active job ledger was not cleared for terminal job {job_id}"
+                )
+
+        self._prune_intermediate_artifacts(automl, completed=False)
+
+    def _mark_cancel_requested(self, rec_id: int, reason: str) -> bool:
+        """Persist cancellation intent before mutating the platform job."""
+        self._cancel_requests.setdefault(
+            rec_id,
+            {
+                "requested_at": datetime.now(timezone.utc).isoformat(),
+                "reason": reason,
+            },
+        )
+        if not self._workspace_path:
+            return True
+        if self._persist_active_jobs(self._workspace_path):
+            return True
+        logger.warning(
+            "Could not persist cancellation request for rec %s; retaining job", rec_id
+        )
+        return False
+
+    def _wait_for_job_quiescence(self, job_id: str) -> str | None:
+        """Poll the SDK until a job is terminal/quiescent, with a bounded wait."""
+        status_fn = getattr(self._sdk, "get_job_status", None)
+        if not callable(status_fn):
+            logger.warning(
+                "%s cannot confirm cancellation of job %s because it does not "
+                "provide get_job_status(job_id)",
+                type(self._sdk).__name__, job_id,
+            )
+            return None
+
+        timeout = max(0.0, float(self._cancel_confirmation_timeout))
+        deadline = time.monotonic() + timeout
+        last_status = None
+        while True:
+            try:
+                status_result = status_fn(job_id)
+                last_status = getattr(status_result, "status", status_result)
+                confirmed = _confirmed_platform_status(status_result)
+                if confirmed is not None:
+                    return confirmed
+            except Exception as ex:
+                logger.warning(
+                    "Failed to confirm cancellation status for job %s: %s", job_id, ex
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    "Timed out waiting for job %s to become quiescent "
+                    "(last status=%s); retaining active state",
+                    job_id, last_status,
+                )
+                return None
+            time.sleep(min(self._cancel_confirmation_poll_interval, remaining))
+
+    def _request_job_cancellation(
+        self,
+        rec_id: int,
+        job_id: str,
+        reason: str,
+        *,
+        allow_refused_terminal: bool = False,
+    ) -> str | None:
+        """Persist intent, request cancellation, and confirm backend quiescence."""
+        intent_durable = self._mark_cancel_requested(rec_id, reason)
+        if not intent_durable:
+            # The existing active-job snapshot already contains the recovery
+            # identity. In particular, ENOSPC must not prevent us from stopping
+            # the writer that is consuming the remaining disk space.
+            logger.critical(
+                "Cancellation intent for job %s could not be rewritten; "
+                "attempting backend cancellation while retaining active state",
+                job_id,
+            )
+        status_fn = getattr(self._sdk, "get_job_status", None)
+        if callable(status_fn):
+            try:
+                pre_cancel_status = _confirmed_platform_status(status_fn(job_id))
+            except Exception as ex:
+                logger.warning(
+                    "Could not inspect job %s before cancellation: %s",
+                    job_id,
+                    ex,
+                )
+            else:
+                if pre_cancel_status in ("Complete", "Error"):
+                    return pre_cancel_status
+        try:
+            cancel_result = self._sdk.cancel_job(job_id)
+        except Exception as ex:
+            logger.warning(
+                "Cancellation request for job %s (rec %s) failed: %s; "
+                "checking whether the backend nevertheless became terminal",
+                job_id, rec_id, ex,
+            )
+            return self._wait_for_job_quiescence(job_id)
+        if cancel_result is False and not allow_refused_terminal:
+            logger.warning(
+                "Platform did not initiate cancellation for job %s (rec %s); "
+                "checking whether it already reached a terminal state",
+                job_id, rec_id,
+            )
+        return self._wait_for_job_quiescence(job_id)
+
+    def _cancel_unledgered_job(
+        self,
+        rec_id: int,
+        job_id: str,
+        workspace_path: str,
+    ) -> str | None:
+        """Keep canceling until a newly launched, unledgered writer is quiescent.
+
+        Returning to the normal run loop while the first active-job snapshot is
+        not durable would make a process crash leak an untracked training job.
+        This emergency path intentionally does not depend on that failed ledger.
+        """
+        while True:
+            if self._persist_active_jobs(workspace_path):
+                logger.warning(
+                    "Recovered durable registration for job %s after an initial "
+                    "active-job ledger failure",
+                    job_id,
+                )
+                return None
+            try:
+                self._sdk.cancel_job(job_id)
+            except BaseException as ex:
+                logger.error(
+                    "Emergency cancellation failed for unledgered job %s: %s",
+                    job_id,
+                    ex,
+                )
+            terminal_status = self._wait_for_job_quiescence(job_id)
+            if terminal_status is not None:
+                if self._delete_intermediate_ckpt:
+                    self._terminal_job_ids.setdefault(
+                        job_id, f"unledgered_{terminal_status.lower()}"
+                    )
+                    self._delete_job_artifacts(
+                        job_id,
+                        "quiescent launch after active-ledger failure",
+                    )
+                self._active_jobs.pop(rec_id, None)
+                self._cancel_requests.pop(rec_id, None)
+                return terminal_status
+            logger.critical(
+                "Job %s is not durably registered and is not yet quiescent; "
+                "retrying cancellation instead of leaving an untracked writer",
+                job_id,
+            )
+            time.sleep(max(self._cancel_confirmation_poll_interval, 0.1))
+
+    def _guard_interrupted_launch(
+        self,
+        rec_id: int,
+        job_id: str,
+        workspace_path: str | None,
+    ) -> str | None:
+        """Retry an interrupted ambiguous launch through the reconciliation window.
+
+        A create request can finish after its client was interrupted. One
+        immediate ``cancel_job(False)`` is therefore not enough: retain the
+        durable identity and keep checking until the late backend object is
+        observed/canceled or the bounded guard window expires.
+        """
+        self._active_jobs[rec_id] = job_id
+        self._cancel_requests.setdefault(
+            rec_id,
+            {
+                "requested_at": datetime.now(timezone.utc).isoformat(),
+                "reason": "job creation interrupted",
+            },
+        )
+        deadline = time.monotonic() + max(
+            0.0, float(self._cancel_confirmation_timeout)
+        )
+        registration_durable = False
+        while True:
+            if workspace_path:
+                registration_durable = (
+                    self._persist_active_jobs(workspace_path)
+                    or registration_durable
+                )
+            try:
+                self._sdk.cancel_job(job_id)
+            except BaseException as ex:
+                logger.warning(
+                    "Interrupted-launch cancellation failed for job %s: %s",
+                    job_id,
+                    ex,
+                )
+
+            terminal_status = None
+            try:
+                status_result = self._sdk.get_job_status(job_id)
+                terminal_status = _confirmed_platform_status(status_result)
+            except BaseException as ex:
+                logger.warning(
+                    "Interrupted-launch status check failed for job %s: %s",
+                    job_id,
+                    ex,
+                )
+            if terminal_status is not None:
+                if terminal_status in ("Complete", "Error"):
+                    logger.warning(
+                        "Interrupted launch %s reached %s before cancellation; "
+                        "retaining its active identity for result recovery",
+                        job_id,
+                        terminal_status,
+                    )
+                    return None
+                if not self._record_terminal_job(
+                    job_id, f"interrupted_{terminal_status.lower()}"
+                ):
+                    logger.error(
+                        "Could not persist terminal interrupted job %s; retaining "
+                        "its active recovery identity",
+                        job_id,
+                    )
+                else:
+                    previous_active = self._active_jobs.pop(rec_id, None)
+                    previous_cancel = self._cancel_requests.pop(rec_id, None)
+                    if (
+                        workspace_path
+                        and not self._persist_active_jobs(workspace_path)
+                    ):
+                        if previous_active is not None:
+                            self._active_jobs[rec_id] = previous_active
+                        if previous_cancel is not None:
+                            self._cancel_requests[rec_id] = previous_cancel
+                    else:
+                        if self._delete_intermediate_ckpt:
+                            self._delete_job_artifacts(
+                                job_id,
+                                "terminal interrupted launch",
+                            )
+                        return terminal_status
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if not registration_durable:
+                    logger.critical(
+                        "Interrupted launch %s is neither quiescent nor durably "
+                        "registered; continuing reconciliation past the %.1fs "
+                        "guard window",
+                        job_id,
+                        self._cancel_confirmation_timeout,
+                    )
+                    time.sleep(max(
+                        self._cancel_confirmation_poll_interval, 0.1
+                    ))
+                    continue
+                logger.critical(
+                    "Interrupted launch %s did not become quiescent within %.1fs; "
+                    "its durable cancellation intent remains for resume",
+                    job_id,
+                    self._cancel_confirmation_timeout,
+                )
+                return None
+            time.sleep(min(
+                max(self._cancel_confirmation_poll_interval, 0.01), remaining
+            ))
+
+    def _finalize_orphan_terminal_job(
+        self,
+        rec_id: int,
+        job_id: str,
+        platform_status: str,
+        *,
+        raise_on_corruption: bool,
+    ) -> None:
+        """Converge a terminal active job whose controller record is missing."""
+        orphan_status = f"orphan_{platform_status.lower()}"
+        if not self._record_terminal_job(job_id, orphan_status):
+            raise RuntimeError(
+                f"terminal artifact ledger was not persisted for orphan job {job_id}"
+            )
+
+        previous_active = self._active_jobs.pop(rec_id, None)
+        previous_cancel_request = self._cancel_requests.pop(rec_id, None)
+        if self._workspace_path and not self._persist_active_jobs(self._workspace_path):
+            if previous_active is not None:
+                self._active_jobs[rec_id] = previous_active
+            if previous_cancel_request is not None:
+                self._cancel_requests[rec_id] = previous_cancel_request
+            raise RuntimeError(
+                f"active job ledger was not cleared for orphan job {job_id}"
+            )
+
+        if self._delete_intermediate_ckpt:
+            self._delete_job_artifacts(job_id, "terminal orphan from corrupt AutoML state")
+        message = (
+            f"AutoML state is corrupt: active job {job_id} for recommendation "
+            f"{rec_id} reached {platform_status}, but the recommendation is missing"
+        )
+        logger.error(message)
+        if raise_on_corruption:
+            raise RuntimeError(message)
+
+    def cancel_active_jobs(self, *, reason: str = "AutoML run canceled") -> None:
+        """Cancel active jobs only after durable intent and confirmed quiescence."""
+        for rec_id, job_id in list(self._active_jobs.items()):
+            rec = None
+            history_available = True
+            if self._automl is not None:
+                try:
+                    rec = next(
+                        (item for item in self._automl.get_history() if item.id == rec_id),
+                        None,
+                    )
+                except Exception as ex:
+                    logger.warning(
+                        "Could not inspect AutoML history while canceling rec %s: %s",
+                        rec_id, ex,
+                    )
+                    history_available = False
+
+            terminal_status = self._request_job_cancellation(
+                rec_id,
+                job_id,
+                reason,
+                allow_refused_terminal=(
+                    history_available and self._automl is not None and rec is None
+                ),
+            )
+            if terminal_status is None:
+                continue
+            if self._automl is None:
+                logger.warning(
+                    "Job %s is quiescent, but no AutoML controller is available; "
+                    "retaining active state for reconciliation",
+                    job_id,
+                )
+                continue
+            if terminal_status in ("Complete", "Error"):
+                logger.warning(
+                    "Job %s reached %s before cancellation; retaining active "
+                    "state so its result and checkpoint can be recovered",
+                    job_id,
+                    terminal_status,
+                )
+                continue
+            if not history_available:
+                logger.warning(
+                    "Job %s is quiescent, but AutoML history could not be read; "
+                    "retaining active state for controller reconciliation",
+                    job_id,
+                )
+                continue
+            if rec is None:
+                try:
+                    self._finalize_orphan_terminal_job(
+                        rec_id,
+                        job_id,
+                        terminal_status,
+                        raise_on_corruption=False,
+                    )
+                except Exception as ex:
+                    logger.warning(
+                        "Could not finalize quiescent orphan job %s: %s; "
+                        "continuing cancellation of remaining jobs",
+                        job_id,
+                        ex,
+                    )
+                    if self._delete_intermediate_ckpt:
+                        self._delete_job_artifacts(
+                            job_id,
+                            "quiescent orphan after ledger failure",
+                        )
+                continue
+
+            try:
+                rec.assign_job_id(job_id)
+                rec.failure_reason = "job_canceled"
+                self._finalize_terminal_job(
+                    automl=self._automl,
+                    rec=rec,
+                    job_id=job_id,
+                    metric_value=0.0,
+                    status="failure",
+                    workspace_path=self._workspace_path,
+                    require_failure=True,
+                )
+            except Exception as ex:
+                logger.warning(
+                    "Job %s is quiescent but rec %s failure was not durably "
+                    "finalized: %s; retaining active state for resume",
+                    job_id, rec_id, ex,
+                )
+                if self._delete_intermediate_ckpt:
+                    self._delete_job_artifacts(
+                        job_id,
+                        "confirmed cancellation after ledger failure",
+                    )
+                continue
+            logger.info("Canceled job %s (rec %s): %s", job_id, rec_id, reason)
+
+        # Terminal cancellation no longer needs promotion/resume parents.
+        # Once every active writer is quiescent and durably finalized, apply
+        # final-search retention so interrupted multi-fidelity runs do not
+        # retain every earlier successful trial checkpoint.
+        if (
+            self._automl is not None
+            and not self._active_jobs
+            and self._delete_intermediate_ckpt
+        ):
+            self._prune_intermediate_artifacts(self._automl, completed=True)
+
+    @_managed_runner_run
     def run(self, train_dataset_uri="", eval_dataset_uri="",
             base_checkpoint="", workspace_id=None, image=None,
             automl_settings=None,
@@ -2024,6 +2990,31 @@ class AutoMLRunner:
                 ``"wer"``). The objective configuration handles direction and
                 scalarization while reported values remain on their original
                 scale.
+            automl_delete_intermediate_ckpt: Defaults to true. Delete failed
+                and non-best terminal job artifacts through the platform SDK.
+                Hyperband-family/PBT searches retain only the current
+                promotion-decision window, active resume parents, and current
+                best, then collapse to the winner at completion. Hybrid
+                successes require an explicitly verified full-fidelity winner
+                before final pruning. Multi-objective searches retain every
+                non-dominated Pareto-front checkpoint.
+                SDKs that expose retention validation reject an output route
+                that cannot be reclaimed before the first job is launched.
+                Set false to retain every trial artifact for debugging.
+            automl_checkpoint_retention_strategy: Bounds checkpoint files
+                written inside each retained training job when
+                ``automl_delete_intermediate_ckpt`` is true. ``"auto"``
+                (default) uses ``"best"`` when the merged spec exposes
+                ``train.checkpointer`` and otherwise uses ``"terminal"``.
+                ``"best"`` configures a single checkpoint using the trainer's
+                declared monitor/mode (or the objective as fallback) and asks
+                compatible trainers to replace periodic saving. It
+                requires a trainer whose ``train.checkpointer`` contract
+                honors ``replace_periodic``; use ``"terminal"`` for older
+                trainers whose monitored checkpointing is additive only.
+                ``"terminal"`` sets the epoch checkpoint interval to that
+                recommendation's effective ``train.num_epochs``; promotion
+                budgets such as ASHA rung epochs are therefore preserved.
 
         Returns:
             Dict with keys: best, progress, baseline, final_evaluation, history.
@@ -2031,7 +3022,18 @@ class AutoMLRunner:
         from tao_automl import AutoML
 
         automl_settings = automl_settings or {"algorithm": "bayesian", "metric": "loss"}
+        self._delete_intermediate_ckpt = _bool_setting(
+            automl_settings.get("automl_delete_intermediate_ckpt", True)
+        )
+        self._algorithm = str(automl_settings.get("algorithm", "")).lower()
+        self._terminal_job_ids = {}
+        self._deleted_job_ids = set()
+        self._cleanup_capability_warned = False
+        self._automl = None
+        if self._delete_intermediate_ckpt:
+            self._validate_artifact_retention_config(platform_kwargs)
         objective_config = parse_objective_config(automl_settings)
+        self._retain_pareto_front = objective_config.is_multi_objective
         objective_names = objective_config.metric_names
         workspace_id = workspace_id or getattr(self._sdk, "_workspace_id", "")
         network_arch = self.skill_ctx.network_arch
@@ -2040,6 +3042,13 @@ class AutoMLRunner:
             ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             workspace_path = os.path.join(workspace_path, f"run_{ts}")
         os.makedirs(workspace_path, exist_ok=True)
+        self._workspace_path = workspace_path
+        if resume:
+            self._terminal_job_ids.update(_load_artifact_jobs(workspace_path))
+            self._deleted_job_ids.update(
+                job_id for job_id, status in self._terminal_job_ids.items()
+                if status == "deleted"
+            )
         logger.info("Workspace: %s", workspace_path)
 
         # Skill metadata is loaded once at __init__ via SkillContext (replaces
@@ -2185,11 +3194,10 @@ class AutoMLRunner:
             automl_hyperparameters=automl_hyperparameters,
             custom_param_ranges=custom_param_ranges,
             action=self.skill_ctx.action,
-            search_schema=(
-                self.skill_ctx.schema if resolved_execution is not None else None
-            ),
+            search_schema=self.skill_ctx.schema,
             resume=resume,
         )
+        self._automl = automl
         logger.info("Starting AutoML loop: network=%s, algorithm=%s, "
                     "metric=%s, direction=%s",
                      network_arch, automl_settings.get("algorithm"),
@@ -2203,6 +3211,20 @@ class AutoMLRunner:
             if pending:
                 logger.info("Resume: recovering %d in-flight job(s) from prior run",
                             len(pending))
+                # Restore the entire durable snapshot before reconciling any
+                # one entry so clearing the first job cannot erase later jobs
+                # if this process is interrupted mid-recovery.
+                for entry in pending:
+                    rec_id = entry["rec_id"]
+                    self._active_jobs[rec_id] = entry["job_id"]
+                    if entry.get("cancel_requested"):
+                        self._cancel_requests[rec_id] = {
+                            "requested_at": entry.get("cancel_requested_at"),
+                            "reason": (
+                                entry.get("cancel_reason")
+                                or "restored cancellation"
+                            ),
+                        }
                 for entry in pending:
                     self._recover_pending_job(
                         entry=entry, automl=automl, metric_name=metric_name,
@@ -2213,23 +3235,19 @@ class AutoMLRunner:
                     )
 
         while not automl.is_complete():
-            recs = automl.next_recommendation()
             progress = automl.get_progress()
             max_recommendations = automl_settings.get("automl_max_recommendations")
             if max_recommendations is not None:
-                remaining = int(max_recommendations) - int(progress.get("completed", 0))
-                if remaining <= 0:
+                if int(progress.get("completed", 0)) >= int(max_recommendations):
                     logger.info(
                         "AutoML recommendation budget reached (%d/%d); stopping launch loop",
                         progress.get("completed", 0), int(max_recommendations),
                     )
                     break
-                if len(recs) > remaining:
-                    logger.info(
-                        "Capping recommendations from %d to remaining budget %d",
-                        len(recs), remaining,
-                    )
-                    recs = recs[:remaining]
+            # Generate only after the runner-level cap check. Once a brain
+            # emits a batch, run the whole batch: slicing can strand pending
+            # promotion records inside multi-fidelity algorithms.
+            recs = automl.next_recommendation()
             if not recs:
                 logger.info("No recommendations available — waiting for results")
                 time.sleep(5)
@@ -2254,6 +3272,29 @@ class AutoMLRunner:
                 except Exception as ex:
                     logger.debug("Could not read AutoML-updated base specs: %s", ex)
                 merged_specs = self._merge_specs(run_base_specs, rec.specs)
+                effective_checkpoint_strategy = None
+                if (
+                    self._delete_intermediate_ckpt
+                    and self.skill_ctx.action == "train"
+                    and isinstance(merged_specs.get("train"), dict)
+                ):
+                    effective_checkpoint_strategy = (
+                        _apply_checkpoint_retention_strategy(
+                            merged_specs,
+                            enabled=True,
+                            strategy=automl_settings.get(
+                                "automl_checkpoint_retention_strategy", "auto"
+                            ),
+                            metric=metric_name,
+                            direction=_effective_dir,
+                        )
+                    )
+                if effective_checkpoint_strategy is not None:
+                    logger.info(
+                        "Recommendation %d: checkpoint retention strategy=%s",
+                        rec.id,
+                        effective_checkpoint_strategy,
+                    )
                 merged_specs = self._apply_resume_checkpoint(
                     merged_specs, rec, platform_kwargs
                 )
@@ -2370,12 +3411,15 @@ class AutoMLRunner:
                 metric_error = self._consecutive_none_metrics >= (
                     self._MAX_CONSECUTIVE_NONE_METRICS
                 )
-                # Report raw values; AutoML objective config handles direction
-                # and scalarization.
-                automl.report_result(
-                    rec_id=rec.id,
-                    metric_value=metric_value if metric_value is not None else 0.0,
+                # Keep active_jobs durable until controller state and the
+                # terminal artifact ledger have both been committed.
+                self._finalize_terminal_job(
+                    automl=automl,
+                    rec=rec,
+                    job_id=getattr(rec, "job_id", None),
+                    metric_value=metric_value,
                     status=status,
+                    workspace_path=workspace_path,
                 )
                 if on_result:
                     on_result(rec, metric_value, status)
@@ -2399,6 +3443,7 @@ class AutoMLRunner:
                         f"job's logs to confirm."
                     )
 
+        search_complete = bool(automl.is_complete())
         best = automl.get_best()
         progress = automl.get_progress()
         history = automl.get_history()
@@ -2468,6 +3513,10 @@ class AutoMLRunner:
             final_evaluation.get("metric_value"),
             _effective_dir,
         )
+        # Only a controller-complete search may collapse retention to its final
+        # winner. A runner-level budget stop can leave pending promotions whose
+        # parent checkpoints must survive a later resume.
+        self._prune_intermediate_artifacts(automl, completed=search_complete)
 
         result = {
             "best": {
@@ -2501,10 +3550,13 @@ class AutoMLRunner:
         )
         if objective_config.is_multi_objective:
             result["pareto_front"] = automl.get_status().get("pareto_front", [])
-        logger.info("AutoML complete: %d recommendations, best metric=%.6f (rec %s)",
-                     progress["completed"],
-                     best_metric if best_metric is not None else 0.0,
-                     best.id if best else "N/A")
+        logger.info(
+            "AutoML %s: %d recommendations, best metric=%.6f (rec %s)",
+            "complete" if search_complete else "stopped before controller completion",
+            progress["completed"],
+            best_metric if best_metric is not None else 0.0,
+            best.id if best else "N/A",
+        )
         return result
 
     def _run_one_job(self, image, action_cfg, specs, rec, metric_name,
@@ -2522,6 +3574,8 @@ class AutoMLRunner:
         virtualenv SDK writes the config and launches the script with its
         environment's interpreter. Monitoring is shared by both paths.
         """
+        if workspace_path and not self._workspace_path:
+            self._workspace_path = workspace_path
         try:
             if execution is not None:
                 if not hasattr(self._sdk, "create_python_job"):
@@ -2558,16 +3612,92 @@ class AutoMLRunner:
                     command=ep["command"],
                     **(platform_kwargs or {}),
                 )
+            # Keep the first local copy of the SDK identity inside the launch
+            # exception boundary. A signal can arrive immediately after the
+            # SDK returns, before the next Python line registers the job.
+            rec.assign_job_id(job.id)
+            self._active_jobs[rec.id] = job.id
         except Exception as e:
+            interrupted_job_id = getattr(e, "tao_job_id", None) or getattr(
+                locals().get("job"), "id", None
+            )
+            if isinstance(interrupted_job_id, str) and interrupted_job_id:
+                try:
+                    rec.assign_job_id(interrupted_job_id)
+                except BaseException as assign_ex:
+                    logger.warning(
+                        "Could not attach interrupted job %s to rec %s: %s",
+                        interrupted_job_id,
+                        rec.id,
+                        assign_ex,
+                    )
+                terminal_status = self._guard_interrupted_launch(
+                    rec.id, interrupted_job_id, workspace_path
+                )
+                if terminal_status is None:
+                    raise
+                rec.failure_reason = (
+                    "job_creation_interrupted: backend writer was reconciled "
+                    f"as {terminal_status}"
+                )
+                return None, "failure"
             logger.error("Failed to create job for rec %d: %s", rec.id, e)
             rec.failure_reason = f"job_creation_failed: {e}"
             return None, "failure"
+        except BaseException as exc:
+            # Remote SDKs attach a durable job ID when an interrupt lands
+            # after submission may have started but before a Job object can be
+            # returned. Register that identity before unwinding so the signal
+            # path cannot leave a late-starting writer outside AutoML state.
+            interrupted_job_id = getattr(exc, "tao_job_id", None) or getattr(
+                locals().get("job"), "id", None
+            )
+            if isinstance(interrupted_job_id, str) and interrupted_job_id:
+                try:
+                    rec.assign_job_id(interrupted_job_id)
+                except BaseException as assign_ex:
+                    logger.warning(
+                        "Could not attach interrupted job %s to rec %s: %s",
+                        interrupted_job_id,
+                        rec.id,
+                        assign_ex,
+                    )
+                self._guard_interrupted_launch(
+                    rec.id, interrupted_job_id, workspace_path
+                )
+                logger.critical(
+                    "Job creation was interrupted after backend submission may "
+                    "have started; retained durable job %s for cancellation/recovery",
+                    interrupted_job_id,
+                )
+            raise
 
-        rec.assign_job_id(job.id)
-        self._active_jobs[rec.id] = job.id
         # Persist in-flight state so a resume can recover it.
-        if workspace_path:
-            self._persist_active_jobs(workspace_path)
+        if workspace_path and not self._persist_active_jobs(workspace_path):
+            terminal_status = self._cancel_unledgered_job(
+                rec.id, job.id, workspace_path
+            )
+            if terminal_status is None:
+                logger.info(
+                    "Rec %d: job %s registration recovered; continuing monitoring",
+                    rec.id,
+                    job.id,
+                )
+            else:
+                self._record_terminal_job(
+                    job.id, f"registration_{terminal_status.lower()}"
+                )
+                rec.failure_reason = (
+                    "active_job_registration_failed: job was canceled because its "
+                    "recovery ledger could not be persisted"
+                )
+                logger.error(
+                    "Rec %d: canceled unledgered job %s after active-job persistence "
+                    "failed",
+                    rec.id,
+                    job.id,
+                )
+                return None, "failure"
         logger.info("Rec %d: job %s submitted (backend: %s)",
                     rec.id, job.id, getattr(job, "backend_job_id", job.id))
 
@@ -2581,6 +3711,8 @@ class AutoMLRunner:
         cached_exec_status = None
         all_logs = ""
         job_status = None
+        confirmed_job_status = None
+        failure_cancel_requested = False
 
         while True:
             time.sleep(self._poll_interval)
@@ -2642,18 +3774,19 @@ class AutoMLRunner:
                                 "canceling backend job",
                                 rec.id, job.id,
                             )
-                            try:
-                                self._sdk.cancel_job(job.id)
-                            except Exception as ex:
-                                logger.warning(
-                                    "Failed to cancel failed job %s for rec %d: %s",
-                                    job.id, rec.id, ex,
+                            if not failure_cancel_requested:
+                                failure_cancel_requested = True
+                                confirmed_job_status = self._request_job_cancellation(
+                                    rec.id,
+                                    job.id,
+                                    "execution failure detected in job logs",
                                 )
-                            break
+                            if confirmed_job_status is not None:
+                                break
             except Exception:
                 pass
 
-            if cached_exec_status == "FAIL":
+            if confirmed_job_status is not None:
                 break
 
             try:
@@ -2661,7 +3794,9 @@ class AutoMLRunner:
             except Exception as e:
                 logger.warning("Failed to get status for job %s: %s", job.id, e)
                 continue
-            if job_status.status in _TERMINAL_STATUSES:
+            terminal_status = _confirmed_platform_status(job_status)
+            if terminal_status is not None:
+                confirmed_job_status = terminal_status
                 break
 
         cached_metrics, cached_exec_status, terminal_logs = _scan_terminal_metric_values(
@@ -2700,12 +3835,10 @@ class AutoMLRunner:
                 metric_name not in cached_metrics or _has_hard_failure_pattern(all_logs)
             ),
         )
-        status = job_status.status if job_status is not None else "Error"
-
-        # fix #3: job has reached terminal state — clear it from active_jobs.json.
-        self._active_jobs.pop(rec.id, None)
-        if workspace_path:
-            self._persist_active_jobs(workspace_path)
+        status = (
+            confirmed_job_status
+            or (job_status.status if job_status is not None else "Error")
+        )
 
         if status == "Error" or exec_status == "FAIL":
             reason = _classify_failure(all_logs)
@@ -2786,17 +3919,26 @@ class AutoMLRunner:
         )
         return metric_value, "success"
 
-    def _persist_active_jobs(self, workspace_path: str) -> None:
+    def _persist_active_jobs(self, workspace_path: str) -> bool:
         """Dump self._active_jobs to workspace/active_jobs.json atomically."""
         now_iso = datetime.now(timezone.utc).isoformat()
-        snapshot = {
-            rec_id: {"rec_id": rec_id, "job_id": job_id, "updated_at": now_iso}
-            for rec_id, job_id in self._active_jobs.items()
-        }
+        snapshot = {}
+        for rec_id, job_id in self._active_jobs.items():
+            entry = {"rec_id": rec_id, "job_id": job_id, "updated_at": now_iso}
+            cancel_request = self._cancel_requests.get(rec_id)
+            if cancel_request is not None:
+                entry.update({
+                    "cancel_requested": True,
+                    "cancel_requested_at": cancel_request.get("requested_at"),
+                    "cancel_reason": cancel_request.get("reason"),
+                })
+            snapshot[rec_id] = entry
         try:
             _save_active_jobs(workspace_path, snapshot)
         except Exception as e:
             logger.warning("Failed to persist active_jobs.json: %s", e)
+            return False
+        return True
 
     def _recover_pending_job(self, entry, automl, metric_name,
                               metric_extractor, eval_fn, workspace_path,
@@ -2807,16 +3949,100 @@ class AutoMLRunner:
         """
         rec_id = entry["rec_id"]
         job_id = entry["job_id"]
+        self._workspace_path = self._workspace_path or workspace_path
+        self._active_jobs[rec_id] = job_id
+        if entry.get("cancel_requested"):
+            self._cancel_requests.setdefault(
+                rec_id,
+                {
+                    "requested_at": entry.get("cancel_requested_at"),
+                    "reason": entry.get("cancel_reason") or "restored cancellation",
+                },
+            )
 
         # Find the matching Recommendation object in the brain's history so
         # we can pass it to on_result/eval_fn and update rec.assign_job_id.
         rec = next((r for r in automl.get_history() if r.id == rec_id), None)
         if rec is None:
-            logger.warning("Resume: rec %d not in brain history; dropping pending job %s",
+            logger.warning("Resume: rec %d not in brain history; canceling orphan job %s",
                            rec_id, job_id)
+            terminal_status = self._request_job_cancellation(
+                rec_id,
+                job_id,
+                "orphaned AutoML resume job",
+                allow_refused_terminal=True,
+            )
+            if terminal_status is None:
+                raise RuntimeError(
+                    f"Could not confirm orphan job {job_id} is quiescent; "
+                    "active state was retained"
+                )
+            if terminal_status in ("Complete", "Error"):
+                raise RuntimeError(
+                    f"Orphan job {job_id} reached {terminal_status}; retaining "
+                    "its checkpoint because the missing recommendation makes "
+                    "winner selection unsafe"
+                )
+            self._finalize_orphan_terminal_job(
+                rec_id,
+                job_id,
+                terminal_status,
+                raise_on_corruption=True,
+            )
             return
 
-        self._active_jobs[rec_id] = job_id
+        rec.assign_job_id(job_id)
+        if (
+            rec_id in self._cancel_requests
+            and str(getattr(rec, "status", "")) not in _TERMINAL_REC_STATUSES
+        ):
+            terminal_status = self._request_job_cancellation(
+                rec_id,
+                job_id,
+                self._cancel_requests[rec_id].get("reason")
+                or "restored cancellation",
+                allow_refused_terminal=True,
+            )
+            if terminal_status is None:
+                raise RuntimeError(
+                    f"Cancellation of restored job {job_id} is still unconfirmed; "
+                    "active state was retained"
+                )
+            if terminal_status == "Canceled":
+                rec.failure_reason = "job_canceled"
+                self._finalize_terminal_job(
+                    automl=automl,
+                    rec=rec,
+                    job_id=job_id,
+                    metric_value=0.0,
+                    status="failure",
+                    workspace_path=workspace_path,
+                    require_failure=True,
+                )
+                return
+            logger.warning(
+                "Resume: job %s reached %s before its restored cancellation; "
+                "recovering the terminal result instead of discarding it",
+                job_id,
+                terminal_status,
+            )
+        if str(getattr(rec, "status", "")) in _TERMINAL_REC_STATUSES:
+            terminal_status = self._wait_for_job_quiescence(job_id)
+            if terminal_status is None:
+                raise RuntimeError(
+                    f"Recommendation {rec_id} is terminal, but job {job_id} "
+                    "was not confirmed quiescent; active state was retained"
+                )
+            self._finalize_terminal_job(
+                automl=automl,
+                rec=rec,
+                job_id=job_id,
+                metric_value=getattr(rec, "result", 0.0),
+                status=str(rec.status),
+                workspace_path=workspace_path,
+                report_result=False,
+            )
+            return
         extract_fn = metric_extractor or _extract_metric_from_logs
         metric_names = list(objective_names or [metric_name])
 
@@ -2825,6 +4051,8 @@ class AutoMLRunner:
         cached_exec_status = None
         all_logs = ""
         job_status = None
+        confirmed_job_status = None
+        failure_cancel_requested = False
 
         # Poll until terminal.
         while True:
@@ -2887,18 +4115,18 @@ class AutoMLRunner:
                                 "failure; canceling backend job",
                                 rec_id, job_id,
                             )
-                            try:
-                                self._sdk.cancel_job(job_id)
-                            except Exception as ex:
-                                logger.warning(
-                                    "Resume: failed to cancel failed job %s for "
-                                    "rec %d: %s",
-                                    job_id, rec_id, ex,
+                            if not failure_cancel_requested:
+                                failure_cancel_requested = True
+                                confirmed_job_status = self._request_job_cancellation(
+                                    rec_id,
+                                    job_id,
+                                    "execution failure detected during resume",
                                 )
-                            break
+                            if confirmed_job_status is not None:
+                                break
             except Exception:
                 pass
-            if cached_exec_status == "FAIL":
+            if confirmed_job_status is not None:
                 break
             try:
                 job_status = self._sdk.get_job_status(job_id)
@@ -2906,7 +4134,9 @@ class AutoMLRunner:
                 logger.warning("Resume: failed to get status for job %s: %s",
                                job_id, e)
                 continue
-            if job_status.status in _TERMINAL_STATUSES:
+            terminal_status = _confirmed_platform_status(job_status)
+            if terminal_status is not None:
+                confirmed_job_status = terminal_status
                 break
 
         cached_metrics, cached_exec_status, terminal_logs = _scan_terminal_metric_values(
@@ -2945,9 +4175,10 @@ class AutoMLRunner:
                 metric_name not in cached_metrics or _has_hard_failure_pattern(all_logs)
             ),
         )
-        status = job_status.status if job_status is not None else "Error"
-        self._active_jobs.pop(rec_id, None)
-        self._persist_active_jobs(workspace_path)
+        status = (
+            confirmed_job_status
+            or (job_status.status if job_status is not None else "Error")
+        )
 
         if status == "Error" or exec_status == "FAIL":
             metric_value = _metric_payload_from_values(cached_metrics, metric_name, metric_names)
@@ -3000,10 +4231,13 @@ class AutoMLRunner:
             )
             report_status = "success" if metric_value is not None else "failure"
 
-        automl.report_result(
-            rec_id=rec_id,
-            metric_value=metric_value if metric_value is not None else 0.0,
+        self._finalize_terminal_job(
+            automl=automl,
+            rec=rec,
+            job_id=job_id,
+            metric_value=metric_value,
             status=report_status,
+            workspace_path=workspace_path,
         )
         if on_result:
             try:
@@ -3264,11 +4498,24 @@ class AutoMLRunner:
 
     @staticmethod
     def _merge_specs(base_specs: dict, rec_specs: dict) -> dict:
-        """Deep-merge recommendation specs into base specs."""
-        import copy
+        """Deep-merge nested caller specs and dotted recommendation keys."""
         merged = copy.deepcopy(base_specs)
-        for key, value in rec_specs.items():
-            AutoMLRunner._set_nested(merged, key, value)
+
+        def merge_mapping(target: dict, overrides: dict) -> None:
+            for key, value in overrides.items():
+                # Brain recommendations use dotted/indexed paths. Caller spec
+                # dictionaries are nested at the SDK boundary and must merge,
+                # not replace an entire top-level train/model/dataset block.
+                if "." in key or "[" in key:
+                    AutoMLRunner._set_nested(target, key, copy.deepcopy(value))
+                    continue
+                current = target.get(key)
+                if isinstance(current, dict) and isinstance(value, dict):
+                    merge_mapping(current, value)
+                else:
+                    target[key] = copy.deepcopy(value)
+
+        merge_mapping(merged, rec_specs)
         return merged
 
 
@@ -3338,8 +4585,6 @@ def run_automl_plan(plan: dict, platform: str) -> dict:
 
     sdk = _make_sdk(platform, **sdk_kwargs)
     runner = AutoMLRunner(sdk=sdk, skill_dir=skill_dir, action=action)
-    global _runner
-    _runner = runner
     result = runner.run(
         train_dataset_uri=params["train_dataset_uri"],
         eval_dataset_uri=params.get("eval_dataset_uri", ""),
@@ -3361,16 +4606,10 @@ def run_automl_plan(plan: dict, platform: str) -> dict:
 _runner = None
 
 def _signal_handler(signum, frame):
-    if _runner and _runner._active_jobs:
-        for rec_id, job_id in _runner._active_jobs.items():
-            try:
-                _runner._sdk.cancel_job(job_id)
-                print(f"Canceled job {job_id} (rec {rec_id})")
-            except Exception as e:
-                print(f"Failed to cancel job {job_id}: {e}")
-    sys.exit(1)
-
-signal.signal(signal.SIGINT, _signal_handler)
+    """Request unwind; cancellation runs after interrupted locks are released."""
+    if _runner:
+        _runner._pending_signal = signum
+    raise SystemExit(1)
 
 
 def main():
