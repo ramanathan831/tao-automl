@@ -85,6 +85,7 @@ class Controller:
         self.objective_config = objective_config or parse_objective_config({"metric": metric})
         self.history = []  # list of Recommendation objects
         self._next_id = 0
+        self._checkpoint_window = 0
 
         # WandB integration (optional)
         self._wandb_config = wandb_config or {}
@@ -154,6 +155,16 @@ class Controller:
             self.history.append(rec)
             recommendations.append(rec)
             self._next_id += 1
+
+        # Keep the entire most recently issued decision window until the
+        # brain is called again.  Looking only at the globally largest budget
+        # is unsafe when Hyperband starts a later bracket at a smaller budget:
+        # that later bracket still needs its just-finished checkpoints for its
+        # next successive-halving decision.
+        if recommendations:
+            self._checkpoint_window += 1
+            for rec in recommendations:
+                rec.checkpoint_window = self._checkpoint_window
 
         # Persist after generating new recommendations
         self.save_state()
@@ -309,6 +320,105 @@ class Controller:
     def get_history(self):
         """Return the full list of Recommendation objects."""
         return list(self.history)
+
+    def get_required_checkpoint_job_ids(self):
+        """Return checkpoint jobs still required by an unfinished search.
+
+        Multi-fidelity brains make promotion decisions in batches. This set is
+        conservative for the current decision window, but releases eliminated
+        trials as soon as the brain advances to the next rung or generation.
+        """
+        required = set()
+        rec_by_id = {rec.id: rec for rec in self.history}
+        active_states = {JobStates.pending, JobStates.started, JobStates.running}
+
+        for rec in self.history:
+            if rec.status in active_states and rec.job_id:
+                required.add(rec.job_id)
+            if rec.status in active_states and rec.resume_from_job_id:
+                required.add(rec.resume_from_job_id)
+
+        def add_rec_id(rec_id):
+            try:
+                rec = rec_by_id.get(int(rec_id))
+            except (TypeError, ValueError):
+                rec = None
+            if rec is not None and rec.job_id:
+                required.add(rec.job_id)
+
+        def collect_brain(brain):
+            if brain is None:
+                return
+            for rec_id in getattr(brain, "active_configs", set()) or set():
+                add_rec_id(rec_id)
+            for promotion in getattr(brain, "pending_promotions", []) or []:
+                if isinstance(promotion, (list, tuple)) and promotion:
+                    add_rec_id(promotion[0])
+            population = getattr(brain, "population", None)
+            if isinstance(population, dict):
+                for rec_id in population:
+                    add_rec_id(rec_id)
+            considered = getattr(brain, "experiments_considered", []) or []
+            for rec in considered:
+                job_id = getattr(rec, "job_id", None)
+                if job_id:
+                    required.add(job_id)
+            collect_brain(getattr(brain, "current_sub_brain", None))
+
+        collect_brain(self.brain)
+
+        checkpoint_windows = [
+            getattr(rec, "checkpoint_window", 0) for rec in self.history
+            if getattr(rec, "checkpoint_window", 0)
+        ]
+        if checkpoint_windows:
+            latest_window = max(checkpoint_windows)
+            required.update(
+                rec.job_id for rec in self.history
+                if getattr(rec, "checkpoint_window", 0) == latest_window
+                and rec.job_id
+            )
+
+        # Fail-closed fallback for workspaces created before decision windows
+        # were persisted.  Their current bracket cannot be reconstructed
+        # reliably: the newest bracket may have a smaller budget than an older
+        # one, so choosing the globally largest budget could delete a required
+        # promotion parent.  New runs use the exact, bounded latest window.
+        if (
+            not checkpoint_windows
+            and getattr(self.brain, "last_launched_count", 0)
+        ):
+            successful = [
+                rec for rec in self.history
+                if rec.status in (JobStates.success, JobStates.done) and rec.job_id
+            ]
+            required.update(rec.job_id for rec in successful)
+
+        return required
+
+    def get_verified_full_fidelity_best(self):
+        """Return the best largest-budget result when it is provable."""
+        completed = [
+            rec for rec in self.history
+            if rec.status in (JobStates.success, JobStates.done) and rec.job_id
+        ]
+        if not completed:
+            return None
+        known = [
+            (self._recommendation_budget(rec), rec) for rec in completed
+            if self._recommendation_budget(rec) is not None
+        ]
+        candidates = completed
+        if known:
+            largest = max(budget for budget, _rec in known)
+            candidates = [rec for budget, rec in known if budget == largest]
+        elif self.algorithm != "hybrid":
+            return self.get_best()
+
+        selector = (
+            min if self.objective_config.score_direction == "minimize" else max
+        )
+        return selector(candidates, key=lambda rec: rec.result)
 
     def get_status(self):
         """Return a structured status snapshot of the entire experiment.
@@ -576,6 +686,7 @@ class Controller:
                 rec.resume_from_job_id = rec_dict.get("resume_from_job_id")
                 rec.resume_from_epoch = rec_dict.get("resume_from_epoch")
                 rec.resume_from_step = rec_dict.get("resume_from_step")
+                rec.checkpoint_window = int(rec_dict.get("checkpoint_window", 0) or 0)
                 rec.early_stop_epoch = rec_dict.get("early_stop_epoch")
                 rec.created_on = rec_dict.get("created_on", "")
                 rec.last_modified = rec_dict.get("last_modified", "")
@@ -583,6 +694,10 @@ class Controller:
 
             if controller.history:
                 controller._next_id = max(r.id for r in controller.history) + 1
+                controller._checkpoint_window = max(
+                    getattr(r, "checkpoint_window", 0)
+                    for r in controller.history
+                )
 
         logger.info(
             "Loaded controller state: %d recommendations, next_id=%d",
@@ -683,6 +798,7 @@ class Controller:
             "resume_from_job_id": rec.resume_from_job_id,
             "resume_from_epoch": rec.resume_from_epoch,
             "resume_from_step": rec.resume_from_step,
+            "checkpoint_window": rec.checkpoint_window,
             "early_stop_epoch": rec.early_stop_epoch,
             "failure_reason": getattr(rec, "failure_reason", None),
             "adjustments": getattr(rec, "adjustments", []),
