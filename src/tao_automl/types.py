@@ -173,3 +173,4 @@ class AutoMLContext:
     metric: str = "loss"
     handler_id: str = ""  # experiment ID for custom ranges
     num_gpu: int = -1
+    random_seed: int | None = None
