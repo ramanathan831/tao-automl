@@ -1327,7 +1327,7 @@ class MetricExtractorError(RuntimeError):
 
 
 class NoFeasibleCandidateError(RuntimeError):
-    """Raised when a constrained selector has no accuracy-feasible candidate."""
+    """Raised when a constrained mode has no candidate under its own policy."""
 
 
 # Spec keys we treat as per-job output directories. When a user hardcodes
@@ -3477,7 +3477,10 @@ class AutoMLRunner:
             )
             if (
                 selected_status.get("status")
-                == "no_accuracy_feasible_candidates"
+                in {
+                    "no_accuracy_feasible_candidates",
+                    "no_multi_objective_accuracy_feasible_candidates",
+                }
             ):
                 raise NoFeasibleCandidateError(selected_status.get("reason"))
             failed = [r.id for r in history if r.status == "failure"]
