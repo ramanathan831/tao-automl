@@ -140,19 +140,34 @@ its production contents. After `NGC_KEY` has been exported from
 `~/.tao/config.env` without printing it, execute:
 
 ```bash
-cd /localhome/local-rarunachalam/tao-automl
-mkdir -p /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/wheel
-PATH=/localhome/local-rarunachalam/.tao/venvs/dino-multiobjective-py314/bin:$PATH \
-  python -m build --wheel \
-  --outdir /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/wheel
+set -euo pipefail
+TAO_AUTOML_REPO=/localhome/local-rarunachalam/tao-automl
+TAO_AUTOML_PYTHON=/localhome/local-rarunachalam/.tao/venvs/dino-multiobjective-py314/bin/python
+TAO_AUTOML_COMMIT=$(git -C "$TAO_AUTOML_REPO" rev-parse HEAD)
+TAO_AUTOML_BUILD_SRC=$(mktemp -d "/tmp/tao-automl-wheel.${TAO_AUTOML_COMMIT:0:12}.XXXXXX")
+TAO_AUTOML_WHEEL_DIR=/localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/wheel/${TAO_AUTOML_COMMIT:0:12}
+test ! -e "$TAO_AUTOML_WHEEL_DIR"
+mkdir -p "$TAO_AUTOML_WHEEL_DIR"
+git -C "$TAO_AUTOML_REPO" archive --format=tar "$TAO_AUTOML_COMMIT" \
+  | tar -xf - -C "$TAO_AUTOML_BUILD_SRC"
+export SOURCE_DATE_EPOCH
+SOURCE_DATE_EPOCH=$(git -C "$TAO_AUTOML_REPO" show -s --format=%ct "$TAO_AUTOML_COMMIT")
+PIP_NO_INDEX=1 "$TAO_AUTOML_PYTHON" -m pip wheel \
+  --no-deps --no-build-isolation --no-cache-dir \
+  --wheel-dir "$TAO_AUTOML_WHEEL_DIR" "$TAO_AUTOML_BUILD_SRC"
+TAO_AUTOML_WHEEL=$(find "$TAO_AUTOML_WHEEL_DIR" -maxdepth 1 -type f \
+  -name 'nvidia_tao_automl-*.whl' -print -quit)
+test -n "$TAO_AUTOML_WHEEL"
+sha256sum "$TAO_AUTOML_WHEEL"
+cd "$TAO_AUTOML_REPO"
 set -a
 source /localhome/local-rarunachalam/.tao/config.env
 set +a
 PATH=/localhome/local-rarunachalam/.tao/venvs/dino-multiobjective-py314/bin:$PATH \
   python experiments/cross_model_automl_20260729/dino_preflight/dino_local_launch.py \
   --source-repo /localhome/local-rarunachalam/tao-automl \
-  --wheel /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/wheel/nvidia_tao_automl-0.1.0-py3-none-any.whl \
-  --registry-path /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/dino_ptm_qualification/candidate_registry.v1.json \
+  --wheel "$TAO_AUTOML_WHEEL" \
+  --registry-path /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/dino_ptm_qualification/candidate_registry.v2.json \
   --voc-manifest /localhome/local-rarunachalam/tao-automl/experiments/cross_model_automl_20260729/datasets/voc2007/manifest.v1.json \
   --voc-root /localhome/local-rarunachalam/.tao/datasets/cross_model_automl_20260729/voc2007/prepared \
   --ptm-cache /localhome/local-rarunachalam/.tao/cache/cross_model_automl_20260729/dino_ptms \

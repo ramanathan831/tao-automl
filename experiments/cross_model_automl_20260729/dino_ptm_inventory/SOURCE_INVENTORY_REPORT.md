@@ -51,10 +51,14 @@ included.
 
 ### `dino_with_fm_backbone`
 
-These are complete DINO detector artifacts using runtime backbone
-`vit_large_dinov2`, as prescribed by the official transfer-learning YAML.
-The NVDINOv2 resource/member naming is checkpoint provenance and does not
-replace that TAO runtime key. Their detector input contract is
+The frozen metadata-only inventory records runtime backbone
+`vit_large_dinov2`, exactly as prescribed by the official transfer-learning
+YAML available during discovery. Subsequent checksum-gated TAO 7.1
+qualification found that this published key is inconsistent with the
+checkpoint's 5472-wide SwiGLU tensors. The production registry therefore uses
+TAO's supported `vit_large_nvdinov2` constructor, which matches 930/930 target
+tensors. The source-inventory JSON remains unchanged so it continues to
+preserve the original published metadata. Their detector input contract is
 `B x 3 x 1536 x 1536`.
 
 | Exact version | Exact member | Bytes | Role | Checkpoint target |

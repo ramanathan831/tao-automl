@@ -16,7 +16,12 @@ from tao_automl.ptm_preflight import (
     CheckpointLoadSmokeRequest,
     CheckpointLoadSmokeResult,
 )
-from tao_automl.ptm_registry import PTMRegistry, canonical_sha256, sha256_file
+from tao_automl.ptm_registry import (
+    PTMRegistry,
+    canonical_sha256,
+    load_ptm_registry,
+    sha256_file,
+)
 
 from dino_checkpoint_adapter import (
     DINOCheckpointMetadataProjectionCallback,
@@ -28,6 +33,7 @@ from dino_checkpoint_adapter import (
     PINNED_TAO71_DOCKER_IMAGE,
     ProjectionBackendRequest,
     TENSOR_HASH_ALGORITHM,
+    _tensor_raw_bytes,
 )
 from qualification_driver import (
     DINOQualificationConfiguration,
@@ -43,6 +49,10 @@ from tao71_docker_load_smoke import (
     DockerRunResult as LoadSmokeDockerRunResult,
     FULL_DETECTOR_CHECKPOINT_TARGET,
     TAO71DINOCheckpointLoadSmoke,
+    TAO71LoadSmokeFailure,
+    _CHECKPOINT_SAFE_GLOBALS,
+    _checkpoint_safe_global_names,
+    _validated_checkpoint_safe_global_names,
     coverage_policy,
 )
 
@@ -98,8 +108,18 @@ class FakeTensor:
     def contiguous(self):
         return self
 
+    def reshape(self, value):
+        assert value == -1
+        return FakeTensor(
+            self.content,
+            dtype=self.dtype,
+            shape=(1,) if self.shape == () else self.shape,
+        )
+
     def view(self, dtype):
         assert dtype is FakeTorch.uint8
+        if self.shape == ():
+            raise RuntimeError("0-D dtype-changing view is unsupported")
         return FakeByteTensor(self.content)
 
 
@@ -171,6 +191,106 @@ def _fixture_documents():
     }
     projected = {"state_dict": state_dict, "tao_model": "dino"}
     return source, projected
+
+
+def test_scalar_tensor_bytes_are_hashed_after_logical_flattening():
+    scalar = FakeTensor(
+        b"\x01\x00\x00\x00\x00\x00\x00\x00",
+        dtype="torch.int64",
+        shape=(),
+    )
+
+    assert _tensor_raw_bytes(scalar, FakeTorch) == scalar.content
+
+
+def test_serializer_qualification_evidence_matches_registry_and_worker():
+    repository_root = Path(__file__).resolve().parents[3]
+    evidence_path = Path(__file__).with_name(
+        "serializer_qualification.v1.json"
+    )
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    registry_path = (
+        repository_root / "src/tao_automl/data/ptm_registry.v1.json"
+    )
+    worker_path = Path(__file__).with_name("dino_checkpoint_adapter.py")
+
+    assert evidence["diagnostic_only"] is True
+    assert evidence["runtime_eligibility_mutated"] is False
+    assert evidence["selection_invoked"] is False
+    assert evidence["agent_selected_checkpoint"] is False
+    assert evidence["container"]["image"] == PINNED_TAO71_DOCKER_IMAGE
+    assert evidence["container"]["identity"] == (
+        PINNED_TAO71_CONTAINER_IDENTITY
+    )
+    assert evidence["implementation"]["worker_sha256"] == sha256_file(
+        worker_path
+    )
+    assert evidence["implementation"]["worker_size_bytes"] == (
+        worker_path.stat().st_size
+    )
+    assert evidence["implementation"]["registry_raw_sha256"] == sha256_file(
+        registry_path
+    )
+    assert evidence["implementation"]["recipe_sha256"] == canonical_sha256(
+        DINO_METADATA_PROJECTION_RECIPE
+    )
+    assert evidence["implementation"]["safe_load"] == {
+        "map_location": "cpu",
+        "weights_only": True,
+    }
+    assert evidence["implementation"]["tensor_hash_algorithm"] == (
+        TENSOR_HASH_ALGORITHM
+    )
+
+    registry = load_ptm_registry(registry_path).to_dict()
+    adapter_records = {
+        record["id"]: record
+        for record in registry["models"]["dino"]["checkpoints"]
+        if any(
+            adapter["id"] == "dino.tao71.metadata_wrapper.v1"
+            for adapter in record.get("artifact_adapters", ())
+        )
+    }
+    observed = {
+        record["checkpoint_id"]: record for record in evidence["records"]
+    }
+    assert set(observed) == set(adapter_records)
+    for checkpoint_id, record in observed.items():
+        registered = adapter_records[checkpoint_id]
+        adapter = next(
+            item
+            for item in registered["artifact_adapters"]
+            if item["id"] == "dino.tao71.metadata_wrapper.v1"
+        )
+        assert record["source"] == {
+            "member": registered["source"]["member"],
+            "size_bytes": registered["expected_size_bytes"],
+            "sha256": registered["sha256"],
+        }
+        assert record["output"] == {
+            "member": adapter["output"]["member"],
+            "size_bytes": adapter["output"]["expected_size_bytes"],
+            "sha256": adapter["output"]["sha256"],
+        }
+        assert len(record["runs"]) == 2
+        assert {
+            run["output_sha256"] for run in record["runs"]
+        } == {record["output"]["sha256"]}
+        assert len(
+            {run["evidence_sha256"] for run in record["runs"]}
+        ) == 1
+        tensor = record["tensor_evidence"]
+        assert tensor["exact"] is True
+        assert tensor["input_tensor_count"] == tensor["output_tensor_count"]
+        assert (
+            tensor["input_tensor_keys_sha256"]
+            == tensor["output_tensor_keys_sha256"]
+        )
+        assert (
+            tensor["input_tensor_values_sha256"]
+            == tensor["output_tensor_values_sha256"]
+        )
+        assert record["two_run_byte_identity"] is True
 
 
 def _adapter_record(input_bytes, output_bytes, *, status="supported"):
@@ -578,6 +698,11 @@ class RecordingTAO71LoadSmokeRunner:
             "tao_version": self._argument(argv, "--tao-version"),
             "device": "cpu",
             "weights_only": True,
+            "weights_only_allowed_globals": [
+                argv[index + 1]
+                for index, value in enumerate(argv)
+                if value == "--safe-global"
+            ],
             "merged_overrides_sha256": self._argument(
                 argv,
                 "--overrides-sha256",
@@ -615,6 +740,8 @@ class RecordingTAO71LoadSmokeRunner:
             "unexpected_source_keys_sha256": digest,
             "loaded_value_match_keys_sha256": digest,
         }
+        if self.mode == "wrong_safe_global":
+            evidence["weights_only_allowed_globals"] = []
         evidence_path.write_bytes(_canonical(evidence) + b"\n")
         return LoadSmokeDockerRunResult(0, "ignored", "protected")
 
@@ -755,6 +882,91 @@ def test_concrete_tao71_load_smoke_routes_backbone_target(tmp_path):
         argv,
         "--backbone",
     ) == "resnet_50"
+
+
+def test_checkpoint_safe_global_is_bound_to_exact_registry_identity():
+    checkpoint_id = "dino.backbone.nvimagenet.resnet50"
+    checkpoint_sha256 = (
+        "49b0df2b517a28760e17158c9ad78371"
+        "c1f833d6ad257f117ff81356743060b7"
+    )
+
+    assert _checkpoint_safe_global_names(
+        checkpoint_id,
+        checkpoint_sha256,
+    ) == ("argparse.Namespace",)
+    assert _checkpoint_safe_global_names(
+        "dino.backbone.imagenet.fan_hybrid_small",
+        "0" * 64,
+    ) == ()
+    with pytest.raises(
+        TAO71LoadSmokeFailure,
+        match="registered artifact digest",
+    ):
+        _checkpoint_safe_global_names(checkpoint_id, "0" * 64)
+
+
+def test_checkpoint_safe_global_policy_matches_packaged_registry():
+    records = {
+        record["id"]: record
+        for record in load_ptm_registry().to_dict()["models"]["dino"][
+            "checkpoints"
+        ]
+    }
+
+    assert set(_CHECKPOINT_SAFE_GLOBALS) == {
+        "dino.backbone.nvimagenet.resnet50"
+    }
+    for checkpoint_id, policy in _CHECKPOINT_SAFE_GLOBALS.items():
+        assert policy["checkpoint_sha256"] == records[checkpoint_id]["sha256"]
+
+
+def test_safe_global_plumbing_and_echo_are_fail_closed(tmp_path, monkeypatch):
+    import tao71_docker_load_smoke
+
+    request = _load_smoke_request(tmp_path)
+    checkpoint_sha256 = sha256_file(request.checkpoint_path)
+    monkeypatch.setitem(
+        tao71_docker_load_smoke._CHECKPOINT_SAFE_GLOBALS,
+        request.checkpoint_id,
+        {
+            "checkpoint_sha256": checkpoint_sha256,
+            "allowed_globals": ("argparse.Namespace",),
+        },
+    )
+    runner = RecordingTAO71LoadSmokeRunner()
+
+    result = TAO71DINOCheckpointLoadSmoke(runner=runner)(request)
+
+    assert result.ok
+    argv, _ = runner.calls[0]
+    safe_global_positions = [
+        index for index, value in enumerate(argv) if value == "--safe-global"
+    ]
+    assert len(safe_global_positions) == 1
+    assert argv[safe_global_positions[0] + 1] == "argparse.Namespace"
+    assert result.details["weights_only_allowed_globals"] == [
+        "argparse.Namespace"
+    ]
+
+    rejected = TAO71DINOCheckpointLoadSmoke(
+        runner=RecordingTAO71LoadSmokeRunner(mode="wrong_safe_global")
+    )(request)
+    assert not rejected.ok
+    assert rejected.code == "invalid_tao71_load_smoke_evidence"
+
+    with pytest.raises(ValueError, match="disagrees with artifact identity"):
+        _validated_checkpoint_safe_global_names(
+            request.checkpoint_id,
+            checkpoint_sha256,
+            (),
+        )
+    with pytest.raises(ValueError, match="disagrees with artifact identity"):
+        _validated_checkpoint_safe_global_names(
+            request.checkpoint_id,
+            checkpoint_sha256,
+            ("argparse.Namespace", "argparse.Namespace"),
+        )
 
 
 def test_concrete_tao71_load_smoke_rejects_unregistered_target(tmp_path):
@@ -1241,6 +1453,15 @@ def test_default_campaign_adapter_identity_is_pinned_docker(tmp_path):
     assert manifest["load_smoke_contract"]["safe_load"] == {
         "map_location": "cpu",
         "weights_only": True,
+        "checkpoint_specific_allowed_globals": {
+            "dino.backbone.nvimagenet.resnet50": {
+                "checkpoint_sha256": (
+                    "49b0df2b517a28760e17158c9ad78371"
+                    "c1f833d6ad257f117ff81356743060b7"
+                ),
+                "allowed_globals": ["argparse.Namespace"],
+            }
+        },
     }
     assert manifest["load_smoke_contract"]["target_routing"] == [
         BACKBONE_CHECKPOINT_TARGET,

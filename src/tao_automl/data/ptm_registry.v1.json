@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "registry_version": "1.2.0",
+  "registry_version": "1.2.1",
   "models": {
     "dino": {
       "default_ptm": "dino.coco.resnet50.trainable.v1.0",
@@ -39,11 +39,11 @@
               },
               "output": {
                 "member": "tao71_dino_resnet50_ep12.pth",
-                "expected_size_bytes": 195112691,
-                "sha256": "71dcc68124a9a8b86f5c4ae817c71f1773daee4213d294b39698fcedbf01556c"
+                "expected_size_bytes": 195109331,
+                "sha256": "678064a0706ec778edb17583be78e9a138afac1c48832ba419b8c774ac7d5756"
               },
               "provenance": {
-                "source": "Preserved TAO 7.1 DINO checkpoint qualification",
+                "source": "Pinned TAO 7.1 serializer qualification",
                 "evidence": "docs/cross_model_automl/dino_ptm_inventory.md"
               }
             }
@@ -219,11 +219,11 @@
               },
               "output": {
                 "member": "tao71_dino_fan_small_ep12.pth",
-                "expected_size_bytes": 193719035,
-                "sha256": "be3b68dd0f5f0148f5e471c943c9980d3fae29cb1e74008f4c978563f63177bc"
+                "expected_size_bytes": 193716107,
+                "sha256": "0a9e5ebfba383bbba8084db72a595bac2be512742998a2b4c0168b4300f3b580"
               },
               "provenance": {
-                "source": "Preserved TAO 7.1 DINO checkpoint qualification",
+                "source": "Pinned TAO 7.1 serializer qualification",
                 "evidence": "docs/cross_model_automl/dino_ptm_inventory.md"
               }
             }
@@ -319,11 +319,11 @@
               },
               "output": {
                 "member": "tao71_dino_fan_large_imagenet22k_36ep.pth",
-                "expected_size_bytes": 399427103,
-                "sha256": "80ec57972d4438328833414af5c00c01f0ab99facca63ed9774deda34f8ffbe2"
+                "expected_size_bytes": 399422743,
+                "sha256": "149b670a4ca0cb701bdd32c69244593f2d6c699fd0d8b1851a9ad385434c7303"
               },
               "provenance": {
-                "source": "Preserved TAO 7.1 DINO checkpoint qualification",
+                "source": "Pinned TAO 7.1 serializer qualification",
                 "evidence": "docs/cross_model_automl/dino_ptm_inventory.md"
               }
             }
@@ -420,18 +420,18 @@
               },
               "output": {
                 "member": "tao71_dino_nvdinov2_518_1536_coco_e36.pth",
-                "expected_size_bytes": 1410850955,
-                "sha256": "15165d1627e2f6dcc553c4810163fed60fa79b44e584054d0c2d36e51dcf48bf"
+                "expected_size_bytes": 1410846731,
+                "sha256": "d7bacddff9393d5f37ecca67686467bce2cd77d95b26c6a01908a90dbc6b6333"
               },
               "provenance": {
-                "source": "Preserved TAO 7.1 DINO checkpoint qualification",
+                "source": "Pinned TAO 7.1 serializer qualification",
                 "evidence": "docs/cross_model_automl/dino_ptm_inventory.md"
               }
             }
           ],
           "model_family": "dino",
           "architecture": "dino_vit_adapter",
-          "backbone": "vit_large_dinov2",
+          "backbone": "vit_large_nvdinov2",
           "checkpoint_target": "train.pretrained_model_path",
           "input_contract": {
             "channels": 3,
@@ -456,7 +456,7 @@
               }
             },
             "model": {
-              "backbone": "vit_large_dinov2",
+              "backbone": "vit_large_nvdinov2",
               "train_backbone": false,
               "num_feature_levels": 4,
               "enc_layers": 6,
@@ -469,10 +469,10 @@
           "checkpoint_spec_file": {
             "source": "repository",
             "path": "data/ptm_specs/dino/dino.coco.nvdinov2_large.trainable.v1.0.yaml",
-            "sha256": "38779e72d2ec7829d0c7ec15b9684c7485c9b9add4c29d587dd7b047efb6e0ab",
+            "sha256": "cde09655633b228f8e89f79efd04f0f2182d573e18397c47fbd4e40d51907439",
             "provenance": {
-              "source": "Official NGC nvidia/tao/dino_with_fm_backbone model-card transfer-learning template",
-              "evidence": "NGC API resource nvidia/tao/dino_with_fm_backbone:trainable_v1.0"
+              "source": "Official NGC NVDINOv2 architecture plus pinned TAO 7.1 checkpoint-shape qualification; the published transfer snippet's vit_large_dinov2 key is incompatible with the checkpoint SwiGLU dimensions",
+              "evidence": "docs/cross_model_automl/dino_ptm_inventory.md"
             }
           },
           "task_compatibility": [
@@ -1645,7 +1645,7 @@
       {
         "id": "dino.backbone.nvimagenet.resnet50",
         "status": "unverified",
-        "status_reason": "Official immutable NGC backbone identity, exact member size, runtime backbone, and checkpoint-specific sidecar are recorded. NGC publishes no checkpoint SHA-256 for this member; checkpoint load, train/validation/inference mini-steps, and save/reload remain pending. This is an explicit qualification candidate and is not runtime eligible.",
+        "status_reason": "Official immutable NGC backbone identity, qualification-observed member SHA-256 and size, runtime backbone, and checkpoint-specific sidecar are recorded. Train/validation/inference mini-steps and save/reload remain pending. This is an explicit qualification candidate and is not runtime eligible.",
         "source": {
           "provider": "ngc",
           "registry": "nvidia/tao",
@@ -1656,6 +1656,7 @@
           "immutable_identity": "ngc://nvidia/tao/pretrained_dino_nvimagenet:resnet50#resnet50_nvimagenetv2.pth.tar"
         },
         "expected_size_bytes": 307117121,
+        "sha256": "49b0df2b517a28760e17158c9ad78371c1f833d6ad257f117ff81356743060b7",
         "model_family": "dino",
         "architecture": "dino_backbone",
         "backbone": "resnet_50",

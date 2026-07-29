@@ -1,13 +1,15 @@
 # DINO pretrained-model inventory
 
-This is the frozen DINO portion of the schema-v1 repository-owned PTM
+This documents the DINO portion of the schema-v1 repository-owned PTM
 registry. Official NGC resource, version, member, and byte-size metadata were
 resolved on 2026-07-29. It contains 31 trainable identities: five complete
 DINO detector checkpoints and all 26 official DINO backbone-only artifacts.
 Checkpoint SHA-256 values for the five detector artifacts come from previously
 staged DINO validation evidence. NGC does not publish checkpoint SHA-256 for
-the 26 backbone members, so none was invented. No checkpoint was downloaded
-to create this inventory.
+the 26 backbone members, so none was invented during source discovery.
+Subsequent checksum-gated qualification recorded the observed SHA-256 for the
+NVImageNet ResNet50 member. No checkpoint was downloaded to create the
+original source inventory.
 
 Official sources:
 
@@ -74,12 +76,22 @@ Python module, or other executable adapter reference: production preflight
 verifies the official NGC input first and then invokes a model-owned callback
 supplied by the TAO integration.
 
-| Registry ID | Preserved TAO 7.1 output | Bytes | SHA-256 |
+| Registry ID | Pinned TAO 7.1 output | Bytes | SHA-256 |
 | --- | --- | ---: | --- |
-| `dino.coco.resnet50.trainable.v1.0` | `tao71_dino_resnet50_ep12.pth` | 195,112,691 | `71dcc68124a9a8b86f5c4ae817c71f1773daee4213d294b39698fcedbf01556c` |
-| `dino.coco.fan_small.trainable.v1.0` | `tao71_dino_fan_small_ep12.pth` | 193,719,035 | `be3b68dd0f5f0148f5e471c943c9980d3fae29cb1e74008f4c978563f63177bc` |
-| `dino.coco.fan_large.trainable.v1.0` | `tao71_dino_fan_large_imagenet22k_36ep.pth` | 399,427,103 | `80ec57972d4438328833414af5c00c01f0ab99facca63ed9774deda34f8ffbe2` |
-| `dino.coco.nvdinov2_large.trainable.v1.0` | `tao71_dino_nvdinov2_518_1536_coco_e36.pth` | 1,410,850,955 | `15165d1627e2f6dcc553c4810163fed60fa79b44e584054d0c2d36e51dcf48bf` |
+| `dino.coco.resnet50.trainable.v1.0` | `tao71_dino_resnet50_ep12.pth` | 195,109,331 | `678064a0706ec778edb17583be78e9a138afac1c48832ba419b8c774ac7d5756` |
+| `dino.coco.fan_small.trainable.v1.0` | `tao71_dino_fan_small_ep12.pth` | 193,716,107 | `0a9e5ebfba383bbba8084db72a595bac2be512742998a2b4c0168b4300f3b580` |
+| `dino.coco.fan_large.trainable.v1.0` | `tao71_dino_fan_large_imagenet22k_36ep.pth` | 399,422,743 | `149b670a4ca0cb701bdd32c69244593f2d6c699fd0d8b1851a9ad385434c7303` |
+| `dino.coco.nvdinov2_large.trainable.v1.0` | `tao71_dino_nvdinov2_518_1536_coco_e36.pth` | 1,410,846,731 | `d7bacddff9393d5f37ecca67686467bce2cd77d95b26c6a01908a90dbc6b6333` |
+
+These output identities were reproduced byte-for-byte in two independent
+runs of the exact pinned TAO 7.1 image. They replace older wrapper identities
+whose zip archive roots encoded a different serializer staging filename;
+tensor key and value digests remained exact.
+The machine-readable run identities, source and worker hashes, tensor
+digests, and isolation flags are frozen in
+`experiments/cross_model_automl_20260729/dino_ptm_qualification/serializer_qualification.v1.json`.
+The first failed qualification and correction boundary are documented in
+`docs/cross_model_automl/dino_ptm_qualification_correction.md`.
 
 Adapted outputs enter the cache only by atomic replacement after registered
 size and SHA-256 verification. Provenance binds the recipe, official input
@@ -109,7 +121,13 @@ their existing sidecars:
 | `dino.coco.gcvit_tiny.trainable.v1.0` | `e90725346e0ad21da63b531ab0ee6cd7f12175fab4a7f7981aeadc4ec3f84498` |
 | `dino.coco.fan_small.trainable.v1.0` | `0ee49339b12f477cf1b79ae0a38553e0b2aa550b14351329938583940397a1d5` |
 | `dino.coco.fan_large.trainable.v1.0` | `731c8b0a140580199cfa043d1ea674bbec9cbb7a269335b847bad05244e41ae4` |
-| `dino.coco.nvdinov2_large.trainable.v1.0` | `38779e72d2ec7829d0c7ec15b9684c7485c9b9add4c29d587dd7b047efb6e0ab` |
+| `dino.coco.nvdinov2_large.trainable.v1.0` | `cde09655633b228f8e89f79efd04f0f2182d573e18397c47fbd4e40d51907439` |
+
+The published NVDINOv2 transfer snippet names `vit_large_dinov2`, but that
+constructor uses standard 4096-wide MLP blocks and is shape-incompatible with
+the checkpoint's 5472-wide SwiGLU blocks. The model card, resource identity,
+checkpoint tensors, and pinned TAO 7.1 implementation agree on
+`vit_large_nvdinov2`; qualification therefore corrects only that backbone key.
 
 Sidecar values are PTM defaults, not user policy. The deterministic merge
 order remains:

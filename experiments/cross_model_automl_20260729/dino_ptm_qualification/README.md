@@ -159,7 +159,14 @@ evidence and are never replaced.
 
 The command-line driver accepts only non-secret paths and a resume flag. It
 reads `NGC_KEY` from the process environment. Source the existing protected
-configuration externally; do not put the credential on the command line:
+configuration externally; do not put the credential on the command line.
+
+The first immutable CPU attempt is preserved under `cpu/`. It exposed
+qualification implementation defects documented in
+`docs/cross_model_automl/dino_ptm_qualification_correction.md`. The corrected
+run uses the new create-only `cpu_v2/` target; neither run is overwritten.
+
+Run:
 
 ```bash
 cd /localhome/local-rarunachalam/tao-automl
@@ -170,7 +177,7 @@ PATH=/localhome/local-rarunachalam/.tao/venvs/dino-multiobjective-py314/bin:$PAT
   python \
   experiments/cross_model_automl_20260729/dino_ptm_qualification/qualification_driver.py \
   --output-dir \
-  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/dino_ptm_qualification/cpu \
+  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/dino_ptm_qualification/cpu_v2 \
   --cache-dir \
   /localhome/local-rarunachalam/.tao/cache/cross_model_automl_20260729/dino_ptms
 ```
@@ -189,10 +196,10 @@ VOC2007 dataset:
 PATH=/localhome/local-rarunachalam/.tao/venvs/dino-multiobjective-py314/bin:$PATH \
   python \
   experiments/cross_model_automl_20260729/dino_ptm_qualification/train_validation_qualification.py \
-  --output-dir /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/dino_ptm_qualification/gpu \
+  --output-dir /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/dino_ptm_qualification/gpu_v2 \
   --cache-dir /localhome/local-rarunachalam/.tao/cache/cross_model_automl_20260729/dino_ptms \
-  --runtime-results-dir /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/dino_ptm_qualification/gpu_runtime \
-  --cpu-qualification-dir /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/dino_ptm_qualification/cpu \
+  --runtime-results-dir /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/dino_ptm_qualification/gpu_runtime_v2 \
+  --cpu-qualification-dir /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/dino_ptm_qualification/cpu_v2 \
   --cpu-cache-dir /localhome/local-rarunachalam/.tao/cache/cross_model_automl_20260729/dino_ptms \
   --voc-manifest /localhome/local-rarunachalam/tao-automl/experiments/cross_model_automl_20260729/datasets/voc2007/manifest.v1.json \
   --voc-root /localhome/local-rarunachalam/.tao/datasets/cross_model_automl_20260729/voc2007/prepared \
@@ -211,12 +218,12 @@ and evidence path:
 python \
   experiments/cross_model_automl_20260729/dino_ptm_qualification/registry_promotion.py \
   --base-registry src/tao_automl/data/ptm_registry.v1.json \
-  --cpu-output-dir /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/dino_ptm_qualification/cpu \
+  --cpu-output-dir /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/dino_ptm_qualification/cpu_v2 \
   --cpu-cache-dir /localhome/local-rarunachalam/.tao/cache/cross_model_automl_20260729/dino_ptms \
-  --gpu-output-dir /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/dino_ptm_qualification/gpu \
+  --gpu-output-dir /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/dino_ptm_qualification/gpu_v2 \
   --gpu-cache-dir /localhome/local-rarunachalam/.tao/cache/cross_model_automl_20260729/dino_ptms \
-  --output-registry /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/dino_ptm_qualification/candidate_registry.v1.json \
-  --audit /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/dino_ptm_qualification/candidate_promotion_audit.v1.json \
+  --output-registry /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/dino_ptm_qualification/candidate_registry.v2.json \
+  --audit /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/dino_ptm_qualification/candidate_promotion_audit.v2.json \
   --registry-version 1.3.0 \
   --validation-evidence experiments/cross_model_automl_20260729/runtime/dino_ptm_qualification/final_promotion_audit.v1.json
 ```

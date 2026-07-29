@@ -269,7 +269,11 @@ def _tensor_raw_bytes(tensor: Any, torch_module: Any) -> bytes:
         )
     try:
         value = tensor.detach().cpu().contiguous()
-        byte_view = value.view(torch_module.uint8).reshape(-1)
+        # PyTorch 2.6+ rejects a dtype-changing ``view`` directly on a 0-D
+        # tensor (for example BatchNorm ``num_batches_tracked``). Flatten the
+        # logical tensor first so scalar and non-scalar state entries follow
+        # the same byte-exact hashing path.
+        byte_view = value.reshape(-1).view(torch_module.uint8).reshape(-1)
         return byte_view.numpy().tobytes(order="C")
     except Exception as exc:
         raise DINOProjectionFailure(

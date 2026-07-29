@@ -10,6 +10,7 @@ image without installing the AutoML checkout in that image.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import math
@@ -55,6 +56,21 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _IMAGE_DIGEST_RE = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
 _TAO71_RE = re.compile(r"^7\.1(?:\.0)?(?:$|[-+].*)")
 
+# PyTorch's restricted weights-only unpickler rejects argparse.Namespace
+# unless it is explicitly allowlisted. One official NVImageNet checkpoint
+# stores training arguments at the root alongside its tensor state. The
+# exception is bound to both the stable registry ID and the verified official
+# artifact digest; all other globals and artifacts remain rejected.
+_CHECKPOINT_SAFE_GLOBALS = {
+    "dino.backbone.nvimagenet.resnet50": {
+        "checkpoint_sha256": (
+            "49b0df2b517a28760e17158c9ad78371"
+            "c1f833d6ad257f117ff81356743060b7"
+        ),
+        "allowed_globals": ("argparse.Namespace",),
+    },
+}
+
 
 def coverage_policy(checkpoint_target: str) -> dict[str, Any]:
     """Return the immutable qualification coverage gate for one target."""
@@ -95,6 +111,54 @@ class TAO71LoadSmokeFailure(RuntimeError):
         self.reason = reason
         self.details = dict(details or {})
         super().__init__(reason)
+
+
+def _checkpoint_safe_global_names(
+    checkpoint_id: str,
+    checkpoint_sha256: str,
+) -> tuple[str, ...]:
+    policy = _CHECKPOINT_SAFE_GLOBALS.get(checkpoint_id)
+    if policy is None:
+        return ()
+    if checkpoint_sha256 != policy["checkpoint_sha256"]:
+        raise TAO71LoadSmokeFailure(
+            "safe_global_checkpoint_identity_mismatch",
+            "Checkpoint-specific safe globals require the registered artifact digest",
+            {"checkpoint_id": checkpoint_id},
+        )
+    return tuple(policy["allowed_globals"])
+
+
+def _validated_checkpoint_safe_global_names(
+    checkpoint_id: str,
+    checkpoint_sha256: str,
+    provided: tuple[str, ...],
+) -> tuple[str, ...]:
+    expected = _checkpoint_safe_global_names(
+        checkpoint_id,
+        checkpoint_sha256,
+    )
+    if provided != expected:
+        raise ValueError(
+            "checkpoint-specific safe-global policy disagrees with artifact identity"
+        )
+    return expected
+
+
+@contextlib.contextmanager
+def _weights_only_safe_globals(
+    torch_module: Any,
+    names: tuple[str, ...],
+):
+    supported = {"argparse.Namespace": argparse.Namespace}
+    if any(name not in supported for name in names):
+        raise ValueError("unsupported weights-only safe global")
+    values = [supported[name] for name in names]
+    if values:
+        with torch_module.serialization.safe_globals(values):
+            yield
+    else:
+        yield
 
 
 def _registered_load_target(request: Any) -> tuple[str, str]:
@@ -448,6 +512,15 @@ class TAO71DINOCheckpointLoadSmoke:
             "safe_load": {
                 "map_location": "cpu",
                 "weights_only": True,
+                "checkpoint_specific_allowed_globals": {
+                    checkpoint_id: {
+                        "checkpoint_sha256": policy["checkpoint_sha256"],
+                        "allowed_globals": list(policy["allowed_globals"]),
+                    }
+                    for checkpoint_id, policy in sorted(
+                        _CHECKPOINT_SAFE_GLOBALS.items()
+                    )
+                },
             },
             "target_routing": sorted(SUPPORTED_CHECKPOINT_TARGETS),
             "coverage_policies": {
@@ -511,6 +584,10 @@ class TAO71DINOCheckpointLoadSmoke:
                 expected_size_bytes=expected_size,
                 expected_sha256=expected_sha,
             )
+            safe_global_names = _checkpoint_safe_global_names(
+                request.checkpoint_id,
+                expected_sha,
+            )
             overrides = merged_checkpoint_overrides(request)
             overrides_sha = _canonical_sha256(overrides)
 
@@ -533,6 +610,11 @@ class TAO71DINOCheckpointLoadSmoke:
                 worker_path.write_bytes(self.worker_source_bytes)
                 os.chmod(worker_path, 0o400)
                 evidence_path = output_root / "load-smoke-evidence.json"
+                safe_global_argv = tuple(
+                    item
+                    for name in safe_global_names
+                    for item in ("--safe-global", name)
+                )
                 argv = (
                     "docker",
                     "run",
@@ -603,6 +685,7 @@ class TAO71DINOCheckpointLoadSmoke:
                     self.tao_version,
                     "--container-identity",
                     self.container_identity,
+                    *safe_global_argv,
                     "--evidence",
                     "/output/load-smoke-evidence.json",
                 )
@@ -658,6 +741,7 @@ class TAO71DINOCheckpointLoadSmoke:
                 "tao_version": self.tao_version,
                 "device": "cpu",
                 "weights_only": True,
+                "weights_only_allowed_globals": list(safe_global_names),
                 "merged_overrides_sha256": overrides_sha,
                 "coverage_policy": active_coverage_policy,
                 "tao_load_path_executed": True,
@@ -947,6 +1031,7 @@ def _in_container_load(
     backbone: str,
     tao_version: str,
     container_identity: str,
+    safe_global_names: tuple[str, ...],
 ) -> dict[str, Any]:
     """Execute TAO's DINO PTM adapter and state-loading path on CPU."""
     _verify_regular_file(
@@ -970,6 +1055,11 @@ def _in_container_load(
     from nvidia_tao_pytorch.cv.dino.model.utils import dino_parser, ptm_adapter
 
     policy = coverage_policy(checkpoint_target)
+    safe_global_names = _validated_checkpoint_safe_global_names(
+        checkpoint_id,
+        checkpoint_sha256,
+        safe_global_names,
+    )
     if not isinstance(backbone, str) or not backbone:
         raise ValueError("registered backbone is empty")
     overrides = json.loads(overrides_path.read_text(encoding="utf-8"))
@@ -978,11 +1068,12 @@ def _in_container_load(
     if str(config.model.backbone) != backbone:
         raise ValueError("effective DINO backbone disagrees with registry")
 
-    raw_checkpoint = torch.load(
-        str(checkpoint_path),
-        map_location="cpu",
-        weights_only=True,
-    )
+    with _weights_only_safe_globals(torch, safe_global_names):
+        raw_checkpoint = torch.load(
+            str(checkpoint_path),
+            map_location="cpu",
+            weights_only=True,
+        )
     if not isinstance(raw_checkpoint, Mapping):
         raise ValueError("checkpoint root is not a mapping")
 
@@ -1046,7 +1137,8 @@ def _in_container_load(
 
         torch.load = safe_torch_load
         try:
-            model = DINOPlModel(config)
+            with _weights_only_safe_globals(torch, safe_global_names):
+                model = DINOPlModel(config)
         finally:
             torch.load = original_torch_load
         if safe_path_load_count != 1:
@@ -1078,6 +1170,7 @@ def _in_container_load(
         "tao_version": tao_version,
         "device": "cpu",
         "weights_only": True,
+        "weights_only_allowed_globals": list(safe_global_names),
         "merged_overrides_sha256": overrides_sha256,
         "coverage_policy": policy,
         "tao_load_path": load_path,
@@ -1115,6 +1208,7 @@ def _load_cli(arguments: argparse.Namespace) -> int:
         backbone=arguments.backbone,
         tao_version=arguments.tao_version,
         container_identity=arguments.container_identity,
+        safe_global_names=tuple(arguments.safe_global),
     )
     _write_json_create_only(Path(arguments.evidence), evidence)
     return 0
@@ -1138,6 +1232,18 @@ def _parser() -> argparse.ArgumentParser:
     load.add_argument("--backbone", required=True)
     load.add_argument("--tao-version", required=True)
     load.add_argument("--container-identity", required=True)
+    load.add_argument(
+        "--safe-global",
+        action="append",
+        default=[],
+        choices=sorted(
+            {
+                name
+                for policy in _CHECKPOINT_SAFE_GLOBALS.values()
+                for name in policy["allowed_globals"]
+            }
+        ),
+    )
     load.add_argument("--evidence", required=True)
     return parser
 

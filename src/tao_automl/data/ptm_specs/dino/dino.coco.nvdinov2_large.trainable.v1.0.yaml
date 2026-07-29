@@ -5,7 +5,7 @@ dataset:
     random_resize_max_size: 1536
     fixed_padding: true
 model:
-  backbone: vit_large_dinov2
+  backbone: vit_large_nvdinov2
   train_backbone: false
   num_feature_levels: 4
   enc_layers: 6

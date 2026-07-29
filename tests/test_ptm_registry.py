@@ -126,7 +126,7 @@ def _registry(*records, default_ptm=None):
 def test_packaged_dino_registry_and_schema_load():
     registry = load_ptm_registry()
     assert registry.schema_version == 1
-    assert registry.registry_version == "1.2.0"
+    assert registry.registry_version == "1.2.1"
     assert "dino" in registry.models
     assert registry.models == tuple(sorted(registry.models))
     assert len(registry.document_sha256) == 64
@@ -306,6 +306,13 @@ def test_packaged_dino_registry_exactly_covers_official_trainable_inventory():
         record["artifact_role"] == "full_detector_deployable"
         for record in official_deployable.values()
     )
+    qualification_backbone_corrections = {
+        (
+            "dino_with_fm_backbone",
+            "trainable_v1.0",
+            "dino_nvdinov2_518_1536_coco_e36.pth",
+        ): "vit_large_nvdinov2",
+    }
 
     for identity, source in official_trainable.items():
         record = packaged[identity]
@@ -313,7 +320,13 @@ def test_packaged_dino_registry_exactly_covers_official_trainable_inventory():
             source["immutable_identity"]
         )
         assert record["expected_size_bytes"] == source["size_bytes"]
-        assert record["backbone"] == source["runtime_backbone"]
+        expected_backbone = qualification_backbone_corrections.get(
+            identity,
+            source["runtime_backbone"],
+        )
+        assert record["backbone"] == expected_backbone
+        if identity in qualification_backbone_corrections:
+            assert source["runtime_backbone"] == "vit_large_dinov2"
         assert record["checkpoint_target"] == source["checkpoint_target"]
         assert record["input_contract"]["channels"] == 3
         assert record["input_contract"]["height"] == (
@@ -386,7 +399,13 @@ def test_dino_backbone_records_preserve_qualification_runtime_boundary():
         )
     for record in qualification_candidates:
         assert record["status"] == "unverified"
-        assert "sha256" not in record
+        if record["id"] == "dino.backbone.nvimagenet.resnet50":
+            assert record["sha256"] == (
+                "49b0df2b517a28760e17158c9ad78371"
+                "c1f833d6ad257f117ff81356743060b7"
+            )
+        else:
+            assert "sha256" not in record
         assert "not runtime eligible" in record["status_reason"]
 
     compatibility = load_ptm_registry().compatibility(
@@ -406,7 +425,7 @@ def test_dino_backbone_records_preserve_qualification_runtime_boundary():
         assert excluded[record["id"]].codes == (expected_code,)
 
 
-def test_packaged_dino_tao71_adapters_match_preserved_wrapper_evidence():
+def test_packaged_dino_tao71_adapters_match_pinned_serializer_evidence():
     records = {
         record["id"]: record
         for record in load_ptm_registry().to_dict()["models"]["dino"][
@@ -416,23 +435,23 @@ def test_packaged_dino_tao71_adapters_match_preserved_wrapper_evidence():
     expected = {
         "dino.coco.resnet50.trainable.v1.0": (
             "tao71_dino_resnet50_ep12.pth",
-            195112691,
-            "71dcc68124a9a8b86f5c4ae817c71f1773daee4213d294b39698fcedbf01556c",
+            195109331,
+            "678064a0706ec778edb17583be78e9a138afac1c48832ba419b8c774ac7d5756",
         ),
         "dino.coco.fan_small.trainable.v1.0": (
             "tao71_dino_fan_small_ep12.pth",
-            193719035,
-            "be3b68dd0f5f0148f5e471c943c9980d3fae29cb1e74008f4c978563f63177bc",
+            193716107,
+            "0a9e5ebfba383bbba8084db72a595bac2be512742998a2b4c0168b4300f3b580",
         ),
         "dino.coco.fan_large.trainable.v1.0": (
             "tao71_dino_fan_large_imagenet22k_36ep.pth",
-            399427103,
-            "80ec57972d4438328833414af5c00c01f0ab99facca63ed9774deda34f8ffbe2",
+            399422743,
+            "149b670a4ca0cb701bdd32c69244593f2d6c699fd0d8b1851a9ad385434c7303",
         ),
         "dino.coco.nvdinov2_large.trainable.v1.0": (
             "tao71_dino_nvdinov2_518_1536_coco_e36.pth",
-            1410850955,
-            "15165d1627e2f6dcc553c4810163fed60fa79b44e584054d0c2d36e51dcf48bf",
+            1410846731,
+            "d7bacddff9393d5f37ecca67686467bce2cd77d95b26c6a01908a90dbc6b6333",
         ),
     }
     for checkpoint_id, output_values in expected.items():
