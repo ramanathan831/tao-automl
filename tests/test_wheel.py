@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from importlib import resources
 
 import pytest
 
@@ -803,3 +804,20 @@ def test_pip_show():
     )
     assert r.returncode == 0
     assert "0.1.0" in r.stdout
+
+
+def test_ptm_registry_resources_are_in_distribution():
+    """Registry runtime data and its public schema must ship with the wheel."""
+    package = resources.files("tao_automl")
+    assert package.joinpath("data", "ptm_registry.v1.json").is_file()
+    assert package.joinpath("data", "ptm_registry.schema.v1.json").is_file()
+
+    from tao_automl.ptm_registry import load_ptm_registry
+
+    registry = load_ptm_registry()
+    assert registry.schema_version == 1
+    for config in registry.to_dict()["models"].values():
+        for record in config["checkpoints"]:
+            sidecar = record.get("checkpoint_spec_file")
+            if sidecar is not None:
+                assert package.joinpath(*sidecar["path"].split("/")).is_file()

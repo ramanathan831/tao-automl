@@ -14,6 +14,7 @@ dependencies = [
     "scikit-learn",
     "scipy",
     "pandas",
+    "packaging>=23.0",
     "omegaconf",
     "openai>=1.0",
     "requests",
@@ -56,6 +57,17 @@ Repository = "https://gitlab-master.nvidia.com/nvidia-tao-toolkit/tao-automl"
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["tao_automl*"]
+
+[tool.setuptools.package-data]
+tao_automl = [
+    "data/*.json",
+    "data/**/*.json",
+    "data/**/*.yaml",
+    "data/**/*.yml",
+    "data/ptm_specs/*/*.json",
+    "data/ptm_specs/*/*.yaml",
+    "data/ptm_specs/*/*.yml",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

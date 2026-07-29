@@ -16,6 +16,7 @@ from tao_automl.objectives import parse_objective_config
 from tao_automl.selection import (
     AccuracyConstraint,
     SelectionConfig,
+    accuracy_feasibility_boundary,
     analyze_archive,
     canonical_spec_fingerprint,
 )
@@ -409,6 +410,32 @@ def test_mode_tie_breaking_is_deterministic_and_noise_aware():
     )
     assert forward.accuracy.winner_id == reverse.accuracy.winner_id
     assert forward.latency.winner_id == reverse.latency.winner_id
+
+
+def test_terminal_latency_feasibility_uses_canonical_tolerance_boundary():
+    selection_config = config(
+        mode="latency",
+        constraint=AccuracyConstraint(kind="relative", value=0.90),
+        accuracy_tolerance=0.01,
+    )
+    analysis = analyze_archive(
+        [
+            Candidate("accuracy", 1.0, 20.0),
+            Candidate("inside_tolerance", 0.895, 10.0),
+            Candidate("outside_tolerance", 0.889, 1.0),
+        ],
+        selection_config,
+    )
+    audits = audits_by_id(analysis)
+
+    assert analysis.accuracy_threshold == pytest.approx(0.90)
+    assert accuracy_feasibility_boundary(
+        analysis.accuracy_threshold,
+        selection_config.accuracy_tolerance,
+    ) == pytest.approx(0.89)
+    assert audits["inside_tolerance"].accuracy_feasible is True
+    assert audits["outside_tolerance"].accuracy_feasible is False
+    assert analysis.latency.winner_id == "inside_tolerance"
 
 
 def test_latency_practical_tolerance_forms_tie_without_confidence_intervals():

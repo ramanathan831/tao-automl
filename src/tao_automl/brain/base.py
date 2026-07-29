@@ -123,6 +123,22 @@ class AutoMLAlgorithmBase:
             return None
         return normalized if math.isfinite(normalized) else None
 
+    @classmethod
+    def _completed_observation_value(cls, recommendation):
+        """Return a finite result only for a successfully completed trial.
+
+        Promotion and exploitation algorithms must never treat the conventional
+        failed-trial placeholder ``0.0`` as an objective value.  Keeping this
+        status/value gate in the shared base class also gives every algorithm
+        identical handling for corrupt non-finite persisted observations.
+        """
+        status = str(getattr(recommendation, "status", "")).lower()
+        if status not in {"success", "done"}:
+            return None
+        return cls._finite_observation_value(
+            getattr(recommendation, "result", None)
+        )
+
     def _observation_utility(self, recommendation):
         """Return an oriented, finite utility for a successful recommendation.
 
@@ -130,13 +146,7 @@ class AutoMLAlgorithmBase:
         acquisitions are maximize-only, so minimization metrics are negated only
         at this ingestion boundary.
         """
-        status = str(getattr(recommendation, "status", "")).lower()
-        if status not in {"success", "done"}:
-            return None
-
-        result = self._finite_observation_value(
-            getattr(recommendation, "result", None)
-        )
+        result = self._completed_observation_value(recommendation)
         if result is None:
             return None
 

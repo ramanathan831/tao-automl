@@ -28,6 +28,33 @@ _NO_DISTINCT_COMPROMISE = (
 )
 
 
+def accuracy_feasibility_boundary(
+    threshold: float,
+    tolerance: float,
+) -> float:
+    """Return the canonical inclusive quality boundary.
+
+    ``threshold`` remains the configured/reference-derived policy value used
+    for reporting. Every feasibility decision uses the inclusive boundary
+    ``threshold - tolerance`` so acquisition, hierarchical allocation, and
+    terminal selection cannot disagree at the numerical tolerance edge.
+    """
+    if isinstance(threshold, bool) or isinstance(tolerance, bool):
+        raise TypeError("accuracy threshold and tolerance must be numbers")
+    try:
+        threshold_value = float(threshold)
+        tolerance_value = float(tolerance)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise TypeError(
+            "accuracy threshold and tolerance must be numbers"
+        ) from exc
+    if not math.isfinite(threshold_value):
+        raise ValueError("accuracy threshold must be finite")
+    if not math.isfinite(tolerance_value) or tolerance_value < 0.0:
+        raise ValueError("accuracy tolerance must be finite and >= 0")
+    return threshold_value - tolerance_value
+
+
 def _candidate_value(candidate: Any, name: str, default: Any = None) -> Any:
     if isinstance(candidate, Mapping):
         return candidate.get(name, default)
@@ -984,12 +1011,14 @@ def analyze_archive(
     reference_value = float(accuracy_winner.accuracy)
     reference_candidate_id = accuracy_winner.candidate_id
     threshold = retention.threshold(reference_value)
+    latency_boundary = accuracy_feasibility_boundary(
+        threshold,
+        config.accuracy_tolerance,
+    )
     latency_feasible = []
     for item in valid:
         assert item.accuracy is not None
-        item.accuracy_feasible = (
-            item.accuracy >= threshold - config.accuracy_tolerance
-        )
+        item.accuracy_feasible = item.accuracy >= latency_boundary
         if item.accuracy_feasible:
             latency_feasible.append(item)
 
@@ -1241,6 +1270,7 @@ __all__ = [
     "MultiObjectiveAccuracyPolicy",
     "SelectionAnalysis",
     "SelectionConfig",
+    "accuracy_feasibility_boundary",
     "analyze_archive",
     "canonical_spec_fingerprint",
 ]

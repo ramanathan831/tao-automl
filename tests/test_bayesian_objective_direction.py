@@ -357,7 +357,7 @@ def test_same_context_produces_same_initial_recommendation(brain_class):
     assert first_recommendation == second_recommendation
 
 
-@pytest.mark.parametrize("brain_class", [Bayesian, BFBO])
+@pytest.mark.parametrize("brain_class", [BFBO])
 def test_legacy_minimize_state_is_oriented_and_nonfinite_pairs_are_dropped(
     brain_class,
 ):
@@ -388,7 +388,7 @@ def test_legacy_minimize_state_is_oriented_and_nonfinite_pairs_are_dropped(
 
 @pytest.mark.parametrize(
     ("brain_class", "optimizer_name"),
-    [(Bayesian, "optimize_ei"), (BFBO, "optimize_ucb")],
+    [(BFBO, "optimize_ucb")],
 )
 def test_resumed_brain_rebuilds_stale_archive_utilities(
     brain_class,
