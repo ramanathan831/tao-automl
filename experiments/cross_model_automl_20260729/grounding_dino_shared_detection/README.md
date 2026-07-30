@@ -18,9 +18,35 @@ with `val_mAP50`; it is not a referring-expression grounding campaign.
 
 The source contains zero image `caption` fields and zero annotation
 `tokens_positive` fields. It therefore cannot support a phrase-grounding or
-`Pr@0.5` product claim. Production also has no supported
-`grounding_dino`/`val_mAP50` metric-sanity policy, and both official repository
-PTMs remain `unverified`. The automatic gate consequently remains closed.
+`Pr@0.5` product claim. Production now has a separate supported
+`grounding_dino`/`val_mAP50` object-detection metric policy; the
+referring-expression `val_Pr@0.5` policy remains blocked. The two policies are
+not aliases.
+
+## Sealed shared-dataset view
+
+The official `tao-dataservices` converters at revision
+`dcea3a39bd3e4709e2325e4b61a4f179efebde4c` were run twice against the exact
+DINO/DDETR/RT-DETR synthetic COCO annotations. Both runs were byte-identical.
+The read-only published view is inside the existing dataset tree:
+
+```text
+/lustre/fsw/portfolios/edgeai/users/rarunachalam/data/
+  tao_od_synthetic_full_dino_coco/grounding_dino_odvg_v1/
+```
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `train/annotations_odvg.jsonl` | `abf109f0fcbabcbc185942399857582ab1db0b8664c3f166c220b9def936d3df` |
+| `train/annotations_odvg_labelmap.json` | `50e203a52565c8c00f41454ad3656662c98cd2902bd6a02d35a2ab3059578d81` |
+| `validation/annotations_remapped.json` | `621f89401b4ab219274486b6c392540772707bcc0e5983a40c5c359f7277737b` |
+
+All 8,395 training annotations and all 2,186 validation annotations are
+preserved. The official ODVG converter intentionally omits only the 49 source
+training images with zero annotations. Their exact IDs are preserved in
+`dataset_conversion.v1.json`; the report therefore claims annotation
+losslessness, not image-count losslessness. Validation preserves all 353
+images and remaps only category IDs from `1..4` to contiguous `0..3`.
 
 Prepared execution is one direct full 10-epoch, one-node/eight-GPU
 qualification per official PTM, followed only after evidence-backed PTM
@@ -35,14 +61,45 @@ Every model job uses the pinned TAO 7.1.0 RC245 `.sqsh` directly. There are no
 CPU model runs, smoke runs, mini-steps, shared archives, manually injected
 candidates, or scheduler submissions in this preparation.
 
+`successor.contract.v1.json` prepares two full PTM qualification workflows,
+one for each official Grounding DINO PTM, and three independent
+algorithm-generated first-candidate mode pilots. Each train and standalone
+evaluate action uses one node and all eight GPUs. Training selection reads
+`val_mAP50`; standalone qualification reads `test_mAP50` from exact status
+evidence and is prohibited from feeding AutoML selection.
+
+The corrected RT-DETR release is now bound and all three of its first
+candidates passed. The automatic trigger remains deliberately closed and
+requires:
+
+- a fresh corrected DDETR automatic release and all three passing
+  first-candidate records (the preserved failed DDETR v2 runtime cannot count);
+- both official PTMs and the `bert-base-uncased` cache staged and hashed before
+  any GPU allocation;
+- full ten-epoch train/validation plus standalone evaluation evidence for at
+  least one official PTM.
+
+Only then may the two PTM qualification workflows be submitted in parallel,
+followed by one candidate per objective mode. The remaining 19 candidates per
+mode are released automatically only when all three first-candidate gates
+pass. No fallback, manual candidate, or manually selected PTM is permitted.
+
 Generate and verify the immutable preparation record with:
 
 ```bash
 PYTHONPATH=src \
-  python -m experiments.cross_model_automl_20260729.grounding_dino_shared_detection.prepare_campaign
+  python -m experiments.cross_model_automl_20260729.grounding_dino_shared_detection.prepare_campaign \
+  --check-only
+
+PYTHONPATH=src \
+  python -m experiments.cross_model_automl_20260729.grounding_dino_shared_detection.dataset_conversion \
+  --check-only
+
+PYTHONPATH=src \
+  python -m experiments.cross_model_automl_20260729.grounding_dino_shared_detection.successor_contract \
+  --check-only
 ```
 
-The generated record intentionally states `launch_authorized: false`. A later
-automatic successor may open the gate only after the converted dataset is
-sealed, a category-detection metric policy is supported, and at least one
-official PTM is qualified by full train/validation/evaluation evidence.
+The historical `campaign.preparation.v1.json` is retained unchanged. The
+current successor contract intentionally states `launch_authorized: false`;
+no GPU job has been submitted from this directory.

@@ -294,6 +294,12 @@ loader and Pr@0.5 evaluator are implemented and locally verified. Substituting
 VOC category prompts must be labeled as detection and is not an acceptable
 grounding result.
 
+The separately scoped synthetic-COCO campaign under
+`grounding_dino_shared_detection` intentionally exercises only the supported
+category-prompted detection path. It uses official COCO-to-ODVG conversion,
+contiguous-ID COCO validation, and `val_mAP50`; it does not change the blocked
+referring-expression row below or make a `Pr@0.5` claim.
+
 ### SegFormer
 
 Preflight must verify:

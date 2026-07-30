@@ -22,6 +22,9 @@ from .contract import (
     read_json,
     validate_preparation,
 )
+from .dataset_conversion import validate_conversion_manifest
+from .dataset_stage import validate_stage_record
+from .successor_contract import validate_successor_contract
 
 
 HERE = Path(__file__).resolve().parent
@@ -176,15 +179,20 @@ def test_qualification_covers_every_official_ptm(preparation):
     )
 
 
-def test_metric_and_ptm_trust_boundaries_keep_gate_closed(preparation):
+def test_metric_contract_is_task_specific_and_ptm_gate_remains_closed(preparation):
     metric = preparation["metric_contract"]
-    assert metric["val_mAP50"]["availability"] == "unregistered"
+    assert metric["val_mAP50"]["availability"] == "supported"
+    assert metric["val_mAP50"]["task"] == "object_detection"
     assert metric["val_Pr@0.5"]["availability"] == "blocked"
+    assert (
+        metric["val_Pr@0.5"]["task"]
+        == "referring_expression_box_grounding"
+    )
     gate = preparation["automatic_gate"]
     assert gate["launch_authorized"] is False
     codes = {item["code"] for item in gate["blockers"]}
     assert "referring_expression_annotation_contract_missing" in codes
-    assert "category_detection_metric_policy_not_supported" in codes
+    assert "category_detection_metric_policy_not_supported" not in codes
     assert "official_ptms_not_production_qualified" in codes
     assert "converted_dataset_artifacts_not_sealed" in codes
 
@@ -223,3 +231,116 @@ def test_committed_preparation_artifact_is_valid_and_non_launching():
     assert document["automatic_gate"]["launch_authorized"] is False
     assert document["execution"]["jobs_submitted"] == 0
     assert document["source"]["dirty"] is False
+    assert document["metric_contract"]["val_mAP50"]["availability"] == "unregistered"
+
+
+def test_committed_conversion_manifest_is_deterministic_and_annotation_lossless():
+    document = read_json(HERE / "dataset_conversion.v1.json")
+
+    validate_conversion_manifest(document)
+    assert document["determinism"]["independent_runs"] == 2
+    assert document["determinism"]["byte_identical"] is True
+    assert document["semantic_validation"]["train"][
+        "source_annotation_count"
+    ] == 8395
+    assert document["semantic_validation"]["train"][
+        "output_instance_count"
+    ] == 8395
+    assert document["semantic_validation"]["train"][
+        "excluded_empty_image_count"
+    ] == 49
+    assert len(
+        document["semantic_validation"]["train"]["excluded_empty_image_ids"]
+    ) == 49
+    assert document["semantic_validation"]["validation"][
+        "source_annotation_count"
+    ] == 2186
+    assert document["semantic_validation"]["validation"][
+        "output_annotation_count"
+    ] == 2186
+    assert document["semantic_validation"]["validation"][
+        "all_images_preserved"
+    ] is True
+    assert document["semantic_validation"]["annotation_lossless"] is True
+    assert document["semantic_validation"]["image_count_lossless"] is False
+
+
+def test_committed_stage_record_binds_nonwritable_lustre_files():
+    document = read_json(HERE / "dataset_stage.v1.json")
+
+    validate_stage_record(document)
+    publication = document["publication"]
+    assert publication["inside_existing_source_dataset_tree"] is True
+    assert publication["all_hashes_and_sizes_match"] is True
+    assert publication["published_files_nonwritable"] is True
+    assert publication["lustre_root"].endswith(
+        "tao_od_synthetic_full_dino_coco/grounding_dino_odvg_v1"
+    )
+    assert document["selection_or_execution"]["scheduler_jobs_submitted"] == 0
+
+
+def test_committed_successor_contract_is_complete_and_fail_closed():
+    document = read_json(HERE / "successor.contract.v1.json")
+
+    validate_successor_contract(document)
+    trigger = document["automatic_trigger"]
+    assert trigger["launch_authorized"] is False
+    assert document["execution"]["jobs_submitted"] == 0
+    codes = {item["code"] for item in trigger["blockers"]}
+    assert "rtdetr_first_candidate_gate_not_passed" not in codes
+    assert "deformable_detr_first_candidate_gate_not_passed" in codes
+    assert "official_ptm_checkpoints_not_staged" in codes
+    assert "official_ptms_not_full_gpu_qualified" in codes
+    assert document["predecessor_first_candidate_gates"]["rtdetr"][
+        "passed"
+    ] is True
+
+
+def test_successor_qualifies_every_official_ptm_on_direct_eight_gpu_sqsh():
+    document = read_json(HERE / "successor.contract.v1.json")
+    inventory = document["ptm_inventory"]
+    jobs = inventory["qualification_jobs"]
+
+    assert inventory["manual_ptm_selection"] is False
+    assert [item["ptm_id"] for item in jobs] == sorted(
+        item["id"] for item in inventory["records"]
+    )
+    assert len(jobs) == 2
+    for job in jobs:
+        resources = job["resources"]
+        assert resources["nodes"] == 1
+        assert resources["gpus_per_node"] == 8
+        assert resources["use_sqsh_conversion"] is False
+        assert resources["sqsh_path"].endswith(".sqsh")
+        assert job["production_preflight"]["cpu_load_smoke"] is False
+        assert job["train"]["spec"]["train"]["num_gpus"] == 8
+        assert job["train"]["spec"]["train"]["gpu_ids"] == list(range(8))
+        assert job["train"]["spec"]["train"]["is_dry_run"] is False
+        assert job["train"]["spec"]["dataset"]["eval_class_ids"] == [0, 1, 2, 3]
+        assert job["evaluate"]["spec"]["evaluate"]["num_gpus"] == 8
+        assert (
+            job["evaluate"]["test_metric_may_not_feed_automl_selection"]
+            is True
+        )
+
+
+def test_successor_mode_pilots_are_independent_and_algorithm_generated():
+    document = read_json(HERE / "successor.contract.v1.json")
+    jobs = document["automl_successor"]["mode_jobs"]
+
+    assert [item["mode"] for item in jobs] == list(MODES)
+    assert len(
+        {item["independent_observation_namespace"] for item in jobs}
+    ) == 3
+    assert all(item["observation_sharing"] is False for item in jobs)
+    assert all(item["candidate_generation"] == "algorithm_only" for item in jobs)
+    assert [item["acquisition"] for item in jobs] == [
+        "expected_improvement",
+        "constrained_expected_improvement",
+        "parego_expected_improvement",
+    ]
+    assert jobs[1]["objective"]["latency_accuracy_retention"][
+        "retained_fraction"
+    ] == pytest.approx(0.90)
+    assert jobs[0]["objective"]["latency_accuracy_retention"] is None
+    assert jobs[2]["objective"]["latency_accuracy_retention"] is None
