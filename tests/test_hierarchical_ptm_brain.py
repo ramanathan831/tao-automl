@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -370,6 +371,52 @@ def test_exact_resume_replays_next_arm_and_inner_acquisition():
     assert restored_raw == uninterrupted_raw
     assert restored_audit == uninterrupted_audit
     assert restored.scheduler.state_dict() == wrapper.scheduler.state_dict()
+
+
+def test_unbounded_schema_metadata_persists_as_strict_json_and_resumes(
+    tmp_path,
+):
+    parameter = _parameter(
+        "model.num_select",
+        minimum=1.0,
+        maximum=100.0,
+    )
+    parameter["valid_max"] = float("inf")
+    parameters = {
+        "dino.a": [parameter],
+        "dino.b": [_parameter("model.depth", minimum=1.0, maximum=6.0)],
+    }
+    store = FileStateStore(str(tmp_path))
+    store.save_job_specs(
+        "hierarchical-session",
+        {"train": {"num_epochs": 1}},
+    )
+    wrapper, _, _ = _make_brain(
+        store=store,
+        parameters=parameters,
+    )
+
+    wrapper.save_state()
+
+    persisted = store._read_json(
+        "brain",
+        "hierarchical-session.json",
+    )
+    tagged_maximum = persisted["signature"]["arms"]["dino.a"]["inner"][
+        "parameters"
+    ][0]["valid_max"]
+    assert tagged_maximum == {
+        "__automl_nonfinite__": "positive_infinity"
+    }
+    json.dumps(persisted, allow_nan=False)
+
+    restored, _, _ = _make_brain(
+        store=store,
+        parameters=parameters,
+        resume=True,
+    )
+    assert restored.signature == wrapper.signature
+    assert restored.signature_sha256 == wrapper.signature_sha256
 
 
 def test_wrapper_resume_accepts_legacy_implicit_accuracy_tolerance():

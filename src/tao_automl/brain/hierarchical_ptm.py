@@ -29,6 +29,7 @@ from tao_automl.ptm_search import (
 )
 from tao_automl.recommendation_audit import (
     algorithmic_campaign_flags,
+    audit_json_value,
     canonical_audit_sha256,
     validate_algorithmic_campaign_flags,
     validate_recommendation_audit,
@@ -393,26 +394,34 @@ class HierarchicalPTMBrain:
         }
 
     def _build_signature(self) -> dict[str, Any]:
-        return {
-            "schema_version": HIERARCHICAL_PTM_BRAIN_SCHEMA_VERSION,
-            "context_id": str(getattr(self.context, "id", "")),
-            "scheduler": copy.deepcopy(self.scheduler.signature),
-            "accuracy_metric": self.accuracy_metric,
-            "latency_metric": self.latency_metric,
-            "fidelity_metric": self.fidelity_metric,
-            "arms": {
-                arm_id: {
-                    "arm": self._arms[arm_id].to_dict(),
-                    "arm_sha256": canonical_audit_sha256(
-                        self._arms[arm_id].to_dict()
-                    ),
-                    "inner": self._inner_configuration(
-                        arm_id, self._fresh_inner_brains[arm_id]
-                    ),
-                }
-                for arm_id in sorted(self._arms)
-            },
-        }
+        # TAO schema metadata may use non-finite sentinels for an unbounded
+        # declared range (for example ``valid_max=inf``).  These are search
+        # space identity metadata, not measured objective values.  Persist
+        # their explicit audit tags so the state remains strict JSON without
+        # weakening finite-value validation at recommendation/result
+        # boundaries.  Operational parameter records remain unchanged.
+        return audit_json_value(
+            {
+                "schema_version": HIERARCHICAL_PTM_BRAIN_SCHEMA_VERSION,
+                "context_id": str(getattr(self.context, "id", "")),
+                "scheduler": copy.deepcopy(self.scheduler.signature),
+                "accuracy_metric": self.accuracy_metric,
+                "latency_metric": self.latency_metric,
+                "fidelity_metric": self.fidelity_metric,
+                "arms": {
+                    arm_id: {
+                        "arm": self._arms[arm_id].to_dict(),
+                        "arm_sha256": canonical_audit_sha256(
+                            self._arms[arm_id].to_dict()
+                        ),
+                        "inner": self._inner_configuration(
+                            arm_id, self._fresh_inner_brains[arm_id]
+                        ),
+                    }
+                    for arm_id in sorted(self._arms)
+                },
+            }
+        )
 
     @property
     def signature(self) -> dict[str, Any]:
