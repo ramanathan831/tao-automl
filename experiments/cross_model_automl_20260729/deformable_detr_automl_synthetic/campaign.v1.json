@@ -93,14 +93,14 @@
     "task": "object_detection"
   },
   "execution": {
-    "blocked_before_sdk_construction": true,
+    "blocked_before_sdk_construction": false,
     "cpu_runs": 0,
     "independent_mode_jobs": true,
     "kind": "objective_aware_three_mode_search",
     "local_model_runs": 0,
     "shared_archive": false,
     "smoke_runs": 0,
-    "submission_ready": false
+    "submission_ready": true
   },
   "failure_policy": {
     "manual_ptm_substitution": false,
@@ -316,14 +316,14 @@
     },
     "manifest_generator": {
       "path": "/localhome/local-rarunachalam/tao-automl/experiments/cross_model_automl_20260729/deformable_detr_automl_synthetic/manifest_generator.py",
-      "sha256": "e3b345157e9ccb8397de53ee6ad6e35af0c8d09604ce19a48e61cf8a90560238"
+      "sha256": "3644b139c208e6e224e8332dabf00c1bd1774652b679f4121b8a6d241729902a"
     },
     "qualification_evidence": {
       "path": "/localhome/local-rarunachalam/tao-automl/experiments/cross_model_automl_20260729/deformable_detr_automl_synthetic/qualification_evidence.py",
       "sha256": "188cd26b179d6eccd3c69e8e3b6b220cc64b37a69f3a0b443052ca9ca4c5f319"
     }
   },
-  "manifest_sha256": "c1e43bec53cca0db205b89d57dc7cbf69416a4706e114c42b27ce530ffa06c63",
+  "manifest_sha256": "2d49b2161ae54caf53f96845c2a1d2bd1e724c3175dae0f6f05937ef906f320c",
   "model": "deformable_detr",
   "modes": [
     {
@@ -505,8 +505,8 @@
       },
       "id": "deformable_detr.coco.gcvit_tiny.trainable.v1.0",
       "official_source": "ngc://nvidia/tao/pretrained_deformable_detr_coco:ddetr_gc_vit_tiny_trainable_v1.0#dd_gcvit_tiny_ep50.pth",
-      "registry_record_sha256": "2e5ad7a108c5600052fa776872f03a95860d05f8b4172dcc9416ceb9bed29189",
-      "registry_status": "unverified"
+      "registry_record_sha256": "40b20ea67ade840697115a486a8c6818466b04d1e37d9624043f8ed099710e8e",
+      "registry_status": "supported"
     },
     {
       "artifact": {
@@ -581,31 +581,14 @@
       },
       "id": "deformable_detr.coco.resnet50.trainable.v1.0",
       "official_source": "ngc://nvidia/tao/pretrained_deformable_detr_coco:ddetr_resnet_50_trainable_v1.0#dd_resnet50_ep50.pth",
-      "registry_record_sha256": "da38db132cbc839b88e9ad9e86210f6ebcd4b1a2539263da64d62e049c2e40c7",
-      "registry_status": "unverified"
+      "registry_record_sha256": "2e58aa9aa7e884fafb9b12961d52780b9c2f0c11a126bdbbddbe8e9c0d68013b",
+      "registry_status": "supported"
     }
   ],
   "qualification_evidence": {
     "adapter": "fail_closed_qualification_evidence_v1",
-    "blockers": [
-      {
-        "checkpoint_id": "deformable_detr.coco.gcvit_tiny.trainable.v1.0",
-        "code": "registry_status_not_supported",
-        "observed_status": "unverified",
-        "reason": "qualification evidence cannot promote or bypass the repository-owned PTM registry",
-        "required_status": "supported",
-        "stage": "registry_runtime_eligibility"
-      },
-      {
-        "checkpoint_id": "deformable_detr.coco.resnet50.trainable.v1.0",
-        "code": "registry_status_not_supported",
-        "observed_status": "unverified",
-        "reason": "qualification evidence cannot promote or bypass the repository-owned PTM registry",
-        "required_status": "supported",
-        "stage": "registry_runtime_eligibility"
-      }
-    ],
-    "decision_sha256": "dfca97c65990b9cd738d0a90d82fe3daa981d5ae6cc8e9cef3c25c3464705bd9",
+    "blockers": [],
+    "decision_sha256": "92a37e7bad406e9ca20ddc4edb7c281b0946cb304f8c398fa83d5a9821dbb2e2",
     "eligibility_policy": "qualification evidence is provenance only; production runtime requires status=supported and live typed preflight",
     "evidence_path": "/localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/deformable_detr_synthetic_qualification_20260730/completion.json",
     "evidence_sha256": "9a3e397a41c1ae576a633d4ee7aaf41bc1a5408da86768fe7ecfe94d4c6ab622",
@@ -643,7 +626,7 @@
         "terminal_checkpoint_size_bytes": 487767215
       }
     ],
-    "runtime_ready": false,
+    "runtime_ready": true,
     "schema_version": 1
   },
   "runtime": {
@@ -753,11 +736,11 @@
     "selector_invoked_on_matched_measurements": false
   },
   "source": {
-    "commit": "ff0319c5f06ed7087fb69c674c80573becad980e",
+    "commit": "c0c15d3f727c685acbffa005d60772e1ad7acba3",
     "launch_head_policy": "clean_descendant",
     "repository": "/localhome/local-rarunachalam/tao-automl",
-    "wheel_path": "/localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/wheel/8c50883c2bf4/nvidia_tao_automl-0.1.0-py3-none-any.whl",
-    "wheel_sha256": "f9ab78c92e29d32f41e0909ccc7969b87b0d717b180e560eee754a1879482393"
+    "wheel_path": "/localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/wheel/af06b3073155/nvidia_tao_automl-0.1.0-py3-none-any.whl",
+    "wheel_sha256": "af06b3073155372cfb3392a71631aa0b350dbf54fea05ff5b5243809af191173"
   },
   "task": "object_detection"
 }
