@@ -816,6 +816,14 @@ def _default_policies() -> tuple[MetricSanityPolicy, ...]:
             source_module="pl_rtdetr_model.py",
         )
     )
+    policies.extend(
+        _detection_policies(
+            model="grounding_dino",
+            model_aliases=("grounding-dino",),
+            source_model="grounding_dino",
+            source_module="pl_gdino_model.py",
+        )
+    )
     policies.extend((
         MetricSanityPolicy(
             policy_id="grounding_dino.referring_box_pr50",

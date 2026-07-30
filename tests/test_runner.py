@@ -1102,6 +1102,39 @@ def test_extract_metric_allows_val_prefix_for_sparse4d_map():
     assert _extract_metric_from_logs(logs, "val_mAP") == 0.0
 
 
+def test_extract_metric_reads_grounding_dino_validation_map50_only():
+    from tao_automl.runner import _extract_metric_from_logs
+
+    logs = "Validation mAP50 : 0.6175\nTest mAP50 : 0.9999\n"
+
+    assert _extract_metric_from_logs(logs, "val_mAP50") == pytest.approx(
+        0.6175
+    )
+    assert _extract_metric_from_logs("test_mAP50: 0.9999\n", "val_mAP50") is None
+
+
+def test_extract_metric_reads_grounding_dino_string_status_kpi(tmp_path):
+    from tao_automl.runner import _extract_metric_from_status_file
+
+    status_path = tmp_path / "status.json"
+    status_path.write_text(
+        json.dumps(
+            {
+                "message": "Eval metrics generated.",
+                "kpi": {"val_mAP50": "0.6175134981"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert _extract_metric_from_status_file(
+        status_path,
+        "val_mAP50",
+    ) == pytest.approx(0.6175134981)
+    assert _extract_metric_from_status_file(status_path, "test_mAP50") is None
+
+
 def test_extract_metric_supports_signed_values_and_exact_aliases():
     from tao_automl.runner import _extract_metric_from_logs
 

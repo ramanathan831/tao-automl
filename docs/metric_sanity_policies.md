@@ -40,6 +40,7 @@ The source inspection below is pinned to TAO PyTorch commit
 | DINO | Object detection | `val_mAP`, `val_mAP50` | `[0, 1]` fraction | Supported | `dino/model/pl_dino_model.py` logs COCO `bbox.stats[0:2]` directly. |
 | Deformable DETR | Object detection | `val_mAP`, `val_mAP50` | `[0, 1]` fraction | Supported | `deformable_detr/model/pl_dd_model.py` logs COCO `bbox.stats[0:2]` directly. |
 | RT-DETR | Object detection | `val_mAP`, `val_mAP50` | `[0, 1]` fraction | Supported | `rtdetr/model/pl_rtdetr_model.py` logs COCO `bbox.stats[0:2]` directly. |
+| Grounding DINO | Category-prompted object detection | `val_mAP`, `val_mAP50` | `[0, 1]` fraction | Supported | The validation loader uses contiguous-ID COCO and the model logs unscaled COCO bbox AP/AP50. This policy does not turn plain category annotations into referring expressions. |
 | Grounding DINO | Referring-expression box grounding | `val_Pr@0.5` | Unverified | Blocked | The inspected validation loader uses `CocoDetection`, and the model validation path emits COCO AP rather than a phrase-grounding `Pr@0.5` contract. |
 | SegFormer | Semantic segmentation | `val_miou` | `[0, 1]` fraction | Supported | `segformer/utils/iou_metric.py` averages intersection/union ratios and `segformer_pl_model.py` reports `val_miou`. |
 | OneFormer | Panoptic segmentation | `PQ` | Unverified | Blocked | The inspected validation path reports semantic mIoU and accuracy, not PQ. |

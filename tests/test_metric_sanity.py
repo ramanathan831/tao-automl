@@ -53,6 +53,13 @@ def _reason_codes(decision):
         ("rtdetr", "val_mAP", "object_detection", "fraction", "supported"),
         (
             "grounding_dino",
+            "val_mAP50",
+            "object_detection",
+            "fraction",
+            "supported",
+        ),
+        (
+            "grounding_dino",
             "val_Pr@0.5",
             "referring_expression_box_grounding",
             "unverified",
@@ -110,7 +117,10 @@ def test_registry_covers_required_model_task_metric_contracts(
     assert policy.source_evidence
 
 
-@pytest.mark.parametrize("model", ["dino", "deformable_detr", "rtdetr"])
+@pytest.mark.parametrize(
+    "model",
+    ["dino", "deformable_detr", "rtdetr", "grounding_dino"],
+)
 @pytest.mark.parametrize("metric", ["val_mAP", "val_mAP50"])
 @pytest.mark.parametrize("value", [0.0, 0.007, 0.5, 1.0])
 def test_detection_coco_ap_fraction_range_has_no_universal_point_one_floor(
@@ -129,7 +139,10 @@ def test_detection_coco_ap_fraction_range_has_no_universal_point_one_floor(
     assert decision.metric_value == value
 
 
-@pytest.mark.parametrize("model", ["dino", "deformable_detr", "rtdetr"])
+@pytest.mark.parametrize(
+    "model",
+    ["dino", "deformable_detr", "rtdetr", "grounding_dino"],
+)
 @pytest.mark.parametrize(
     ("value", "expected_code"),
     [
@@ -278,6 +291,21 @@ def test_unverified_runtime_metric_contracts_fail_closed(model, metric):
     reason = decision.reasons[0].to_dict()
     assert reason["details"]["scale"] == "unverified"
     assert reason["details"]["policy_id"] == decision.policy_id
+
+
+def test_grounding_dino_detection_and_referring_metrics_remain_distinct():
+    registry = default_metric_sanity_registry()
+
+    detection = registry.resolve("grounding-dino", "mAP50")
+    referring = registry.resolve("grounding_dino", "Pr@0.5")
+
+    assert detection.task == "object_detection"
+    assert detection.availability == "supported"
+    assert detection.scale == "fraction"
+    assert referring.task == "referring_expression_box_grounding"
+    assert referring.availability == "blocked"
+    assert referring.scale == "unverified"
+    assert detection.policy_id != referring.policy_id
 
 
 def test_mask_grounding_dino_legacy_ciou_is_not_overall_iou_alias():
