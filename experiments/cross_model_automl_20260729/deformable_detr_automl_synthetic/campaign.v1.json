@@ -304,7 +304,7 @@
   "launcher_integrity": {
     "campaign_controller": {
       "path": "/localhome/local-rarunachalam/tao-automl/experiments/cross_model_automl_20260729/deformable_detr_automl_synthetic/run_campaign.py",
-      "sha256": "b00fb18de561b48ca193315685aa33b09b5bf67b9669a452228cbb9b974b1a0d"
+      "sha256": "4f5140b59f73c01c89ed720f24908cb6d39e23d3f8b553265c0ef055969195a3"
     },
     "latency_input": {
       "path": "/localhome/local-rarunachalam/tao-automl/experiments/cross_model_automl_20260729/deformable_detr_automl_synthetic/latency_input.v1.json",
@@ -316,14 +316,14 @@
     },
     "manifest_generator": {
       "path": "/localhome/local-rarunachalam/tao-automl/experiments/cross_model_automl_20260729/deformable_detr_automl_synthetic/manifest_generator.py",
-      "sha256": "3644b139c208e6e224e8332dabf00c1bd1774652b679f4121b8a6d241729902a"
+      "sha256": "8e69f978325c43019a3d2bbf0e50944da8346e02b19cff9b548069c5361141dc"
     },
     "qualification_evidence": {
       "path": "/localhome/local-rarunachalam/tao-automl/experiments/cross_model_automl_20260729/deformable_detr_automl_synthetic/qualification_evidence.py",
       "sha256": "188cd26b179d6eccd3c69e8e3b6b220cc64b37a69f3a0b443052ca9ca4c5f319"
     }
   },
-  "manifest_sha256": "af0a5577db308c88d8e777d3a8a4f554eb29de448edb627e304d58cd85d53e68",
+  "manifest_sha256": "09285bf1d9479c35348c82d81a7e5786e17972aeded96fcaf3bc17d49f9783cc",
   "model": "deformable_detr",
   "modes": [
     {
@@ -635,6 +635,7 @@
     "container_mounts": "/lustre",
     "distributed_workers_per_child": 8,
     "evaluate_template_sha256": "b869b869378ed55713349c44ef4a965fbbbb0392bb9cc29fd12560945de73151",
+    "export_template_sha256": "3ff3a1f7d6ce4c53f43b5fdfb9695d4a5d430c9e4587565c0d337a87eb0b3c25",
     "gpus_per_child": 8,
     "hardware_contract": {
       "compute_capability": "8.0",
@@ -736,7 +737,7 @@
     "selector_invoked_on_matched_measurements": false
   },
   "source": {
-    "commit": "d56e1a7d05b7d9c5535e079c48359a64d921138c",
+    "commit": "d527c5091af4e741b045fdbcfc37fac114991f03",
     "launch_head_policy": "clean_descendant",
     "repository": "/localhome/local-rarunachalam/tao-automl",
     "wheel_path": "/localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/wheel/af06b3073155/nvidia_tao_automl-0.1.0-py3-none-any.whl",
