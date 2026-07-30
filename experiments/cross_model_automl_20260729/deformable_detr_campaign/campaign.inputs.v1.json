@@ -1,7 +1,7 @@
 {
   "campaign_id": "deformable-detr-voc2007-ptm-qualification-20260730",
   "source": {
-    "commit": "04bb38e446978d2f24d9ee74adc882bbd8e16af4",
+    "commit": "5c45bb6d60d43b53311207cc3aec3d37791d5ffd",
     "repository": "/localhome/local-rarunachalam/tao-automl"
   },
   "runtime": {
