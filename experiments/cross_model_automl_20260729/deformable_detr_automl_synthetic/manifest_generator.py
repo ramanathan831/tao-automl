@@ -43,7 +43,7 @@ DEFAULT_OUTPUT = HERE / "campaign.v1.json"
 LATENCY_INPUT_MANIFEST = HERE / "latency_input.v1.json"
 WHEEL_PATH = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
-    "cross_model_automl_20260729/wheel/8c50883c2bf4/"
+    "cross_model_automl_20260729/wheel/af06b3073155/"
     "nvidia_tao_automl-0.1.0-py3-none-any.whl"
 )
 SKILL_DIR = Path(
