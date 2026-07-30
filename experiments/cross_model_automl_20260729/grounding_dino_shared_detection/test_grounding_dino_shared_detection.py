@@ -215,3 +215,11 @@ def test_preparation_hash_detects_mutation(preparation):
     changed["execution"]["jobs_submitted"] = 1
     with pytest.raises(PreparationError, match="model execution"):
         validate_preparation(changed)
+
+
+def test_committed_preparation_artifact_is_valid_and_non_launching():
+    document = read_json(HERE / "campaign.preparation.v1.json")
+    validate_preparation(document)
+    assert document["automatic_gate"]["launch_authorized"] is False
+    assert document["execution"]["jobs_submitted"] == 0
+    assert document["source"]["dirty"] is False
