@@ -495,6 +495,44 @@ def test_resume_rejects_unrelated_failure(manifest, tmp_path):
         )
 
 
+def test_resume_completion_reuses_four_trains_and_validates(
+    manifest, tmp_path
+):
+    workflow_ids = tuple(item["workflow_id"] for item in manifest["ptms"])
+    artifact_name = manifest["resume_contract"][
+        "resume_workflow_artifact_name"
+    ]
+    for workflow_id in workflow_ids:
+        record = _successful_workflow(manifest, workflow_id)
+        record["resume"] = {
+            "completed_training_job_reused": True,
+            "training_job_submitted": False,
+            "prior_workflow_artifact_modified": False,
+        }
+        run_campaign.atomic_json(
+            tmp_path / workflow_id / artifact_name,
+            record,
+        )
+    completion = resume_evaluation.build_resume_completion(
+        manifest,
+        tmp_path,
+        workflow_ids,
+        {workflow_id: 0 for workflow_id in workflow_ids},
+        {
+            "path": "/immutable/completion.json",
+            "file_sha256": "a" * 64,
+            "completion_sha256": "b" * 64,
+            "manifest_sha256": manifest["resume_contract"][
+                "prior_manifest"
+            ]["manifest_sha256"],
+        },
+    )
+    assert completion["completed_training_jobs_reused"] == 4
+    assert completion["training_jobs_submitted"] == 0
+    assert completion["prior_completion_artifact_modified"] is False
+    assert run_campaign.validate_completion(completion, manifest) == completion
+
+
 def test_resume_launch_requires_explicit_acknowledgement():
     with pytest.raises(
         run_campaign.CampaignExecutionError,
