@@ -344,12 +344,14 @@ def build_manifest() -> dict[str, Any]:
     schema = SKILL_DIR / "schemas/train.schema.json"
     template_train = SKILL_DIR / "references/spec_template_train.yaml"
     template_evaluate = SKILL_DIR / "references/spec_template_evaluate.yaml"
+    template_export = SKILL_DIR / "references/spec_template_export.yaml"
     required_files = (
         WHEEL_PATH,
         skill_info,
         schema,
         template_train,
         template_evaluate,
+        template_export,
     )
     for path in required_files:
         if not path.is_file():
@@ -424,6 +426,7 @@ def build_manifest() -> dict[str, Any]:
             "train_schema_sha256": sha256_file(schema),
             "train_template_sha256": sha256_file(template_train),
             "evaluate_template_sha256": sha256_file(template_evaluate),
+            "export_template_sha256": sha256_file(template_export),
             "image_reference": (
                 "nvcr.io/nvstaging/tao/"
                 "tao-toolkit-pyt:7.1.0-rc-245-multiarch"
@@ -583,6 +586,15 @@ def validate_manifest(
         or runtime.get("sqsh_path") != SQSH_PATH
         or runtime.get("nodes_per_child") != 1
         or runtime.get("gpus_per_child") != 8
+        or any(
+            not isinstance(runtime.get(field), str)
+            or len(runtime[field]) != 64
+            for field in (
+                "train_template_sha256",
+                "evaluate_template_sha256",
+                "export_template_sha256",
+            )
+        )
     ):
         raise ManifestError("SLURM/SQSH resource contract changed")
     launcher_integrity = value.get("launcher_integrity")

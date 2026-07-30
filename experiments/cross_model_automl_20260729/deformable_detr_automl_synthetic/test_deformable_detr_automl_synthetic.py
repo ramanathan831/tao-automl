@@ -78,6 +78,7 @@ def test_runtime_uses_packaged_skill_schema_and_pinned_sqsh(manifest):
     assert len(runtime["train_schema_sha256"]) == 64
     assert len(runtime["train_template_sha256"]) == 64
     assert len(runtime["evaluate_template_sha256"]) == 64
+    assert len(runtime["export_template_sha256"]) == 64
 
 
 def test_mode_acquisitions_are_separate_and_objective_aware(manifest):
@@ -184,9 +185,22 @@ def test_evaluation_adapter_carries_candidate_architecture(manifest):
         "/lustre/results/candidate.pth"
     )
     assert result["evaluate"]["num_gpus"] == 8
+    assert result["export"]["format"] == "onnx"
     assert result["dataset"]["test_data_sources"]["json_file"].endswith(
         "/val/annotations.json"
     )
+
+    tampered = copy.deepcopy(manifest)
+    tampered["runtime"]["export_template_sha256"] = "0" * 64
+    with pytest.raises(
+        run_campaign.CampaignExecutionError,
+        match="spec_template_export.yaml changed after campaign sealing",
+    ):
+        run_campaign.build_evaluation_spec(
+            tampered,
+            {"model": {"num_queries": 100}},
+            "/lustre/results/candidate.pth",
+        )
 
 
 def test_latency_input_manifest_records_actual_annotation_order(manifest):
@@ -309,6 +323,80 @@ def test_first_candidate_failure_halts_before_release(manifest, tmp_path):
     ):
         gate.wait_for_release()
     assert not (tmp_path / "automatic_release.json").exists()
+
+
+def test_candidate_adapter_raises_after_recording_first_candidate_failure(
+    manifest,
+    tmp_path,
+):
+    gate = run_campaign.AutomaticFirstCandidateGate(
+        tmp_path / "first_candidate_gate",
+        manifest,
+        poll_seconds=0.001,
+        timeout_seconds=1,
+    )
+    evaluator = run_campaign.DeformableDETRCandidateEvaluator(
+        sdk=object(),
+        manifest=manifest,
+        mode="latency",
+        runtime_root=tmp_path,
+        gate=gate,
+    )
+    recommendation = SimpleNamespace(
+        id=0,
+        failure_reason="required_eval_fn_failed:latency worker failed",
+    )
+
+    with pytest.raises(
+        run_campaign.CampaignExecutionError,
+        match="latency_rec_0 failed the automatic first-candidate gate",
+    ):
+        evaluator.on_result(recommendation, None, "failure")
+
+    gate_record = json.loads(
+        (
+            tmp_path
+            / "first_candidate_gate"
+            / "latency.json"
+        ).read_text()
+    )
+    assert gate_record["passed"] is False
+    assert not (
+        tmp_path / "first_candidate_gate" / "automatic_release.json"
+    ).exists()
+
+
+def test_candidate_adapter_blocks_second_candidate_before_job_launch(
+    manifest,
+    tmp_path,
+):
+    gate = run_campaign.AutomaticFirstCandidateGate(
+        tmp_path / "first_candidate_gate",
+        manifest,
+        poll_seconds=0.001,
+        timeout_seconds=1,
+    )
+    gate.record(
+        "latency",
+        candidate_id="latency_rec_0",
+        passed=False,
+        evidence_sha256=None,
+        reason="required latency worker failed",
+    )
+    evaluator = run_campaign.DeformableDETRCandidateEvaluator(
+        sdk=object(),
+        manifest=manifest,
+        mode="latency",
+        runtime_root=tmp_path,
+        gate=gate,
+    )
+
+    with pytest.raises(
+        run_campaign.CampaignExecutionError,
+        match="first-candidate gate failed: latency",
+    ):
+        evaluator.on_recommendation(SimpleNamespace(id=1))
+    assert not evaluator.evidence_path.exists()
 
 
 def test_qualification_adapter_gates_on_shared_dataset_campaign(manifest):

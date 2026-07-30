@@ -350,17 +350,62 @@ def nested_spec_overrides(manifest: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _load_skill_template(
+    manifest: Mapping[str, Any],
+    *,
+    filename: str,
+    digest_field: str,
+) -> dict[str, Any]:
+    """Load one skill template only after checking its sealed identity."""
+    template = (
+        Path(manifest["runtime"]["skill_dir"])
+        / "references"
+        / filename
+    )
+    if not template.is_file():
+        raise CampaignExecutionError(
+            f"skill template is unavailable: {template}"
+        )
+    observed_sha = hashlib.sha256(template.read_bytes()).hexdigest()
+    if observed_sha != manifest["runtime"].get(digest_field):
+        raise CampaignExecutionError(
+            f"skill {filename} changed after campaign sealing"
+        )
+    value = yaml.safe_load(template.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise CampaignExecutionError(
+            f"skill {filename} must contain a mapping"
+        )
+    return value
+
+
 def build_evaluation_spec(
     manifest: Mapping[str, Any],
     recommendation_specs: Mapping[str, Any],
     checkpoint: str,
 ) -> dict[str, Any]:
     """Carry candidate architecture values into standalone full validation."""
-    template = (
-        Path(manifest["runtime"]["skill_dir"])
-        / "references/spec_template_evaluate.yaml"
+    specification = _load_skill_template(
+        manifest,
+        filename="spec_template_evaluate.yaml",
+        digest_field="evaluate_template_sha256",
     )
-    specification = yaml.safe_load(template.read_text(encoding="utf-8"))
+    export_template = _load_skill_template(
+        manifest,
+        filename="spec_template_export.yaml",
+        digest_field="export_template_sha256",
+    )
+    export_defaults = export_template.get("export")
+    if not isinstance(export_defaults, Mapping):
+        raise CampaignExecutionError(
+            "skill export template has no export configuration"
+        )
+    # DeformableDETRModel reads export.format while constructing the model,
+    # including for checkpoint-backed evaluation/latency.  The action-specific
+    # evaluate template omits this section because the TAO launcher normally
+    # merges dataclass defaults.  The standalone latency worker receives raw
+    # OmegaConf, so carry the sealed official export defaults explicitly.
+    specification["export"] = copy.deepcopy(dict(export_defaults))
 
     def merge(base: dict[str, Any], overlay: Mapping[str, Any]) -> None:
         for key, value in overlay.items():
@@ -732,6 +777,12 @@ class DeformableDETRCandidateEvaluator:
     def on_recommendation(self, recommendation: Any) -> None:
         from tao_automl.selection import canonical_spec_fingerprint
 
+        if int(recommendation.id) > 0:
+            # This callback runs before SDK job creation. It is also the
+            # resume-safe backstop when a result callback was interrupted or
+            # swallowed: no post-pilot candidate may launch until all three
+            # rec_0 records passed the frozen barrier.
+            self.gate.wait_for_release()
         candidate_id = f"{self.mode}_rec_{recommendation.id}"
         fingerprint = canonical_spec_fingerprint(recommendation.specs)
         audit = copy.deepcopy(recommendation.recommendation_audit)
@@ -853,6 +904,7 @@ class DeformableDETRCandidateEvaluator:
         record = self.evidence.setdefault(candidate_id, {})
         record["automl_status"] = status
         record["reported_metric"] = metric
+        first_candidate_failed = False
         if str(status).lower() not in {"success", "done"}:
             record["status"] = "terminal_failure"
             record["failure_reason"] = getattr(
@@ -867,7 +919,12 @@ class DeformableDETRCandidateEvaluator:
                     reason=record["failure_reason"]
                     or "first recommendation failed",
                 )
+                first_candidate_failed = True
         self._persist()
+        if first_candidate_failed:
+            raise CampaignExecutionError(
+                f"{candidate_id} failed the automatic first-candidate gate"
+            )
 
 
 class AutomaticFirstCandidateGate:
@@ -1023,6 +1080,16 @@ def launch_plan(manifest: Mapping[str, Any]) -> dict[str, Any]:
 
 def assert_launchable(manifest: Mapping[str, Any]) -> None:
     """Re-audit the immutable evidence immediately before any SDK creation."""
+    for filename, digest_field in (
+        ("spec_template_train.yaml", "train_template_sha256"),
+        ("spec_template_evaluate.yaml", "evaluate_template_sha256"),
+        ("spec_template_export.yaml", "export_template_sha256"),
+    ):
+        _load_skill_template(
+            manifest,
+            filename=filename,
+            digest_field=digest_field,
+        )
     decision = audit_qualification_evidence()
     if decision.to_dict() != manifest["qualification_evidence"]:
         raise CampaignExecutionError(
@@ -1155,25 +1222,11 @@ def skill_base_model_defaults(
     manifest: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Load the exact skill-owned train template bound into the manifest."""
-    template = (
-        Path(manifest["runtime"]["skill_dir"])
-        / "references/spec_template_train.yaml"
+    return _load_skill_template(
+        manifest,
+        filename="spec_template_train.yaml",
+        digest_field="train_template_sha256",
     )
-    if not template.is_file():
-        raise CampaignExecutionError(
-            f"skill train template is unavailable: {template}"
-        )
-    observed_sha = hashlib.sha256(template.read_bytes()).hexdigest()
-    if observed_sha != manifest["runtime"]["train_template_sha256"]:
-        raise CampaignExecutionError(
-            "skill train template changed after campaign sealing"
-        )
-    defaults = yaml.safe_load(template.read_text(encoding="utf-8"))
-    if not isinstance(defaults, dict):
-        raise CampaignExecutionError(
-            "skill train template must contain a mapping"
-        )
-    return defaults
 
 
 def run_mode(
