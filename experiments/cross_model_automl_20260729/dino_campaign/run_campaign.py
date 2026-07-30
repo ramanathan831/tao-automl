@@ -810,7 +810,12 @@ def _install_payload(manifest: Mapping[str, Any]) -> str:
         "[(root/name).write_bytes(base64.b64decode(data)) "
         "for name,data in files.items()]"
     )
-    return f"python -c {shlex.quote(script)}"
+    # The SDK runner resolves only ``{config_path}`` at container start with
+    # ``str.format``.  The embedded JSON mapping also contains braces, so make
+    # those braces literal for that later formatting pass.  Keep the actual
+    # config placeholder outside this payload unescaped in ``_launch_latency``.
+    command = f"python -c {shlex.quote(script)}"
+    return command.replace("{", "{{").replace("}", "}}")
 
 
 def _latency_contract_document(

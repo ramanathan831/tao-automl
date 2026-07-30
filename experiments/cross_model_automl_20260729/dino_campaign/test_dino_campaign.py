@@ -519,6 +519,19 @@ def test_evaluation_child_job_is_persisted_and_reused(
     assert sdk.created == 1
 
 
+def test_latency_install_payload_survives_sdk_config_path_formatting(
+    sealed_manifest,
+):
+    payload = run_campaign._install_payload(sealed_manifest)
+    command = f"{payload} && worker --config {{config_path}}"
+
+    resolved = command.format(config_path="/tmp/spec.yaml")
+
+    assert "tao_automl/__init__.py" in resolved
+    assert "dino_latency_worker.py" in resolved
+    assert "worker --config /tmp/spec.yaml" in resolved
+
+
 def test_latency_child_job_is_persisted_and_reused(
     sealed_manifest,
     monkeypatch: pytest.MonkeyPatch,
