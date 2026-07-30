@@ -122,11 +122,17 @@ def verify_local_launch_contract(
         HERE / "campaign.inputs.v1.json": integrity["inputs_sha256"],
         HERE / "manifest_generator.py": integrity["manifest_generator_sha256"],
         HERE / "run_campaign.py": integrity["launcher_sha256"],
+        HERE / "resume_evaluation.py": integrity[
+            "resume_launcher_sha256"
+        ],
         (
             HERE.parent
             / "deformable_detr_campaign"
             / "run_campaign.py"
         ): integrity["workflow_support_sha256"],
+        manifest_generator.PRIOR_MANIFEST: integrity[
+            "prior_manifest_file_sha256"
+        ],
         Path(manifest["dataset"]["manifest"]["path"]): manifest["dataset"][
             "manifest"
         ]["sha256"],
@@ -537,6 +543,85 @@ def _submit_job(sdk: Any, manifest: Mapping[str, Any], command: str) -> Any:
     )
 
 
+def _terminal_checkpoint(
+    sdk: Any,
+    job_id: str,
+    *,
+    training_epochs: int,
+) -> dict[str, Any]:
+    """Resolve RT-DETR's exact terminal checkpoint, failing on ambiguity.
+
+    RT-DETR emits ``model_epoch_NNN.pth``. It does not use the
+    ``model_epoch_NNN_step_*.pth`` convention used by Deformable DETR.
+    Candidate enumeration order is never used to choose a checkpoint.
+    """
+    root = workflow_support._local_lustre_path(
+        sdk.get_job_results_dir(job_id)
+    )
+    terminal_epoch_index = training_epochs - 1
+    filename = f"model_epoch_{terminal_epoch_index:03d}.pth"
+    train_dir = f"{root.rstrip('/')}/results_dir/train"
+    expected_path = f"{train_dir}/{filename}"
+    paths = sorted(
+        {
+            line.strip()
+            for line in remote_output(
+                f"find {shlex.quote(train_dir)} -maxdepth 1 -type f "
+                f"-name {shlex.quote(filename)} -print"
+            ).splitlines()
+            if line.strip()
+        }
+    )
+    if len(paths) != 1:
+        rendered = ", ".join(paths) if paths else "<none>"
+        raise CampaignExecutionError(
+            f"RT-DETR training job {job_id} emitted {len(paths)} exact "
+            f"{filename!r} terminal checkpoints; matches={rendered}"
+        )
+    checkpoint = paths[0]
+    if checkpoint != expected_path:
+        raise CampaignExecutionError(
+            "RT-DETR terminal checkpoint did not resolve to its exact "
+            f"train output path: {checkpoint}"
+        )
+    identity = remote_output(
+        " ".join(
+            [
+                "stat -c '%s'",
+                shlex.quote(checkpoint),
+                "&& sha256sum",
+                shlex.quote(checkpoint),
+            ]
+        ),
+        timeout=1800,
+    ).strip().splitlines()
+    if len(identity) != 2:
+        raise CampaignExecutionError(
+            "RT-DETR terminal checkpoint identity probe was incomplete"
+        )
+    try:
+        size = int(identity[0])
+    except ValueError as exc:
+        raise CampaignExecutionError(
+            "RT-DETR terminal checkpoint size was invalid"
+        ) from exc
+    digest = identity[1].split()[0]
+    if size <= 0 or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise CampaignExecutionError(
+            "RT-DETR terminal checkpoint identity was invalid"
+        )
+    return {
+        "path": checkpoint,
+        "sha256": digest,
+        "size_bytes": size,
+        "training_epochs": training_epochs,
+        "terminal_epoch_index": terminal_epoch_index,
+        "filename": filename,
+        "naming_contract": "rtdetr_model_epoch_without_step_suffix",
+        "ambiguity_policy": "fail_closed",
+    }
+
+
 def _run_workflow(
     manifest_path: str,
     runtime_root: str,
@@ -614,7 +699,7 @@ def _run_workflow(
                 expected_validation_records=10,
             )
         )
-        checkpoint = workflow_support._terminal_checkpoint(
+        checkpoint = _terminal_checkpoint(
             sdk,
             train_job.id,
             training_epochs=10,

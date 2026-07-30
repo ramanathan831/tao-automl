@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from . import manifest_generator
+from . import resume_evaluation
 from . import run_campaign
 
 
@@ -93,6 +94,11 @@ def test_manifest_is_exactly_four_direct_full_gpu_workflows(manifest):
     assert manifest["runtime"]["sqsh_path"].endswith(".sqsh")
     assert manifest["runtime"]["sqsh_direct_path"] is True
     assert manifest["runtime"]["slurm_image_conversion"] is False
+    assert manifest["checkpoint_resolution"] == (
+        manifest_generator.RTDETR_CHECKPOINT_CONTRACT
+    )
+    assert manifest["resume_contract"]["training_job_resubmission"] is False
+    assert manifest["resume_contract"]["prior_workflow_artifact_immutable"] is True
     assert tuple(item["id"] for item in manifest["ptms"]) == (
         manifest_generator.EXPECTED_PTMS
     )
@@ -176,7 +182,7 @@ def test_train_spec_is_ten_epoch_full_dataset_torchrun_ddp(
 def test_standalone_evaluation_uses_dict_source_and_terminal_checkpoint(
     manifest, workflow_id
 ):
-    checkpoint = f"/lustre/results/{workflow_id}/model_epoch_009_step_100.pth"
+    checkpoint = f"/lustre/results/{workflow_id}/model_epoch_009.pth"
     train = run_campaign.build_train_spec(manifest, workflow_id)
     evaluate = run_campaign.build_evaluation_spec(
         manifest, workflow_id, checkpoint
@@ -311,6 +317,196 @@ def test_runtime_disables_conversion_but_submits_pinned_sqsh(
             "account": manifest["runtime"]["account"],
         }
     ]
+
+
+def test_rtdetr_terminal_checkpoint_uses_exact_model_epoch_name(monkeypatch):
+    class SDK:
+        @staticmethod
+        def get_job_results_dir(_job_id):
+            return "lustre:///lustre/results/job"
+
+    calls = []
+
+    def remote(command, *, timeout=900):
+        calls.append((command, timeout))
+        if command.startswith("find "):
+            return (
+                "/lustre/results/job/results_dir/train/"
+                "model_epoch_009.pth\n"
+            )
+        return "357713264\n" + "a" * 64 + "  model_epoch_009.pth\n"
+
+    monkeypatch.setattr(run_campaign, "remote_output", remote)
+    checkpoint = run_campaign._terminal_checkpoint(
+        SDK(), "job-id", training_epochs=10
+    )
+    assert checkpoint == {
+        "path": (
+            "/lustre/results/job/results_dir/train/model_epoch_009.pth"
+        ),
+        "sha256": "a" * 64,
+        "size_bytes": 357713264,
+        "training_epochs": 10,
+        "terminal_epoch_index": 9,
+        "filename": "model_epoch_009.pth",
+        "naming_contract": "rtdetr_model_epoch_without_step_suffix",
+        "ambiguity_policy": "fail_closed",
+    }
+    assert "-maxdepth 1" in calls[0][0]
+    assert "model_epoch_009.pth" in calls[0][0]
+    assert "_step_" not in calls[0][0]
+
+
+def test_rtdetr_terminal_checkpoint_rejects_ambiguity_deterministically(
+    monkeypatch,
+):
+    class SDK:
+        @staticmethod
+        def get_job_results_dir(_job_id):
+            return "/lustre/results/job"
+
+    monkeypatch.setattr(
+        run_campaign,
+        "remote_output",
+        lambda *_args, **_kwargs: (
+            "/lustre/results/job/z/model_epoch_009.pth\n"
+            "/lustre/results/job/a/model_epoch_009.pth\n"
+        ),
+    )
+    with pytest.raises(
+        run_campaign.CampaignExecutionError,
+        match=(
+            "emitted 2 exact 'model_epoch_009.pth'.*"
+            "matches=/lustre/results/job/a/.*, /lustre/results/job/z/"
+        ),
+    ):
+        run_campaign._terminal_checkpoint(
+            SDK(), "job-id", training_epochs=10
+        )
+
+
+def test_rtdetr_terminal_checkpoint_rejects_zero_matches(monkeypatch):
+    class SDK:
+        @staticmethod
+        def get_job_results_dir(_job_id):
+            return "/lustre/results/job"
+
+    monkeypatch.setattr(
+        run_campaign,
+        "remote_output",
+        lambda *_args, **_kwargs: "",
+    )
+    with pytest.raises(
+        run_campaign.CampaignExecutionError,
+        match="emitted 0 exact 'model_epoch_009.pth'.*matches=<none>",
+    ):
+        run_campaign._terminal_checkpoint(
+            SDK(), "job-id", training_epochs=10
+        )
+
+
+def _completed_training_failure(manifest, workflow_id):
+    record = run_campaign._initial_workflow(manifest, workflow_id)
+    record["manifest_sha256"] = manifest["resume_contract"][
+        "prior_manifest"
+    ]["manifest_sha256"]
+    job_id = "01bd6228-ff82-4f04-a290-711ba45456f0"
+    record.update(
+        {
+            "status": "terminal_failure",
+            "terminal": True,
+            "failure_preserved": True,
+            "failure": {
+                "type": "CampaignExecutionError",
+                "message": (
+                    f"training job {job_id} emitted 0 exact "
+                    "'model_epoch_009_step_*.pth' terminal checkpoints"
+                ),
+                "replacement_submitted": False,
+            },
+            "jobs": {
+                "train": {
+                    "tao_job_id": job_id,
+                    "status": "Complete",
+                    "result_root": f"/lustre/results/{job_id}",
+                    "status_evidence": {
+                        "path": (
+                            f"/lustre/results/{job_id}/results_dir/"
+                            "train/status.json"
+                        ),
+                        "sha256": "a" * 64,
+                        "size_bytes": 123,
+                        "record_count": 11,
+                        "validation_record_count": 10,
+                        "validation_metrics": [
+                            {"mAP": 0.2, "mAP50": 0.4}
+                            for _ in range(10)
+                        ],
+                        "terminal_success_message": (
+                            "Train finished successfully."
+                        ),
+                        "terminal_success": True,
+                    },
+                }
+            },
+        }
+    )
+    return record
+
+
+def test_resume_source_is_exactly_old_checkpoint_failure(
+    manifest, tmp_path
+):
+    workflow_id = manifest["ptms"][0]["workflow_id"]
+    source = _completed_training_failure(manifest, workflow_id)
+    path = tmp_path / workflow_id / "workflow_completion.json"
+    run_campaign.atomic_json(path, source)
+    loaded, identity = resume_evaluation.validate_resume_source(
+        manifest, tmp_path, workflow_id
+    )
+    assert loaded == source
+    assert identity["train_job_id"] == (
+        "01bd6228-ff82-4f04-a290-711ba45456f0"
+    )
+    resumed = resume_evaluation._initial_resume_record(
+        manifest, loaded, identity
+    )
+    assert resumed["manifest_sha256"] == manifest["manifest_sha256"]
+    assert resumed["resume"]["completed_training_job_reused"] is True
+    assert resumed["resume"]["training_job_submitted"] is False
+    assert resumed["resume"]["prior_workflow_artifact_modified"] is False
+    assert loaded == source
+
+
+def test_resume_rejects_unrelated_failure(manifest, tmp_path):
+    workflow_id = manifest["ptms"][0]["workflow_id"]
+    source = _completed_training_failure(manifest, workflow_id)
+    source["failure"]["message"] = "unrelated failure"
+    run_campaign.atomic_json(
+        tmp_path / workflow_id / "workflow_completion.json",
+        source,
+    )
+    with pytest.raises(
+        run_campaign.CampaignExecutionError,
+        match="not an eligible completed-training resume source",
+    ):
+        resume_evaluation.validate_resume_source(
+            manifest, tmp_path, workflow_id
+        )
+
+
+def test_resume_launch_requires_explicit_acknowledgement():
+    with pytest.raises(
+        run_campaign.CampaignExecutionError,
+        match="acknowledge-direct-full-dataset",
+    ):
+        resume_evaluation.main(
+            [
+                "--manifest",
+                str(MANIFEST_PATH),
+                "--resume-evaluations",
+            ]
+        )
 
 
 def test_manifest_builder_rejects_missing_or_reordered_ptm_cohort():

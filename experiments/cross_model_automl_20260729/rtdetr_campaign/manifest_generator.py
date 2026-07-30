@@ -19,6 +19,7 @@ from tao_automl.ptm_registry import canonical_sha256, load_ptm_registry
 HERE = Path(__file__).resolve().parent
 DEFAULT_INPUTS = HERE / "campaign.inputs.v1.json"
 DEFAULT_OUTPUT = HERE / "campaign.v1.json"
+PRIOR_MANIFEST = HERE / "campaign.pre_checkpoint_fix.v1.json"
 EXPECTED_PTMS = (
     "rtdetr.trafficcam.resnet50.trainable.v2.0",
     "rtdetr.trafficcam.resnet18.trainable.v2.0",
@@ -71,6 +72,12 @@ EXECUTION_CONTRACT = {
     "standalone_evaluation": True,
     "requires_direct_full_dataset_acknowledgement": True,
     "submission_ready_after_artifact_preflight": True,
+}
+RTDETR_CHECKPOINT_CONTRACT = {
+    "directory": "results_dir/train",
+    "terminal_filename_template": "model_epoch_{epoch_index:03d}.pth",
+    "enumeration_order_is_selection_input": False,
+    "ambiguous_match_policy": "fail_closed",
 }
 
 
@@ -359,7 +366,25 @@ def build_manifest(inputs: Mapping[str, Any]) -> dict[str, Any]:
             }
         )
 
+    if not PRIOR_MANIFEST.is_file():
+        raise ManifestError("pre-fix campaign manifest is unavailable")
+    prior_manifest = json.loads(PRIOR_MANIFEST.read_text(encoding="utf-8"))
+    prior_payload = copy.deepcopy(prior_manifest)
+    prior_manifest_sha = prior_payload.pop("manifest_sha256", None)
+    if (
+        prior_manifest_sha != canonical_sha(prior_payload)
+        or prior_manifest_sha
+        != "a0f6a0d5aa54a9c2dcbdf70a87c1138f708965b11c8e7060b83f7aaabc5be141"
+        or prior_manifest.get("campaign_id") != inputs["campaign_id"]
+        or tuple(item["id"] for item in prior_manifest.get("ptms", []))
+        != EXPECTED_PTMS
+    ):
+        raise ManifestError("pre-fix campaign manifest identity changed")
+
     launcher = HERE / "run_campaign.py"
+    resume_launcher = HERE / "resume_evaluation.py"
+    if not resume_launcher.is_file():
+        raise ManifestError("evaluation-only resume launcher is unavailable")
     workflow_support = (
         HERE.parent / "deformable_detr_campaign" / "run_campaign.py"
     )
@@ -421,6 +446,33 @@ def build_manifest(inputs: Mapping[str, Any]) -> dict[str, Any]:
         "dataset": _dataset_record(dataset_inputs),
         "qualification": dict(qualification),
         "ptms": ptms,
+        "checkpoint_resolution": copy.deepcopy(RTDETR_CHECKPOINT_CONTRACT),
+        "resume_contract": {
+            "prior_manifest": {
+                "path": str(PRIOR_MANIFEST),
+                "file_sha256": sha256_file(PRIOR_MANIFEST),
+                "manifest_sha256": prior_manifest_sha,
+            },
+            "eligible_prior_status": "terminal_failure",
+            "eligible_train_status": "Complete",
+            "eligible_failure_type": "CampaignExecutionError",
+            "eligible_failure_message_regex": (
+                "^training job [0-9a-f-]{36} emitted 0 exact "
+                "'model_epoch_009_step_\\*\\.pth' terminal checkpoints$"
+            ),
+            "reuse_completed_training_job": True,
+            "training_job_resubmission": False,
+            "prior_workflow_artifact_immutable": True,
+            "prior_completion_artifact_immutable": True,
+            "resume_workflow_artifact_name": (
+                "workflow_resume_completion.json"
+            ),
+            "resume_completion_artifact_name": "completion.resume.json",
+            "resume_launcher": {
+                "path": str(resume_launcher),
+                "sha256": sha256_file(resume_launcher),
+            },
+        },
         "failure_policy": {
             "preserve_terminal_failures": True,
             "replace_failed_workflow": False,
@@ -441,7 +493,9 @@ def build_manifest(inputs: Mapping[str, Any]) -> dict[str, Any]:
             "launcher_sha256": (
                 sha256_file(launcher) if launcher.is_file() else None
             ),
+            "resume_launcher_sha256": sha256_file(resume_launcher),
             "workflow_support_sha256": sha256_file(workflow_support),
+            "prior_manifest_file_sha256": sha256_file(PRIOR_MANIFEST),
             "ptm_registry_sha256": registry.document_sha256,
         },
     }
@@ -466,6 +520,8 @@ def validate_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
         or manifest.get("smoke_runs") != 0
         or manifest.get("execution") != EXECUTION_CONTRACT
         or manifest.get("qualification") != QUALIFICATION_CONTRACT
+        or manifest.get("checkpoint_resolution")
+        != RTDETR_CHECKPOINT_CONTRACT
     ):
         raise ManifestError("direct-full RT-DETR execution contract changed")
     if tuple(item["id"] for item in manifest["ptms"]) != EXPECTED_PTMS:
@@ -487,6 +543,17 @@ def validate_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
         or dataset["remap_mscoco_category"] is not False
     ):
         raise ManifestError("synthetic COCO class/remap contract changed")
+    resume = manifest.get("resume_contract")
+    if (
+        not isinstance(resume, Mapping)
+        or resume.get("reuse_completed_training_job") is not True
+        or resume.get("training_job_resubmission") is not False
+        or resume.get("prior_workflow_artifact_immutable") is not True
+        or resume.get("prior_completion_artifact_immutable") is not True
+        or resume.get("prior_manifest", {}).get("manifest_sha256")
+        != "a0f6a0d5aa54a9c2dcbdf70a87c1138f708965b11c8e7060b83f7aaabc5be141"
+    ):
+        raise ManifestError("completed-training resume contract changed")
     return copy.deepcopy(dict(manifest))
 
 

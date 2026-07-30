@@ -1,11 +1,5 @@
 {
   "campaign_id": "rtdetr-synthetic-coco-four-ptm-qualification-20260730",
-  "checkpoint_resolution": {
-    "ambiguous_match_policy": "fail_closed",
-    "directory": "results_dir/train",
-    "enumeration_order_is_selection_input": false,
-    "terminal_filename_template": "model_epoch_{epoch_index:03d}.pth"
-  },
   "completion_contract": {
     "automatic_after_all_workflows_terminal": true,
     "terminal_artifact_name": "completion.json",
@@ -85,14 +79,12 @@
   },
   "integrity": {
     "inputs_sha256": "065323c3d2fc6a3e93c417a1ff91ac7896c56a0171720bd2ec769fa98e88a241",
-    "launcher_sha256": "43b07b3139d8df5972e05198c44c1cafc53471e2019c6a170c0c3866cf6446ba",
-    "manifest_generator_sha256": "91ced2c4202cf825bc47ce5b54709a160048dd4a93de80aae41d6fcda2ee3cec",
-    "prior_manifest_file_sha256": "583c43ef6358714cf4cead142d49fc2aa3410027b0f3c2941d758c78564af154",
+    "launcher_sha256": "8609d09d1e6f98eccabf2938b13810dfc86817a0aabe24923a4152c2a0fdfdbb",
+    "manifest_generator_sha256": "55e90d8b017da36d3ec18d5f7b4f83dfc2f8c66ce588ddc25cb75bf8355bc737",
     "ptm_registry_sha256": "5eda26a2e0b8b9cc2f5d3f9c74854d3006750eeda993de9580cd46dea5054560",
-    "resume_launcher_sha256": "5c8f09e028b7c12e6c3d61c49a67591734123030046610024f01232b1c7ba5b9",
     "workflow_support_sha256": "abf44c5c87b161aee183bafe42bbe22ced9b108a7b6609447e15f3b8f1d224da"
   },
-  "manifest_sha256": "c99148024d56b579398596264e0383cbe9c4a7668b842d25f69459eb2ff8abd4",
+  "manifest_sha256": "a0f6a0d5aa54a9c2dcbdf70a87c1138f708965b11c8e7060b83f7aaabc5be141",
   "model": "rtdetr",
   "ptms": [
     {
@@ -435,27 +427,6 @@
     "train_batch_size_per_gpu": 4,
     "training_epochs": 10,
     "validation_interval": 1
-  },
-  "resume_contract": {
-    "eligible_failure_message_regex": "^training job [0-9a-f-]{36} emitted 0 exact 'model_epoch_009_step_\\*\\.pth' terminal checkpoints$",
-    "eligible_failure_type": "CampaignExecutionError",
-    "eligible_prior_status": "terminal_failure",
-    "eligible_train_status": "Complete",
-    "prior_completion_artifact_immutable": true,
-    "prior_manifest": {
-      "file_sha256": "583c43ef6358714cf4cead142d49fc2aa3410027b0f3c2941d758c78564af154",
-      "manifest_sha256": "a0f6a0d5aa54a9c2dcbdf70a87c1138f708965b11c8e7060b83f7aaabc5be141",
-      "path": "/localhome/local-rarunachalam/tao-automl/experiments/cross_model_automl_20260729/rtdetr_campaign/campaign.pre_checkpoint_fix.v1.json"
-    },
-    "prior_workflow_artifact_immutable": true,
-    "resume_completion_artifact_name": "completion.resume.json",
-    "resume_launcher": {
-      "path": "/localhome/local-rarunachalam/tao-automl/experiments/cross_model_automl_20260729/rtdetr_campaign/resume_evaluation.py",
-      "sha256": "5c8f09e028b7c12e6c3d61c49a67591734123030046610024f01232b1c7ba5b9"
-    },
-    "resume_workflow_artifact_name": "workflow_resume_completion.json",
-    "reuse_completed_training_job": true,
-    "training_job_resubmission": false
   },
   "runtime": {
     "account": "edgeai_tao-ptm_image-foundation-model-clip",
