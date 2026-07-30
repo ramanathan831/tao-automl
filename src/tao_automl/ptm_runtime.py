@@ -383,6 +383,23 @@ class ResolvedPTMRuntimeInventory:
         return tuple(arm.checkpoint_id for arm in self.arms)
 
     def stable_dict(self) -> dict[str, Any]:
+        spec_merge_precedence = [
+            "model_defaults",
+            "checkpoint_spec_document",
+            "registry_default_spec_overrides",
+            "automl_profile_overrides",
+        ]
+        if "per_checkpoint_profile_overrides" in self.base_layers_sha256:
+            spec_merge_precedence.append(
+                "per_checkpoint_profile_overrides"
+            )
+        spec_merge_precedence.extend(
+            [
+                "user_overrides",
+                "verified_checkpoint_artifact_identity",
+                "generated_candidate_values",
+            ]
+        )
         return {
             "schema_version": PTM_RUNTIME_SCHEMA_VERSION,
             "stage": "resolved_runtime_inventory",
@@ -397,15 +414,7 @@ class ResolvedPTMRuntimeInventory:
             "base_layers_sha256": dict(self.base_layers_sha256),
             "report_sha256": self.report.report_sha256,
             "registry_sha256": self.report.registry_sha256,
-            "spec_merge_precedence": [
-                "model_defaults",
-                "checkpoint_spec_document",
-                "registry_default_spec_overrides",
-                "automl_profile_overrides",
-                "user_overrides",
-                "verified_checkpoint_artifact_identity",
-                "generated_candidate_values",
-            ],
+            "spec_merge_precedence": spec_merge_precedence,
             "arms": [arm.stable_dict() for arm in self.arms],
             "algorithmic_campaign_flags": algorithmic_campaign_flags(),
         }
@@ -430,10 +439,31 @@ def resolve_ptm_runtime_inventory(
     checkpoint_targets: str | Mapping[str, str] | None = None,
     ptm_policy: str | None = None,
     user_checkpoint_id: str | None = None,
+    execution_checkpoint_artifacts: (
+        Mapping[str, Mapping[str, Any]] | None
+    ) = None,
+    per_checkpoint_profile_overrides: (
+        Mapping[str, Mapping[str, Any]] | None
+    ) = None,
     model: str,
     algorithm: str = "bayesian",
 ) -> ResolvedPTMRuntimeInventory:
-    """Resolve policy-compliant PTMs and effective pre-candidate base specs."""
+    """Resolve policy-compliant PTMs and effective pre-candidate base specs.
+
+    ``execution_checkpoint_artifacts`` is an optional content-preserving path
+    projection for remote runtimes such as SLURM.  Live PTM preflight still
+    verifies the local cached bytes.  A caller may bind those exact bytes to a
+    shared-filesystem execution path only by providing the same SHA-256 and
+    byte size for every selected arm.  The runtime inventory records the
+    projected path and the already verified content identity, so this cannot
+    substitute a different checkpoint or bypass preflight.
+
+    ``per_checkpoint_profile_overrides`` binds profile values that follow a
+    checkpoint's registered runtime contract, such as its input resolution.
+    It must contain exactly the selected checkpoint IDs.  These values are
+    merged after the shared profile and before user overrides, preserving the
+    documented precedence while keeping heterogeneous PTM arms comparable.
+    """
     algorithm = _validate_algorithm(algorithm)
     model = _nonempty_string(model, "model")
     mode = _objective_mode(objective_config)
@@ -490,6 +520,50 @@ def resolve_ptm_runtime_inventory(
             + ", ".join(missing)
         )
     selected_ids = tuple(sorted(selected_ids))
+    if execution_checkpoint_artifacts is None:
+        execution_artifacts: dict[str, Mapping[str, Any]] = {}
+    elif not isinstance(execution_checkpoint_artifacts, Mapping):
+        raise TypeError(
+            "execution_checkpoint_artifacts must be a mapping or None"
+        )
+    else:
+        if set(execution_checkpoint_artifacts) != set(selected_ids):
+            raise ValueError(
+                "execution_checkpoint_artifacts must contain exactly the "
+                "selected PTM checkpoint IDs"
+            )
+        execution_artifacts = {
+            checkpoint_id: execution_checkpoint_artifacts[checkpoint_id]
+            for checkpoint_id in selected_ids
+        }
+    checkpoint_profiles_supplied = (
+        per_checkpoint_profile_overrides is not None
+    )
+    if per_checkpoint_profile_overrides is None:
+        checkpoint_profiles: dict[str, Mapping[str, Any]] = {
+            checkpoint_id: {} for checkpoint_id in selected_ids
+        }
+    elif not isinstance(per_checkpoint_profile_overrides, Mapping):
+        raise TypeError(
+            "per_checkpoint_profile_overrides must be a mapping or None"
+        )
+    else:
+        if set(per_checkpoint_profile_overrides) != set(selected_ids):
+            raise ValueError(
+                "per_checkpoint_profile_overrides must contain exactly the "
+                "selected PTM checkpoint IDs"
+            )
+        checkpoint_profiles = {}
+        for checkpoint_id in selected_ids:
+            raw_profile = per_checkpoint_profile_overrides[checkpoint_id]
+            if not isinstance(raw_profile, Mapping):
+                raise TypeError(
+                    "per_checkpoint_profile_overrides values must be mappings"
+                )
+            checkpoint_profiles[checkpoint_id] = _normalize_layer(
+                raw_profile,
+                f"per_checkpoint_profile_overrides[{checkpoint_id!r}]",
+            )
     all_prepared_records = {
         checkpoint_id: registry.checkpoint(checkpoint_id)
         for checkpoint_id in prepared_ids
@@ -525,21 +599,57 @@ def resolve_ptm_runtime_inventory(
     for checkpoint_id in selected_ids:
         prepared = prepared_by_id[checkpoint_id]
         record = records[checkpoint_id]
+        execution_path = str(prepared.checkpoint.path)
+        projected = execution_artifacts.get(checkpoint_id)
+        if projected is not None:
+            if not isinstance(projected, Mapping):
+                raise TypeError(
+                    "execution_checkpoint_artifacts values must be mappings"
+                )
+            if set(projected) != {"path", "sha256", "size_bytes"}:
+                raise ValueError(
+                    "each execution checkpoint artifact must contain exactly "
+                    "path, sha256, and size_bytes"
+                )
+            raw_path = projected.get("path")
+            if (
+                not isinstance(raw_path, str)
+                or not raw_path.strip()
+                or not Path(raw_path).is_absolute()
+            ):
+                raise ValueError(
+                    "execution checkpoint path must be a non-empty absolute "
+                    "shared-filesystem path"
+                )
+            if (
+                projected.get("sha256") != prepared.checkpoint.sha256
+                or projected.get("size_bytes")
+                != prepared.checkpoint.size_bytes
+            ):
+                raise ValueError(
+                    f"execution checkpoint content identity does not match "
+                    f"live preflight for {checkpoint_id!r}"
+                )
+            execution_path = raw_path.strip()
         # The official checkpoint document is the lower part of the PTM
         # layer. Repository-owned normalized overrides resolve any conflict.
         ptm_layer = merge_ptm_spec_precedence(
             model_defaults=prepared.checkpoint_spec.document,
             candidate_overrides=record["default_spec_overrides"],
         ).spec
+        effective_profile = merge_ptm_spec_precedence(
+            model_defaults=profile,
+            candidate_overrides=checkpoint_profiles[checkpoint_id],
+        ).spec
         target = targets[checkpoint_id]
         effective = merge_ptm_spec_precedence(
             model_defaults=defaults,
             ptm_overrides=ptm_layer,
-            automl_profile_overrides=profile,
+            automl_profile_overrides=effective_profile,
             user_overrides=user,
             # The verified artifact identity is injected after user values.
             # Generated values are applied one level later by the wrapper.
-            candidate_overrides={target: str(prepared.checkpoint.path)},
+            candidate_overrides={target: execution_path},
         ).spec
         input_contract_hash = canonical_sha256(record["input_contract"])
         ptm_layer_hash = canonical_sha256(ptm_layer)
@@ -548,7 +658,7 @@ def resolve_ptm_runtime_inventory(
             ResolvedPTMRuntimeArm(
                 checkpoint_id=checkpoint_id,
                 checkpoint_target=target,
-                checkpoint_path=str(prepared.checkpoint.path),
+                checkpoint_path=execution_path,
                 effective_base_spec=effective,
                 report_sha256=report.report_sha256,
                 registry_sha256=report.registry_sha256,
@@ -571,6 +681,10 @@ def resolve_ptm_runtime_inventory(
         "automl_profile_overrides": canonical_sha256(profile),
         "user_overrides": canonical_sha256(user),
     }
+    if checkpoint_profiles_supplied:
+        layers["per_checkpoint_profile_overrides"] = canonical_sha256(
+            checkpoint_profiles
+        )
     provisional = ResolvedPTMRuntimeInventory(
         report=report,
         algorithm=algorithm,

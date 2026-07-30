@@ -956,6 +956,41 @@ class Bayesian(AutoMLAlgorithmBase):
             )
 
         if data_type in ("int", "integer"):
+            # Preserve explicit discrete integer domains supplied by the
+            # schema/custom range adapter. Mapping the normalized GP proposal
+            # to the ordered option set prevents unsealed intermediate values.
+            valid_options = get_valid_options(
+                parameter_config, self.custom_ranges
+            )
+            if valid_options:
+                index = min(
+                    int(suggestion * len(valid_options)),
+                    len(valid_options) - 1,
+                )
+                quantized_int = int(valid_options[index])
+                if not (
+                    type(parent_param) is float
+                    and math.isnan(parent_param)
+                ):
+                    if (
+                        isinstance(parent_param, str)
+                        and parent_param != "nan"
+                        and parent_param == "TRUE"
+                    ) or (
+                        isinstance(parent_param, bool)
+                        and parent_param
+                    ):
+                        self.parent_params[parameter_name] = quantized_int
+                return network_utils.apply_network_specific_param_logic(
+                    network=self.network,
+                    data_type=data_type,
+                    parameter_name=parameter_name,
+                    value=quantized_int,
+                    v_max=max(int(item) for item in valid_options),
+                    default_train_spec=self.default_train_spec,
+                    parent_params=self.parent_params,
+                )
+
             v_min = parameter_config.get("valid_min", "")
             v_max = parameter_config.get("valid_max", "")
 

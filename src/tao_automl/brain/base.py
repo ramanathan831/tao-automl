@@ -551,6 +551,36 @@ class AutoMLAlgorithmBase:
                 if "model_config.input_image_config.size_height_width.width" in self.parent_params.keys():
                     return self.parent_params["model_config.input_image_config.size_height_width.width"]
 
+            # An explicit integer option set is a discrete domain, not merely
+            # documentation layered over the enclosing numeric bounds.
+            valid_options = get_valid_options(
+                parameter_config, self.custom_ranges
+            )
+            if valid_options:
+                sampled_int = int(np.random.choice(valid_options))
+                if not (
+                    type(parent_param) is float
+                    and math.isnan(parent_param)
+                ):
+                    if (
+                        isinstance(parent_param, str)
+                        and parent_param != "nan"
+                        and parent_param == "TRUE"
+                    ) or (
+                        isinstance(parent_param, bool)
+                        and parent_param
+                    ):
+                        self.parent_params[parameter_name] = sampled_int
+                return network_utils.apply_network_specific_param_logic(
+                    network=self.network,
+                    data_type=data_type,
+                    parameter_name=parameter_name,
+                    value=sampled_int,
+                    v_max=max(int(item) for item in valid_options),
+                    default_train_spec=self.default_train_spec,
+                    parent_params=self.parent_params,
+                )
+
             # Check if this parameter has a dependency and math_cond for calculation
             depends_on = parameter_config.get("depends_on", None)
             if depends_on and math_cond and type(math_cond) is str:

@@ -408,6 +408,14 @@ def test_resolve_full_latency_inventory_and_merge_all_precedence_layers(
     assert resolved.inventory_sha256 == canonical_audit_sha256(
         resolved.stable_dict()
     )
+    assert (
+        "per_checkpoint_profile_overrides"
+        not in resolved.base_layers_sha256
+    )
+    assert (
+        "per_checkpoint_profile_overrides"
+        not in resolved.stable_dict()["spec_merge_precedence"]
+    )
     for arm in resolved.arms:
         spec = arm.effective_base_spec
         suffix = arm.checkpoint_id[-1]
@@ -421,6 +429,163 @@ def test_resolve_full_latency_inventory_and_merge_all_precedence_layers(
         assert arm.report_sha256 == verified_report.report_sha256
         assert len(arm.registry_record_sha256) == 64
         assert len(arm.input_contract_sha256) == 64
+
+
+def test_remote_execution_checkpoint_projection_preserves_verified_identity(
+    verified_report,
+):
+    projected = {
+        item.checkpoint_id: {
+            "path": f"/lustre/ptm/{item.checkpoint_id}.pth",
+            "sha256": item.checkpoint.sha256,
+            "size_bytes": item.checkpoint.size_bytes,
+        }
+        for item in verified_report.prepared
+    }
+
+    resolved = _resolve(
+        verified_report,
+        "latency",
+        execution_checkpoint_artifacts=projected,
+    )
+
+    for arm in resolved.arms:
+        assert arm.checkpoint_path == projected[arm.checkpoint_id]["path"]
+        assert (
+            arm.effective_base_spec["train"]["pretrained_model_path"]
+            == projected[arm.checkpoint_id]["path"]
+        )
+        prepared = next(
+            item
+            for item in verified_report.prepared
+            if item.checkpoint_id == arm.checkpoint_id
+        )
+        assert (
+            arm.checkpoint_artifact_sha256
+            == prepared.checkpoint.sha256
+        )
+
+
+def test_per_checkpoint_profile_overrides_preserve_ptm_input_contracts(
+    verified_report,
+):
+    profiles = {
+        "dino.a": {
+            "dataset": {
+                "augmentation": {
+                    "eval_spatial_size": [544, 960],
+                    "preserve_aspect_ratio": False,
+                }
+            }
+        },
+        "dino.b": {
+            "dataset": {
+                "augmentation": {
+                    "eval_spatial_size": [640, 640],
+                    "preserve_aspect_ratio": True,
+                }
+            }
+        },
+    }
+
+    resolved = _resolve(
+        verified_report,
+        "latency",
+        per_checkpoint_profile_overrides=profiles,
+    )
+
+    by_id = {
+        arm.checkpoint_id: arm.effective_base_spec
+        for arm in resolved.arms
+    }
+    assert by_id["dino.a"]["dataset"]["augmentation"] == {
+        "eval_spatial_size": [544, 960],
+        "preserve_aspect_ratio": False,
+    }
+    assert by_id["dino.b"]["dataset"]["augmentation"] == {
+        "eval_spatial_size": [640, 640],
+        "preserve_aspect_ratio": True,
+    }
+    assert (
+        resolved.base_layers_sha256[
+            "per_checkpoint_profile_overrides"
+        ]
+        == canonical_sha256(profiles)
+    )
+    precedence = resolved.stable_dict()["spec_merge_precedence"]
+    assert precedence.index("automl_profile_overrides") < precedence.index(
+        "per_checkpoint_profile_overrides"
+    ) < precedence.index("user_overrides")
+
+
+@pytest.mark.parametrize(
+    "profiles,match",
+    [
+        ({"dino.a": {}}, "exactly the selected"),
+        (
+            {"dino.a": {}, "dino.b": []},
+            "values must be mappings",
+        ),
+    ],
+)
+def test_per_checkpoint_profile_overrides_fail_closed(
+    verified_report,
+    profiles,
+    match,
+):
+    with pytest.raises((ValueError, TypeError), match=match):
+        _resolve(
+            verified_report,
+            "latency",
+            per_checkpoint_profile_overrides=profiles,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation,match",
+    [
+        (lambda values: values.pop("dino.b"), "exactly the selected"),
+        (
+            lambda values: values["dino.a"].update(
+                {"path": "relative/a.pth"}
+            ),
+            "absolute shared-filesystem",
+        ),
+        (
+            lambda values: values["dino.a"].update(
+                {"sha256": "0" * 64}
+            ),
+            "content identity does not match",
+        ),
+        (
+            lambda values: values["dino.a"].update(
+                {"size_bytes": 999}
+            ),
+            "content identity does not match",
+        ),
+    ],
+)
+def test_remote_execution_checkpoint_projection_fails_closed(
+    verified_report,
+    mutation,
+    match,
+):
+    projected = {
+        item.checkpoint_id: {
+            "path": f"/lustre/ptm/{item.checkpoint_id}.pth",
+            "sha256": item.checkpoint.sha256,
+            "size_bytes": item.checkpoint.size_bytes,
+        }
+        for item in verified_report.prepared
+    }
+    mutation(projected)
+
+    with pytest.raises((ValueError, TypeError), match=match):
+        _resolve(
+            verified_report,
+            "latency",
+            execution_checkpoint_artifacts=projected,
+        )
 
 
 def test_bayesian_alias_is_canonical_across_build_and_resume(
