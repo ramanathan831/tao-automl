@@ -147,6 +147,23 @@ def test_spec_profile_is_full_dataset_ten_epoch_eight_gpu(manifest):
     )
 
 
+def test_runtime_inventory_starts_from_exact_skill_train_template(manifest):
+    defaults = run_campaign.skill_base_model_defaults(manifest)
+    for parameter in generator.SEARCH_PARAMETERS:
+        value = defaults
+        for component in parameter.split("."):
+            value = value[component]
+        assert isinstance(value, (int, float))
+
+    tampered = copy.deepcopy(manifest)
+    tampered["runtime"]["train_template_sha256"] = "0" * 64
+    with pytest.raises(
+        run_campaign.CampaignExecutionError,
+        match="changed after campaign sealing",
+    ):
+        run_campaign.skill_base_model_defaults(tampered)
+
+
 def test_evaluation_adapter_carries_candidate_architecture(manifest):
     result = run_campaign.build_evaluation_spec(
         manifest,

@@ -1123,10 +1123,11 @@ def build_runtime_inventory(
 
     settings = mode_settings(manifest, mode)
     objective = parse_objective_config(settings)
+    base_defaults = skill_base_model_defaults(manifest)
     resolved = resolve_ptm_runtime_inventory(
         report=report,
         objective_config=objective,
-        base_model_defaults={},
+        base_model_defaults=base_defaults,
         profile_overrides=nested_spec_overrides(manifest),
         user_overrides={},
         ptm_policy="all",
@@ -1148,6 +1149,31 @@ def build_runtime_inventory(
             "resolved runtime did not retain sealed Lustre checkpoint paths"
         )
     return resolved
+
+
+def skill_base_model_defaults(
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Load the exact skill-owned train template bound into the manifest."""
+    template = (
+        Path(manifest["runtime"]["skill_dir"])
+        / "references/spec_template_train.yaml"
+    )
+    if not template.is_file():
+        raise CampaignExecutionError(
+            f"skill train template is unavailable: {template}"
+        )
+    observed_sha = hashlib.sha256(template.read_bytes()).hexdigest()
+    if observed_sha != manifest["runtime"]["train_template_sha256"]:
+        raise CampaignExecutionError(
+            "skill train template changed after campaign sealing"
+        )
+    defaults = yaml.safe_load(template.read_text(encoding="utf-8"))
+    if not isinstance(defaults, dict):
+        raise CampaignExecutionError(
+            "skill train template must contain a mapping"
+        )
+    return defaults
 
 
 def run_mode(
