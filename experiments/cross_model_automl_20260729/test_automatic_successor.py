@@ -10,6 +10,7 @@ import pytest
 from tao_automl.recommendation_audit import (
     algorithmic_campaign_flags,
     build_recommendation_audit,
+    canonical_audit_sha256,
 )
 from tao_automl.selection import analyze_archive
 
@@ -25,9 +26,11 @@ from automatic_successor import (  # noqa: E402
     _process_identity,
     _selection_config,
     canonical_sha256,
+    routing_identity_from_environment_file,
     sha256_file,
     trigger_successor,
     validate_completed_dino,
+    validate_successor_completion,
     validate_successor_descriptor,
     watch_and_trigger,
 )
@@ -61,24 +64,88 @@ def _write_json(path: Path, value) -> None:
 
 
 def _successor_files(tmp_path: Path) -> tuple[Path, Path, Path]:
-    marker = tmp_path / "successor-ran.json"
+    marker = tmp_path / "successor-runtime" / "completion.json"
     script = tmp_path / "successor.py"
     script.write_text(
-        "import json, pathlib, sys, time\n"
-        "pathlib.Path(sys.argv[1]).write_text("
-        "json.dumps({'launched': True}) + '\\n', encoding='utf-8')\n"
+        "import argparse, hashlib, json, pathlib, time\n"
+        "p=argparse.ArgumentParser()\n"
+        "p.add_argument('--manifest', required=True)\n"
+        "p.add_argument('--runtime-root', required=True)\n"
+        "p.add_argument('--completion-artifact', required=True)\n"
+        "p.add_argument('--env-file', required=True)\n"
+        "p.add_argument('--launch', action='store_true')\n"
+        "p.add_argument('--acknowledge-direct-full-dataset', action='store_true')\n"
+        "p.add_argument('--skip-completion', action='store_true')\n"
+        "a=p.parse_args()\n"
+        "if a.skip_completion: raise SystemExit(0)\n"
+        "m=json.loads(pathlib.Path(a.manifest).read_text())\n"
+        "ids={'gcvit_tiny':'deformable-detr-gcvit',"
+        "'resnet50':'deformable-detr-resnet50'}\n"
+        "w=[{'workflow_id':n,'ptm_id':ids[n],'status':'success',"
+        "'terminal':True,'process_exit_code':0,'failure_preserved':False,"
+        "'metrics':{'mAP':0.4,'mAP50':0.6}} for n in ids]\n"
+        "c={'schema_version':1,'campaign_id':m['campaign_id'],"
+        "'model':'deformable_detr','manifest_sha256':m['manifest_sha256'],"
+        "'terminal':True,'status':'success','logical_workflows_submitted':2,"
+        "'successful_workflows':2,'failed_workflows':0,"
+        "'workflows_started_in_parallel':True,'cpu_runs':0,'smoke_runs':0,"
+        "'ministep_runs':0,'local_model_runs':0,'failures_preserved':True,"
+        "'replacement_workflows_submitted':False,"
+        "'outcomes':{'gcvit_tiny':'success','resnet50':'success'},"
+        "'workflows':w}\n"
+        "raw=json.dumps(c,sort_keys=True,separators=(',',':'),"
+        "ensure_ascii=True,allow_nan=False).encode()\n"
+        "c['completion_sha256']=hashlib.sha256(raw).hexdigest()\n"
+        "out=pathlib.Path(a.completion_artifact);out.parent.mkdir("
+        "parents=True,exist_ok=True)\n"
+        "out.write_text(json.dumps(c,sort_keys=True)+'\\n',encoding='utf-8')\n"
         "time.sleep(0.1)\n",
         encoding="utf-8",
     )
+    generator = tmp_path / "manifest_generator.py"
+    generator.write_text("# sealed test manifest generator\n", encoding="utf-8")
     campaign_manifest = tmp_path / "deformable_detr_campaign.v1.json"
+    manifest_payload = {
+        "schema_version": 1,
+        "campaign_id": "deformable-detr-test-successor",
+        "model": "deformable_detr",
+        "task": "object_detection",
+        "execution": {
+            "kind": "direct_full_qualification",
+            "cpu_runs": 0,
+            "smoke_runs": 0,
+            "ministep_runs": 0,
+            "local_model_runs": 0,
+            "full_training": True,
+            "standalone_evaluation": True,
+        },
+        "runtime": {
+            "nodes": 1,
+            "tasks_per_node": 1,
+            "gpus_per_node": 8,
+            "sqsh_path": "/lustre/test.sqsh",
+            "sqsh_sha256": "a" * 64,
+        },
+        "ptms": [
+            {
+                "workflow_id": "gcvit_tiny",
+                "id": "deformable-detr-gcvit",
+            },
+            {
+                "workflow_id": "resnet50",
+                "id": "deformable-detr-resnet50",
+            },
+        ],
+        "integrity": {
+            "launcher_sha256": sha256_file(script),
+            "manifest_generator_sha256": sha256_file(generator),
+        },
+    }
     _write_json(
         campaign_manifest,
         {
-            "schema_version": 1,
-            "model": "deformable_detr",
-            "execution_kind": "direct_full_search",
-            "cpu_runs": 0,
-            "smoke_runs": 0,
+            **manifest_payload,
+            "manifest_sha256": canonical_sha256(manifest_payload),
         },
     )
     return script, marker, campaign_manifest
@@ -95,6 +162,14 @@ def _descriptor(
     process_identity = _process_identity(os.getpid())
     assert process_identity is not None
     executable = Path(sys.executable).resolve()
+    successor_runtime = marker.parent
+    generator = tmp_path / "manifest_generator.py"
+    environment_file = tmp_path / "config.env"
+    environment_file.write_text(
+        "SLURM_HOSTNAME=test.invalid\nSLURM_USER=test\n",
+        encoding="utf-8",
+    )
+    dino_validator = HERE / "dino_campaign" / "manifest_generator.py"
     payload = {
         "schema_version": 1,
         "predecessor": {
@@ -102,31 +177,51 @@ def _descriptor(
             "manifest_path": str(MANIFEST_PATH),
             "manifest_file_sha256": sha256_file(MANIFEST_PATH),
             "manifest_sha256": MANIFEST["manifest_sha256"],
+            "manifest_validator_path": str(dino_validator),
+            "manifest_validator_sha256": sha256_file(dino_validator),
             "runtime_root": str(runtime_root),
             "required_modes": list(MODES),
             "controller_process": process_identity,
         },
         "successor": {
             "name": "direct-full-deformable-detr",
+            "campaign_id": "deformable-detr-test-successor",
             "model": "deformable_detr",
-            "execution_kind": "direct_full_search",
+            "execution_kind": "direct_full_qualification",
             "cpu_runs": 0,
             "smoke_runs": 0,
             "manifest_path": str(campaign_manifest),
             "manifest_file_sha256": sha256_file(campaign_manifest),
+            "manifest_generator_path": str(generator),
+            "launcher_path": str(script),
+            "runtime_root": str(successor_runtime),
             "working_directory": str(tmp_path),
             "command": [
                 str(executable),
                 str(script),
+                "--manifest",
+                str(campaign_manifest),
+                "--runtime-root",
+                str(successor_runtime),
+                "--completion-artifact",
                 str(marker),
+                "--env-file",
+                str(environment_file),
+                "--launch",
                 "--acknowledge-direct-full-dataset",
             ],
             "environment": {
                 "HOME": str(tmp_path),
                 "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
                 "PATH": "/usr/bin:/bin",
+                "PYTHONPATH": str(tmp_path),
                 "PYTHONDONTWRITEBYTECODE": "1",
             },
+            "environment_file": str(environment_file),
+            "routing": routing_identity_from_environment_file(
+                environment_file
+            ),
             "completion_artifact": str(marker),
             "required_files": [
                 {
@@ -136,6 +231,10 @@ def _descriptor(
                 {
                     "path": str(script),
                     "sha256": sha256_file(script),
+                },
+                {
+                    "path": str(generator),
+                    "sha256": sha256_file(generator),
                 },
                 {
                     "path": str(campaign_manifest),
@@ -471,7 +570,12 @@ def test_completed_gate_triggers_successor_exactly_once(tmp_path):
         )
         == 0
     )
-    assert json.loads(marker.read_text()) == {"launched": True}
+    completion = json.loads(marker.read_text())
+    assert completion["status"] == "success"
+    assert completion["outcomes"] == {
+        "gcvit_tiny": "success",
+        "resnet50": "success",
+    }
     state = json.loads(
         (
             runtime_root
@@ -614,6 +718,42 @@ def test_latency_provenance_tampering_blocks_without_launch(tmp_path):
     assert not marker.exists()
 
 
+def test_post_calibration_fallback_blocks_without_launch(tmp_path):
+    (
+        runtime_root,
+        _script,
+        marker,
+        _campaign_manifest,
+        descriptor_path,
+        descriptor,
+    ) = _fixture(tmp_path)
+    _completed_runtime(runtime_root, descriptor)
+    evidence_path = runtime_root / "accuracy" / "candidate_evidence.json"
+    evidence = json.loads(evidence_path.read_text())
+    audit = evidence["candidates"]["accuracy_rec_8"][
+        "recommendation_audit"
+    ]
+    proposal = audit["acquisition"]["proposal"]
+    proposal["stage"] = "calibration"
+    proposal["decision_state"]["stage"] = "calibration"
+    payload = {
+        key: value for key, value in audit.items() if key != "audit_sha256"
+    }
+    audit["audit_sha256"] = canonical_audit_sha256(payload)
+    _write_json(evidence_path, evidence)
+
+    with pytest.raises(
+        AutomaticSuccessorError,
+        match="reverted from objective-aware model-based acquisition",
+    ):
+        watch_and_trigger(
+            descriptor_path,
+            runtime_root,
+            poll_seconds=0.001,
+        )
+    assert not marker.exists()
+
+
 def test_tampered_successor_input_is_rejected(tmp_path):
     (
         runtime_root,
@@ -636,6 +776,182 @@ def test_tampered_successor_input_is_rejected(tmp_path):
             poll_seconds=0.001,
         )
     assert not marker.exists()
+
+
+def test_changed_slurm_routing_is_rejected(tmp_path):
+    (
+        runtime_root,
+        _script,
+        marker,
+        _campaign_manifest,
+        descriptor_path,
+        descriptor,
+    ) = _fixture(tmp_path)
+    _completed_runtime(runtime_root, descriptor)
+    environment_file = Path(descriptor["successor"]["environment_file"])
+    environment_file.write_text(
+        "SLURM_HOSTNAME=redirected.invalid\nSLURM_USER=test\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        AutomaticSuccessorError,
+        match="routing identity changed after sealing",
+    ):
+        watch_and_trigger(
+            descriptor_path,
+            runtime_root,
+            poll_seconds=0.001,
+        )
+    assert not marker.exists()
+
+
+def test_successor_command_must_consume_sealed_manifest(tmp_path):
+    (
+        _runtime_root,
+        _script,
+        _marker,
+        _campaign_manifest,
+        descriptor_path,
+        descriptor,
+    ) = _fixture(tmp_path)
+    command = descriptor["successor"]["command"]
+    command[command.index("--manifest") + 1] = str(tmp_path / "other.json")
+    payload = {
+        key: value
+        for key, value in descriptor.items()
+        if key != "descriptor_sha256"
+    }
+    descriptor["descriptor_sha256"] = canonical_sha256(payload)
+    _write_json(descriptor_path, descriptor)
+
+    with pytest.raises(
+        AutomaticSuccessorError,
+        match="does not consume its sealed manifest",
+    ):
+        validate_successor_descriptor(descriptor_path)
+
+
+def test_successor_descriptor_cannot_embed_credentials(tmp_path):
+    (
+        _runtime_root,
+        _script,
+        _marker,
+        _campaign_manifest,
+        descriptor_path,
+        descriptor,
+    ) = _fixture(tmp_path)
+    descriptor["successor"]["environment"]["NGC_KEY"] = "not-allowed"
+    payload = {
+        key: value
+        for key, value in descriptor.items()
+        if key != "descriptor_sha256"
+    }
+    descriptor["descriptor_sha256"] = canonical_sha256(payload)
+    _write_json(descriptor_path, descriptor)
+
+    with pytest.raises(
+        AutomaticSuccessorError,
+        match="must not embed credential variables",
+    ):
+        validate_successor_descriptor(descriptor_path)
+
+
+def test_zero_exit_contract_requires_fresh_valid_completion(tmp_path):
+    (
+        runtime_root,
+        _script,
+        marker,
+        _campaign_manifest,
+        descriptor_path,
+        descriptor,
+    ) = _fixture(tmp_path)
+    _completed_runtime(runtime_root, descriptor)
+    descriptor["successor"]["command"].append("--skip-completion")
+    payload = {
+        key: value
+        for key, value in descriptor.items()
+        if key != "descriptor_sha256"
+    }
+    descriptor["descriptor_sha256"] = canonical_sha256(payload)
+    _write_json(descriptor_path, descriptor)
+
+    with pytest.raises(
+        AutomaticSuccessorError,
+        match="without a regular completion artifact",
+    ):
+        watch_and_trigger(
+            descriptor_path,
+            runtime_root,
+            poll_seconds=0.001,
+        )
+    assert not marker.exists()
+    state = json.loads(
+        (
+            runtime_root
+            / "automatic_successor"
+            / "automatic_successor_state.json"
+        ).read_text()
+    )
+    assert state["status"] == "successor_completion_invalid"
+
+
+def test_fresh_trigger_rejects_preexisting_completion(tmp_path):
+    (
+        runtime_root,
+        _script,
+        marker,
+        _campaign_manifest,
+        descriptor_path,
+        descriptor,
+    ) = _fixture(tmp_path)
+    _completed_runtime(runtime_root, descriptor)
+    _write_json(marker, {"stale": True})
+
+    with pytest.raises(
+        AutomaticSuccessorError,
+        match="refuses a pre-existing completion artifact",
+    ):
+        watch_and_trigger(
+            descriptor_path,
+            runtime_root,
+            poll_seconds=0.001,
+        )
+
+
+def test_self_hashed_inconsistent_completion_is_rejected(tmp_path):
+    (
+        runtime_root,
+        _script,
+        marker,
+        _campaign_manifest,
+        descriptor_path,
+        descriptor,
+    ) = _fixture(tmp_path)
+    _completed_runtime(runtime_root, descriptor)
+    assert (
+        watch_and_trigger(
+            descriptor_path,
+            runtime_root,
+            poll_seconds=0.001,
+        )
+        == 0
+    )
+    completion = json.loads(marker.read_text())
+    completion["successful_workflows"] = 1
+    payload = {
+        key: value
+        for key, value in completion.items()
+        if key != "completion_sha256"
+    }
+    completion["completion_sha256"] = canonical_sha256(payload)
+    _write_json(marker, completion)
+
+    with pytest.raises(
+        AutomaticSuccessorError,
+        match="counts or aggregate status are inconsistent",
+    ):
+        validate_successor_completion(descriptor)
 
 
 def test_descriptor_is_content_addressed(tmp_path):

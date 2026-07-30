@@ -17,6 +17,7 @@ import argparse
 import copy
 import fcntl
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -60,6 +61,29 @@ EXPECTED_OPTIMIZATION_DIRECTION = {
         "latency": "minimize",
     },
 }
+SUCCESSOR_EXECUTION_KIND = "direct_full_qualification"
+REQUIRED_SUCCESSOR_ENVIRONMENT = frozenset(
+    {
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "PATH",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONPATH",
+    }
+)
+SECRET_ENVIRONMENT_NAMES = frozenset(
+    {
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "HF_TOKEN",
+        "NGC_API_KEY",
+        "NGC_KEY",
+    }
+)
+ROUTING_ENVIRONMENT_NAMES = frozenset(
+    {"SLURM_HOSTNAME", "SLURM_USER", "SSH_KEY_PATH"}
+)
 SELECTION_TIME_ISOLATION = {
     "selector_invoked_on_matched_measurements": False,
     "selection_time_objectives_replaced": False,
@@ -107,6 +131,78 @@ def load_json(path: Path) -> Any:
         ) from exc
 
 
+def routing_identity_from_environment_file(path: Path) -> dict[str, Any]:
+    """Resolve only non-secret SLURM/SSH routing identity from an env file."""
+    if path.is_symlink() or not path.is_file():
+        raise AutomaticSuccessorError(
+            "successor environment file is unavailable or is a symlink"
+        )
+    values: dict[str, str] = {}
+    for line_number, raw_line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(),
+        start=1,
+    ):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line.removeprefix("export ").strip()
+        if "=" not in line:
+            continue
+        name, raw_value = line.split("=", 1)
+        name = name.strip()
+        if name not in ROUTING_ENVIRONMENT_NAMES:
+            continue
+        if name in values:
+            raise AutomaticSuccessorError(
+                f"successor environment file duplicates {name} "
+                f"at line {line_number}"
+            )
+        value = raw_value.strip()
+        if (
+            len(value) >= 2
+            and value[0] == value[-1]
+            and value[0] in {"'", '"'}
+        ):
+            value = value[1:-1]
+        if not value or any(character.isspace() for character in value):
+            raise AutomaticSuccessorError(
+                f"successor routing value {name} is empty or contains whitespace"
+            )
+        values[name] = value
+    missing = sorted(
+        name
+        for name in ("SLURM_HOSTNAME", "SLURM_USER")
+        if not values.get(name)
+    )
+    if missing:
+        raise AutomaticSuccessorError(
+            "successor environment lacks required routing keys: "
+            + ", ".join(missing)
+        )
+    key_path_value = values.get("SSH_KEY_PATH")
+    key_path: Path | None = None
+    key_sha256: str | None = None
+    if key_path_value is not None:
+        key_path = Path(key_path_value)
+        if (
+            not key_path.is_absolute()
+            or key_path.is_symlink()
+            or not key_path.is_file()
+        ):
+            raise AutomaticSuccessorError(
+                "successor SSH key path must be an absolute regular "
+                "non-symlink file"
+            )
+        key_sha256 = sha256_file(key_path)
+    return {
+        "slurm_hostname": values["SLURM_HOSTNAME"],
+        "slurm_user": values["SLURM_USER"],
+        "ssh_key_path": str(key_path) if key_path is not None else None,
+        "ssh_key_sha256": key_sha256,
+    }
+
+
 def atomic_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     pending = path.with_suffix(path.suffix + ".tmp")
@@ -147,6 +243,38 @@ def _finite_metric(value: Any, *, path: str) -> float:
     return normalized
 
 
+def _single_command_value(command: list[str], flag: str) -> str:
+    positions = [index for index, value in enumerate(command) if value == flag]
+    if len(positions) != 1:
+        raise AutomaticSuccessorError(
+            f"successor command must contain {flag} exactly once"
+        )
+    position = positions[0]
+    if position + 1 >= len(command) or command[position + 1].startswith("--"):
+        raise AutomaticSuccessorError(
+            f"successor command has no value for {flag}"
+        )
+    return command[position + 1]
+
+
+def _load_canonical_successor_manifest(
+    path: Path,
+) -> dict[str, Any]:
+    manifest = load_json(path)
+    if not isinstance(manifest, Mapping):
+        raise AutomaticSuccessorError(
+            "successor campaign manifest must be a mapping"
+        )
+    manifest = copy.deepcopy(dict(manifest))
+    expected = manifest.pop("manifest_sha256", None)
+    if not isinstance(expected, str) or expected != canonical_sha256(manifest):
+        raise AutomaticSuccessorError(
+            "successor campaign manifest canonical hash changed"
+        )
+    manifest["manifest_sha256"] = expected
+    return manifest
+
+
 def validate_successor_descriptor(path: Path) -> dict[str, Any]:
     """Validate and content-address one immutable successor command."""
     descriptor = load_json(path)
@@ -178,17 +306,29 @@ def validate_successor_descriptor(path: Path) -> dict[str, Any]:
             f"predecessor required_modes must equal {list(MODES)}"
         )
     manifest_path = Path(str(predecessor.get("manifest_path", "")))
+    predecessor_runtime_root = Path(
+        str(predecessor.get("runtime_root", ""))
+    )
+    manifest_validator_path = Path(
+        str(predecessor.get("manifest_validator_path", ""))
+    )
     if (
         not manifest_path.is_absolute()
+        or not predecessor_runtime_root.is_absolute()
+        or not manifest_validator_path.is_absolute()
         or _SHA256_RE.fullmatch(
             str(predecessor.get("manifest_file_sha256", ""))
         )
         is None
         or _SHA256_RE.fullmatch(str(predecessor.get("manifest_sha256", "")))
         is None
+        or _SHA256_RE.fullmatch(
+            str(predecessor.get("manifest_validator_sha256", ""))
+        )
+        is None
     ):
         raise AutomaticSuccessorError(
-            "predecessor manifest path and hashes are incomplete"
+            "predecessor paths and manifest identities are incomplete"
         )
     controller = predecessor.get("controller_process")
     if not isinstance(controller, Mapping):
@@ -243,9 +383,10 @@ def validate_successor_descriptor(path: Path) -> dict[str, Any]:
             raise AutomaticSuccessorError(
                 f"successor required_files[{index}] is incomplete"
             )
-    if successor.get("execution_kind") != "direct_full_search":
+    if successor.get("execution_kind") != SUCCESSOR_EXECUTION_KIND:
         raise AutomaticSuccessorError(
-            "successor execution_kind must be 'direct_full_search'"
+            "successor execution_kind must be "
+            f"{SUCCESSOR_EXECUTION_KIND!r}"
         )
     if successor.get("cpu_runs") != 0 or successor.get("smoke_runs") != 0:
         raise AutomaticSuccessorError(
@@ -264,24 +405,46 @@ def validate_successor_descriptor(path: Path) -> dict[str, Any]:
         raise AutomaticSuccessorError(
             "successor executable must be an absolute path"
         )
-    required_by_path = {
-        str(Path(record["path"])): record for record in required_files
-    }
+    required_by_path: dict[str, Mapping[str, Any]] = {}
+    for index, record in enumerate(required_files):
+        record_path = str(Path(record["path"]))
+        if record_path in required_by_path:
+            raise AutomaticSuccessorError(
+                f"successor required_files[{index}] duplicates {record_path}"
+            )
+        if _SHA256_RE.fullmatch(str(record.get("sha256", ""))) is None:
+            raise AutomaticSuccessorError(
+                f"successor required_files[{index}] has an invalid SHA-256"
+            )
+        required_by_path[record_path] = record
     if str(executable) not in required_by_path:
         raise AutomaticSuccessorError(
             "successor executable must be content-addressed in required_files"
         )
     successor_manifest = Path(str(successor.get("manifest_path", "")))
+    successor_runtime_root = Path(
+        str(successor.get("runtime_root", ""))
+    )
+    launcher_path = Path(str(successor.get("launcher_path", "")))
+    manifest_generator_path = Path(
+        str(successor.get("manifest_generator_path", ""))
+    )
     if (
         not successor_manifest.is_absolute()
+        or not successor_runtime_root.is_absolute()
+        or not launcher_path.is_absolute()
+        or not manifest_generator_path.is_absolute()
         or _SHA256_RE.fullmatch(
             str(successor.get("manifest_file_sha256", ""))
         )
         is None
         or str(successor_manifest) not in required_by_path
+        or str(launcher_path) not in required_by_path
+        or str(manifest_generator_path) not in required_by_path
     ):
         raise AutomaticSuccessorError(
-            "successor campaign manifest must be content-addressed"
+            "successor launcher, generator, manifest, and runtime must be "
+            "absolute and content-addressed"
         )
     if (
         required_by_path[str(successor_manifest)]["sha256"]
@@ -289,6 +452,74 @@ def validate_successor_descriptor(path: Path) -> dict[str, Any]:
     ):
         raise AutomaticSuccessorError(
             "successor manifest hashes disagree"
+        )
+    if len(command) < 2 or command[1] != str(launcher_path):
+        raise AutomaticSuccessorError(
+            "successor command does not execute its content-addressed launcher"
+        )
+    if command.count("--launch") != 1:
+        raise AutomaticSuccessorError(
+            "successor command must contain --launch exactly once"
+        )
+    if "--resume" in command:
+        raise AutomaticSuccessorError(
+            "automatic successor must start a fresh sealed runtime"
+        )
+    if _single_command_value(command, "--manifest") != str(
+        successor_manifest
+    ):
+        raise AutomaticSuccessorError(
+            "successor command does not consume its sealed manifest"
+        )
+    if _single_command_value(command, "--runtime-root") != str(
+        successor_runtime_root
+    ):
+        raise AutomaticSuccessorError(
+            "successor command runtime differs from its sealed runtime root"
+        )
+    environment_file = Path(
+        str(successor.get("environment_file", ""))
+    )
+    if (
+        not environment_file.is_absolute()
+        or _single_command_value(command, "--env-file")
+        != str(environment_file)
+    ):
+        raise AutomaticSuccessorError(
+            "successor command must use its explicit absolute environment file"
+        )
+    routing = successor.get("routing")
+    if (
+        not isinstance(routing, Mapping)
+        or set(routing)
+        != {
+            "slurm_hostname",
+            "slurm_user",
+            "ssh_key_path",
+            "ssh_key_sha256",
+        }
+        or not isinstance(routing.get("slurm_hostname"), str)
+        or not routing["slurm_hostname"]
+        or not isinstance(routing.get("slurm_user"), str)
+        or not routing["slurm_user"]
+        or (
+            routing.get("ssh_key_path") is None
+            and routing.get("ssh_key_sha256") is not None
+        )
+        or (
+            routing.get("ssh_key_path") is not None
+            and (
+                not isinstance(routing["ssh_key_path"], str)
+                or not Path(routing["ssh_key_path"]).is_absolute()
+                or _SHA256_RE.fullmatch(
+                    str(routing.get("ssh_key_sha256", ""))
+                )
+                is None
+            )
+        )
+    ):
+        raise AutomaticSuccessorError(
+            "successor routing identity is incomplete"
         )
     environment = successor.get("environment")
     if (
@@ -304,12 +535,102 @@ def validate_successor_descriptor(path: Path) -> dict[str, Any]:
         raise AutomaticSuccessorError(
             "successor environment must be a non-empty explicit mapping"
         )
+    if not REQUIRED_SUCCESSOR_ENVIRONMENT.issubset(environment):
+        missing = sorted(REQUIRED_SUCCESSOR_ENVIRONMENT - set(environment))
+        raise AutomaticSuccessorError(
+            f"successor environment is missing required keys: {missing}"
+        )
+    forbidden = sorted(SECRET_ENVIRONMENT_NAMES & set(environment))
+    if forbidden:
+        raise AutomaticSuccessorError(
+            "successor descriptor must not embed credential variables: "
+            f"{forbidden}"
+        )
+    for key in ("HOME",):
+        if not Path(environment[key]).is_absolute():
+            raise AutomaticSuccessorError(
+                f"successor environment {key} must be absolute"
+            )
+    for key in ("PATH", "PYTHONPATH"):
+        entries = environment[key].split(os.pathsep)
+        if not entries or any(not Path(entry).is_absolute() for entry in entries):
+            raise AutomaticSuccessorError(
+                f"successor environment {key} entries must be absolute"
+            )
     completion_artifact = Path(
         str(successor.get("completion_artifact", ""))
     )
-    if not completion_artifact.is_absolute():
+    try:
+        completion_artifact.relative_to(successor_runtime_root)
+    except ValueError as exc:
         raise AutomaticSuccessorError(
-            "successor completion_artifact must be absolute"
+            "successor completion artifact must be inside its runtime root"
+        ) from exc
+    if (
+        not completion_artifact.is_absolute()
+        or completion_artifact
+        != successor_runtime_root / "completion.json"
+    ):
+        raise AutomaticSuccessorError(
+            "successor completion_artifact must be the sealed runtime "
+            "completion.json"
+        )
+    if _single_command_value(
+        command,
+        "--completion-artifact",
+    ) != str(completion_artifact):
+        raise AutomaticSuccessorError(
+            "successor command does not bind its terminal completion artifact"
+        )
+
+    manifest = _load_canonical_successor_manifest(successor_manifest)
+    execution = manifest.get("execution")
+    runtime = manifest.get("runtime")
+    ptms = manifest.get("ptms")
+    integrity = manifest.get("integrity")
+    if (
+        manifest.get("schema_version") != 1
+        or manifest.get("campaign_id") != successor.get("campaign_id")
+        or manifest.get("model") != "deformable_detr"
+        or not isinstance(execution, Mapping)
+        or execution.get("kind") != SUCCESSOR_EXECUTION_KIND
+        or execution.get("cpu_runs") != 0
+        or execution.get("smoke_runs") != 0
+        or execution.get("ministep_runs") != 0
+        or execution.get("local_model_runs") != 0
+        or execution.get("full_training") is not True
+        or execution.get("standalone_evaluation") is not True
+        or not isinstance(runtime, Mapping)
+        or runtime.get("nodes") != 1
+        or runtime.get("tasks_per_node") != 1
+        or runtime.get("gpus_per_node") != 8
+        or not str(runtime.get("sqsh_path", "")).endswith(".sqsh")
+        or _SHA256_RE.fullmatch(str(runtime.get("sqsh_sha256", "")))
+        is None
+        or not isinstance(ptms, list)
+        or len(ptms) != 2
+        or len({item.get("id") for item in ptms if isinstance(item, Mapping)})
+        != 2
+        or {
+            item.get("workflow_id")
+            for item in ptms
+            if isinstance(item, Mapping)
+        }
+        != {"gcvit_tiny", "resnet50"}
+        or not isinstance(integrity, Mapping)
+    ):
+        raise AutomaticSuccessorError(
+            "successor manifest violates the direct full Deformable DETR "
+            "execution contract"
+        )
+    if (
+        integrity.get("launcher_sha256")
+        != required_by_path[str(launcher_path)]["sha256"]
+        or integrity.get("manifest_generator_sha256")
+        != required_by_path[str(manifest_generator_path)]["sha256"]
+    ):
+        raise AutomaticSuccessorError(
+            "successor manifest source identities disagree with the descriptor"
         )
     return descriptor
 
@@ -348,6 +669,17 @@ def verify_successor_inputs(descriptor: Mapping[str, Any]) -> list[dict[str, Any
             raise AutomaticSuccessorError(
                 f"successor executable is unavailable: {executable_path}"
             )
+    environment_file = Path(successor["environment_file"])
+    observed_routing = routing_identity_from_environment_file(environment_file)
+    if observed_routing != successor["routing"]:
+        raise AutomaticSuccessorError(
+            "successor SLURM/SSH routing identity changed after sealing"
+        )
+    if Path(successor["completion_artifact"]).exists():
+        raise AutomaticSuccessorError(
+            "fresh automatic successor refuses a pre-existing completion "
+            "artifact"
+        )
     return evidence
 
 
@@ -364,20 +696,33 @@ def load_predecessor_manifest(
         raise AutomaticSuccessorError(
             "predecessor manifest file identity changed"
         )
-    campaign_root = path.parent
-    inserted = str(campaign_root)
-    sys.path.insert(0, inserted)
+    validator_path = Path(predecessor["manifest_validator_path"])
+    if (
+        not validator_path.is_file()
+        or sha256_file(validator_path)
+        != predecessor["manifest_validator_sha256"]
+    ):
+        raise AutomaticSuccessorError(
+            "predecessor manifest validator identity changed"
+        )
+    module_name = (
+        "_sealed_dino_manifest_generator_"
+        + predecessor["manifest_validator_sha256"][:16]
+    )
     try:
-        from manifest_generator import load_manifest
-
-        manifest = load_manifest(path)
+        spec = importlib.util.spec_from_file_location(
+            module_name,
+            validator_path,
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError("unable to construct sealed validator module")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        manifest = module.load_manifest(path)
     except Exception as exc:
         raise AutomaticSuccessorError(
             f"predecessor manifest validation failed: {type(exc).__name__}"
         ) from exc
-    finally:
-        if sys.path and sys.path[0] == inserted:
-            sys.path.pop(0)
     if manifest.get("manifest_sha256") != predecessor["manifest_sha256"]:
         raise AutomaticSuccessorError(
             "predecessor canonical manifest identity changed"
@@ -424,6 +769,149 @@ def verify_controller_alive(descriptor: Mapping[str, Any]) -> None:
             "DINO controller exited or its sealed process identity changed "
             "before producing terminal evidence"
         )
+
+
+def validate_successor_completion(
+    descriptor: Mapping[str, Any],
+    *,
+    not_before_ns: int | None = None,
+) -> dict[str, Any]:
+    """Validate the sealed terminal record emitted by the successor."""
+    successor = descriptor["successor"]
+    path = Path(successor["completion_artifact"])
+    if path.is_symlink() or not path.is_file():
+        raise AutomaticSuccessorError(
+            "successor returned without a regular completion artifact"
+        )
+    if not_before_ns is not None and path.stat().st_mtime_ns < not_before_ns:
+        raise AutomaticSuccessorError(
+            "successor completion artifact predates this launch"
+        )
+    value = load_json(path)
+    if not isinstance(value, Mapping):
+        raise AutomaticSuccessorError(
+            "successor completion artifact must be a mapping"
+        )
+    completion = copy.deepcopy(dict(value))
+    expected = completion.pop("completion_sha256", None)
+    if expected != canonical_sha256(completion):
+        raise AutomaticSuccessorError(
+            "successor completion artifact integrity verification failed"
+        )
+    outcomes = completion.get("outcomes")
+    workflows = completion.get("workflows")
+    manifest = _load_canonical_successor_manifest(
+        Path(successor["manifest_path"])
+    )
+    expected_workflows = {
+        str(item["workflow_id"]): str(item["id"])
+        for item in manifest["ptms"]
+    }
+    if (
+        completion.get("schema_version") != 1
+        or completion.get("campaign_id") != successor["campaign_id"]
+        or completion.get("model") != "deformable_detr"
+        or completion.get("manifest_sha256")
+        != manifest["manifest_sha256"]
+        or completion.get("terminal") is not True
+        or completion.get("status")
+        not in {"success", "terminal_with_failures"}
+        or completion.get("logical_workflows_submitted") != 2
+        or completion.get("workflows_started_in_parallel") is not True
+        or completion.get("cpu_runs") != 0
+        or completion.get("smoke_runs") != 0
+        or completion.get("ministep_runs") != 0
+        or completion.get("local_model_runs") != 0
+        or completion.get("failures_preserved") is not True
+        or completion.get("replacement_workflows_submitted") is not False
+        or not isinstance(outcomes, Mapping)
+        or set(outcomes) != set(expected_workflows)
+        or any(
+            value not in {"success", "terminal_failure"}
+            for value in outcomes.values()
+        )
+        or not isinstance(workflows, list)
+        or len(workflows) != 2
+        or any(
+            not isinstance(record, Mapping)
+            or record.get("terminal") is not True
+            or record.get("status")
+            not in {"success", "terminal_failure"}
+            for record in workflows
+        )
+    ):
+        raise AutomaticSuccessorError(
+            "successor completion artifact violates its terminal contract"
+        )
+    workflow_by_id: dict[str, Mapping[str, Any]] = {}
+    for index, record in enumerate(workflows):
+        workflow_id = str(record.get("workflow_id", ""))
+        if not workflow_id or workflow_id in workflow_by_id:
+            raise AutomaticSuccessorError(
+                "successor completion has duplicate or missing workflow IDs"
+            )
+        workflow_by_id[workflow_id] = record
+        status = record["status"]
+        exit_code = record.get("process_exit_code")
+        if (
+            workflow_id not in expected_workflows
+            or record.get("ptm_id") != expected_workflows[workflow_id]
+            or outcomes.get(workflow_id) != status
+            or isinstance(exit_code, bool)
+            or not isinstance(exit_code, int)
+            or (status == "success" and exit_code != 0)
+            or (status == "terminal_failure" and exit_code == 0)
+        ):
+            raise AutomaticSuccessorError(
+                f"successor workflow {index} is inconsistent with its "
+                "identity, outcome, or process exit"
+            )
+        if status == "success":
+            metrics = record.get("metrics")
+            if (
+                record.get("failure_preserved") is not False
+                or not isinstance(metrics, Mapping)
+                or set(metrics) != {"mAP", "mAP50"}
+            ):
+                raise AutomaticSuccessorError(
+                    f"successful successor workflow {workflow_id} lacks "
+                    "its exact metric evidence"
+                )
+            for metric_name, metric_value in metrics.items():
+                normalized = _finite_metric(
+                    metric_value,
+                    path=(
+                        "successor_completion.workflows."
+                        f"{workflow_id}.metrics.{metric_name}"
+                    ),
+                )
+                if not 0.0 <= normalized <= 1.0:
+                    raise AutomaticSuccessorError(
+                        f"successor workflow {workflow_id} metric "
+                        f"{metric_name} is outside [0, 1]"
+                    )
+        elif record.get("failure_preserved") is not True:
+            raise AutomaticSuccessorError(
+                f"failed successor workflow {workflow_id} was not preserved"
+            )
+    if set(workflow_by_id) != set(expected_workflows):
+        raise AutomaticSuccessorError(
+            "successor completion workflow identities are incomplete"
+        )
+    successful = sum(value == "success" for value in outcomes.values())
+    failed = len(expected_workflows) - successful
+    expected_status = "success" if failed == 0 else "terminal_with_failures"
+    if (
+        completion.get("successful_workflows") != successful
+        or completion.get("failed_workflows") != failed
+        or completion.get("status") != expected_status
+    ):
+        raise AutomaticSuccessorError(
+            "successor completion counts or aggregate status are inconsistent"
+        )
+    completion["completion_sha256"] = expected
+    completion["completion_file_sha256"] = sha256_file(path)
+    return completion
 
 
 def _validate_success_candidate(
@@ -900,25 +1388,28 @@ def validate_completed_dino(
                 raise AutomaticSuccessorError(
                     f"{candidate_path} objective-aware acquisition evidence changed"
                 )
-            if (
+            should_be_model_based = len(successful_visible) >= calibration
+            is_expected_model_based = (
                 proposal.get("stage") == "model_based"
+                and decision.get("stage") == "model_based"
                 and decision.get("active_method")
                 == EXPECTED_MODEL_BASED_METHOD[mode]
-            ):
-                if (
-                    decision.get("stage") != "model_based"
-                    or decision.get("optimization_direction")
-                    != EXPECTED_OPTIMIZATION_DIRECTION[mode]
-                    or len(successful_visible) < calibration
-                ):
-                    raise AutomaticSuccessorError(
-                        f"{candidate_path} model-based acquisition began incorrectly"
-                    )
-                adaptive_ids.append(rec_id)
-            elif proposal.get("stage") == "model_based":
+                and decision.get("optimization_direction")
+                == EXPECTED_OPTIMIZATION_DIRECTION[mode]
+            )
+            if should_be_model_based and not is_expected_model_based:
                 raise AutomaticSuccessorError(
-                    f"{candidate_path} used the wrong model-based acquisition"
+                    f"{candidate_path} reverted from objective-aware "
+                    "model-based acquisition after calibration"
                 )
+            if not should_be_model_based and proposal.get("stage") == (
+                "model_based"
+            ):
+                raise AutomaticSuccessorError(
+                    f"{candidate_path} model-based acquisition began incorrectly"
+                )
+            if is_expected_model_based:
+                adaptive_ids.append(rec_id)
             if state in SUCCESS_CANDIDATE_STATES:
                 _validate_success_candidate(
                     record,
@@ -1002,7 +1493,6 @@ def trigger_successor(
     gate_report: Mapping[str, Any],
 ) -> int:
     """Execute one sealed successor command and never silently retry it."""
-    inputs = verify_successor_inputs(descriptor)
     successor = descriptor["successor"]
     state_path = state_dir / "automatic_successor_state.json"
     if state_path.exists():
@@ -1011,6 +1501,14 @@ def trigger_successor(
             "automatic successor already has terminal or running state: "
             f"{previous.get('status')!r}"
         )
+    inputs = verify_successor_inputs(descriptor)
+    completion_path = Path(successor["completion_artifact"])
+    if completion_path.exists():
+        raise AutomaticSuccessorError(
+            "fresh automatic successor refuses a pre-existing completion "
+            "artifact"
+        )
+    launch_not_before_ns = time.time_ns()
     pending = {
         "schema_version": 1,
         "status": "successor_spawn_pending",
@@ -1023,6 +1521,7 @@ def trigger_successor(
         "required_file_evidence": inputs,
         "cpu_runs": 0,
         "smoke_runs": 0,
+        "launch_not_before_ns": launch_not_before_ns,
     }
     atomic_json(state_path, pending)
     log_path = state_dir / "automatic_successor.log"
@@ -1087,23 +1586,44 @@ def trigger_successor(
         )
         atomic_json(decision_path, decision)
         return_code = process.wait()
+    try:
+        completion = validate_successor_completion(
+            descriptor,
+            not_before_ns=launch_not_before_ns,
+        )
+    except AutomaticSuccessorError as exc:
+        invalid = {
+            **started,
+            "status": "successor_completion_invalid",
+            "finished_at_utc": utc_timestamp(),
+            "return_code": return_code,
+            "log_path": str(log_path),
+            "completion_artifact": successor["completion_artifact"],
+            "completion_error": str(exc),
+        }
+        atomic_json(state_path, invalid)
+        raise
+    successful = (
+        return_code == 0 and completion.get("status") == "success"
+    )
     finished = {
         **started,
         "status": (
             "successor_completed"
-            if return_code == 0
+            if successful
             else "successor_failed"
         ),
         "finished_at_utc": utc_timestamp(),
         "return_code": return_code,
         "log_path": str(log_path),
         "completion_artifact": successor["completion_artifact"],
-        "completion_artifact_present": Path(
-            successor["completion_artifact"]
-        ).is_file(),
+        "completion_artifact_present": True,
+        "completion_status": completion["status"],
+        "completion_sha256": completion["completion_sha256"],
+        "completion_file_sha256": completion["completion_file_sha256"],
     }
     atomic_json(state_path, finished)
-    return return_code
+    return 0 if successful else (return_code or 1)
 
 
 def reconcile_existing_trigger(
@@ -1120,6 +1640,11 @@ def reconcile_existing_trigger(
         )
     status = state.get("status")
     if status == "successor_completed":
+        completion = validate_successor_completion(descriptor)
+        if completion["status"] != "success":
+            raise AutomaticSuccessorError(
+                "completed successor state has a non-success completion"
+            )
         return 0
     if status == "successor_running":
         identity = state.get("process_identity")
