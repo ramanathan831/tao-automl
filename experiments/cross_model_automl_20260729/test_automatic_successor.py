@@ -23,8 +23,10 @@ from automatic_successor import (  # noqa: E402
     EXPECTED_OPTIMIZATION_DIRECTION,
     MODES,
     SELECTION_TIME_ISOLATION,
+    _history_snapshot,
     _process_identity,
     _selection_config,
+    _validate_candidate_history_alignment,
     canonical_sha256,
     routing_identity_from_environment_file,
     sha256_file,
@@ -540,6 +542,116 @@ def _fixture(tmp_path: Path):
         descriptor_path,
         descriptor,
     )
+
+
+def _failure_history(*, failure_reason: str = "required_eval_fn_failed:test"):
+    specs = {"model.enc_layers": 4}
+    return {
+        "rec_id": 0,
+        "specs": specs,
+        "job_id": "failed-job",
+        "metric": 0,
+        "objective_score": 0,
+        "objective_values": {"mAP50": 0},
+        "status": "failure",
+        "failure_reason": failure_reason,
+    }
+
+
+def test_terminal_failure_aligns_with_runner_failure_sentinel():
+    history = _failure_history()
+    record = {
+        "status": "terminal_failure",
+        "specs": history["specs"],
+        "train_job_id": history["job_id"],
+        "failure_reason": history["failure_reason"],
+        "automl_status": "failure",
+        "reported_metric": None,
+    }
+
+    assert (
+        _validate_candidate_history_alignment(
+            record,
+            history,
+            candidate_path="accuracy.candidates.accuracy_rec_0",
+        )
+        is False
+    )
+    assert _history_snapshot(history) == {
+        "candidate_id": "0",
+        "candidate_fingerprint": (
+            __import__(
+                "tao_automl.selection",
+                fromlist=["canonical_spec_fingerprint"],
+            ).canonical_spec_fingerprint(history["specs"])
+        ),
+        "status": "failure",
+        "objective_values": {"mAP50": 0},
+        "failure_reason": history["failure_reason"],
+    }
+
+
+def test_pre_submission_cancellation_is_narrowly_recovered():
+    history = _failure_history(failure_reason="job_canceled")
+    record = {
+        "agent_intervention_flags": algorithmic_campaign_flags(),
+        "candidate_id": "accuracy_rec_0",
+        "rec_id": "0",
+        "recommendation_audit": {},
+        "specs": history["specs"],
+        "status": "recommended",
+    }
+
+    assert (
+        _validate_candidate_history_alignment(
+            record,
+            history,
+            candidate_path="accuracy.candidates.accuracy_rec_0",
+        )
+        is True
+    )
+
+
+def test_recommended_non_cancellation_failure_is_rejected():
+    history = _failure_history()
+    record = {
+        "agent_intervention_flags": algorithmic_campaign_flags(),
+        "candidate_id": "accuracy_rec_0",
+        "rec_id": "0",
+        "recommendation_audit": {},
+        "specs": history["specs"],
+        "status": "recommended",
+    }
+
+    with pytest.raises(
+        AutomaticSuccessorError,
+        match="not a narrowly recoverable cancellation",
+    ):
+        _validate_candidate_history_alignment(
+            record,
+            history,
+            candidate_path="accuracy.candidates.accuracy_rec_0",
+        )
+
+
+def test_replay_uses_explicit_retention_only_for_latency_mode():
+    assert (
+        _selection_config(
+            MANIFEST,
+            "latency",
+        ).latency_accuracy_retention.value
+        == 0.90
+    )
+    assert (
+        _selection_config(
+            MANIFEST,
+            "accuracy",
+        ).latency_accuracy_retention.value
+        == 0.98
+    )
+    multi_objective = _selection_config(MANIFEST, "multi_objective")
+    assert multi_objective.latency_accuracy_retention.value == 0.98
+    assert multi_objective.multi_objective_min_accuracy is None
 
 
 def test_completed_gate_triggers_successor_exactly_once(tmp_path):

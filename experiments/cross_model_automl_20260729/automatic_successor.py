@@ -41,10 +41,18 @@ from tao_automl.selection import (
 
 
 MODES = ("accuracy", "latency", "multi_objective")
-TERMINAL_CANDIDATE_STATES = frozenset(
-    {"success", "terminal_failure", "failure", "error", "done"}
-)
 SUCCESS_CANDIDATE_STATES = frozenset({"success", "done"})
+FAILED_HISTORY_STATES = frozenset({"failure", "error"})
+RECOVERED_CANCELLATION_RECORD_KEYS = frozenset(
+    {
+        "agent_intervention_flags",
+        "candidate_id",
+        "rec_id",
+        "recommendation_audit",
+        "specs",
+        "status",
+    }
+)
 EXPECTED_MODEL_BASED_METHOD = {
     "accuracy": "accuracy_expected_improvement",
     "latency": "constrained_latency_expected_improvement",
@@ -1106,15 +1114,20 @@ def _selection_config(
     mode: str,
 ) -> SelectionConfig:
     search = manifest["search"]
+    retention = (
+        AccuracyConstraint(
+            kind="relative",
+            value=search["latency_accuracy_retention"],
+            reference="accuracy_winner",
+        )
+        if mode == "latency"
+        else AccuracyConstraint()
+    )
     return SelectionConfig(
         mode=mode,
         accuracy_metric="mAP50",
         latency_metric="latency_ms",
-        latency_accuracy_retention=AccuracyConstraint(
-            kind="relative",
-            value=search["latency_accuracy_retention"],
-            reference="accuracy_winner",
-        ),
+        latency_accuracy_retention=retention,
         multi_objective_min_accuracy=None,
         accuracy_tolerance=1.0e-12,
         latency_tolerance=search["latency_practical_tolerance_ms"],
@@ -1124,6 +1137,109 @@ def _selection_config(
         latency_ci_low_metric="latency_ci95_low_ms",
         latency_ci_high_metric="latency_ci95_high_ms",
     )
+
+
+def _history_snapshot(history_item: Mapping[str, Any]) -> dict[str, Any]:
+    """Return immutable observation fields exposed to later recommendations."""
+    return {
+        "candidate_id": str(history_item["rec_id"]),
+        "candidate_fingerprint": canonical_spec_fingerprint(
+            history_item["specs"]
+        ),
+        "status": history_item["status"],
+        "objective_values": history_item.get("objective_values", {}),
+        "failure_reason": history_item.get("failure_reason"),
+    }
+
+
+def _visible_history_snapshot(item: Mapping[str, Any]) -> dict[str, Any]:
+    """Project an issuance-time observation onto immutable raw evidence."""
+    return {
+        key: item.get(key)
+        for key in (
+            "candidate_id",
+            "candidate_fingerprint",
+            "status",
+            "objective_values",
+            "failure_reason",
+        )
+    }
+
+
+def _validate_candidate_history_alignment(
+    record: Mapping[str, Any],
+    history_item: Mapping[str, Any],
+    *,
+    candidate_path: str,
+) -> bool:
+    """Validate candidate evidence against terminal runner history.
+
+    Returns ``True`` only for a cancellation whose candidate artifact was
+    intentionally left at the pre-submission ``recommended`` state by an
+    interrupted controller.  The terminal runner history remains the
+    authoritative preserved failure record in that narrow case.
+    """
+    state = str(record.get("status", "")).lower()
+    history_status = str(history_item.get("status", "")).lower()
+    if history_item.get("specs") != record.get("specs"):
+        raise AutomaticSuccessorError(
+            f"{candidate_path} specifications differ from runner history"
+        )
+    if history_status in SUCCESS_CANDIDATE_STATES:
+        if (
+            state not in SUCCESS_CANDIDATE_STATES
+            or history_item.get("job_id") != record.get("train_job_id")
+            or history_item.get("objective_values", {})
+            != record.get("objective_values", {})
+        ):
+            raise AutomaticSuccessorError(
+                f"{candidate_path} differs from runner history "
+                "(successful candidate)"
+            )
+        return False
+    if history_status not in FAILED_HISTORY_STATES:
+        raise AutomaticSuccessorError(
+            f"{candidate_path} history status is not terminal"
+        )
+    failure_reason = history_item.get("failure_reason")
+    job_id = history_item.get("job_id")
+    if (
+        not isinstance(failure_reason, str)
+        or not failure_reason
+        or not isinstance(job_id, str)
+        or not job_id
+        or history_item.get("metric") != 0
+        or history_item.get("objective_score") != 0
+        or history_item.get("objective_values") != {"mAP50": 0}
+    ):
+        raise AutomaticSuccessorError(
+            f"{candidate_path} runner failure sentinel is malformed"
+        )
+    if state == "recommended":
+        if (
+            failure_reason != "job_canceled"
+            or set(record) != RECOVERED_CANCELLATION_RECORD_KEYS
+        ):
+            raise AutomaticSuccessorError(
+                f"{candidate_path} is not a narrowly recoverable cancellation"
+            )
+        return True
+    if state not in {"terminal_failure", "failure", "error"}:
+        raise AutomaticSuccessorError(
+            f"{candidate_path} is not terminal: {state!r}"
+        )
+    if (
+        record.get("train_job_id") != job_id
+        or record.get("failure_reason") != failure_reason
+        or record.get("automl_status") not in (None, history_status)
+        or record.get("reported_metric") is not None
+        or record.get("objective_values") not in (None, {"mAP50": 0})
+    ):
+        raise AutomaticSuccessorError(
+            f"{candidate_path} differs from runner history "
+            "(failed candidate)"
+        )
+    return False
 
 
 def _selection_winner_id(
@@ -1259,6 +1375,7 @@ def validate_completed_dino(
             )
 
         success_ids: set[str] = set()
+        recovered_cancellation_ids: list[str] = []
         adaptive_ids: list[str] = []
         archive: list[dict[str, Any]] = []
         history_by_id = {
@@ -1270,11 +1387,6 @@ def validate_completed_dino(
             if not isinstance(record, Mapping):
                 raise AutomaticSuccessorError(
                     f"{candidate_path} must be a mapping"
-                )
-            state = str(record.get("status", "")).lower()
-            if state not in TERMINAL_CANDIDATE_STATES:
-                raise AutomaticSuccessorError(
-                    f"{candidate_path} is not terminal: {state!r}"
                 )
             _require_exact_false_flags(
                 record.get("agent_intervention_flags"),
@@ -1308,32 +1420,13 @@ def validate_completed_dino(
                 )
             history_item = history_by_id[rec_id]
             history_status = str(history_item.get("status", "")).lower()
-            if history_status not in {
-                "success",
-                "done",
-                "failure",
-                "error",
-            }:
-                raise AutomaticSuccessorError(
-                    f"{candidate_path} history status is not terminal"
-                )
-            if (
-                history_item.get("specs") != specs
-                or history_item.get("job_id") != record.get("train_job_id")
-                or history_item.get("objective_values", {})
-                != record.get("objective_values", {})
-            ):
-                raise AutomaticSuccessorError(
-                    f"{candidate_path} differs from runner history"
-                )
-            if (
-                state in SUCCESS_CANDIDATE_STATES
-            ) != (
-                history_status in SUCCESS_CANDIDATE_STATES
-            ):
-                raise AutomaticSuccessorError(
-                    f"{candidate_path} terminal status differs from history"
-                )
+            recovered_cancellation = _validate_candidate_history_alignment(
+                record,
+                history_item,
+                candidate_path=candidate_path,
+            )
+            if recovered_cancellation:
+                recovered_cancellation_ids.append(rec_id)
             if (
                 audit.get("search_algorithm") != "bayesian"
                 or audit.get("search_seed")
@@ -1355,14 +1448,16 @@ def validate_completed_dino(
                 raise AutomaticSuccessorError(
                     f"{candidate_path} visible history is missing"
                 )
-            expected_visible_ids = [
-                str(index) for index in range(int(rec_id))
+            expected_visible = [
+                _history_snapshot(history_by_id[str(index)])
+                for index in range(int(rec_id))
             ]
             if [
-                str(item.get("candidate_id")) for item in visible
-            ] != expected_visible_ids:
+                _visible_history_snapshot(item) for item in visible
+            ] != expected_visible:
                 raise AutomaticSuccessorError(
-                    f"{candidate_path} visible history is not issuance-ordered"
+                    f"{candidate_path} visible history differs from the "
+                    "issuance-ordered runner history"
                 )
             successful_visible = [
                 item
@@ -1410,7 +1505,7 @@ def validate_completed_dino(
                 )
             if is_expected_model_based:
                 adaptive_ids.append(rec_id)
-            if state in SUCCESS_CANDIDATE_STATES:
+            if history_status in SUCCESS_CANDIDATE_STATES:
                 _validate_success_candidate(
                     record,
                     candidate_path=candidate_path,
@@ -1418,16 +1513,16 @@ def validate_completed_dino(
                     fingerprint=fingerprint,
                 )
                 success_ids.add(rec_id)
-            archive.append(
-                {
-                    "id": int(rec_id),
-                    "specs": copy.deepcopy(specs),
-                    "status": history_status,
-                    "objective_values": copy.deepcopy(
-                        history_item.get("objective_values", {})
-                    ),
-                }
-            )
+                archive.append(
+                    {
+                        "id": int(rec_id),
+                        "specs": copy.deepcopy(specs),
+                        "status": history_status,
+                        "objective_values": copy.deepcopy(
+                            history_item.get("objective_values", {})
+                        ),
+                    }
+                )
 
         if len(success_ids) <= calibration or not adaptive_ids:
             raise AutomaticSuccessorError(
@@ -1461,6 +1556,10 @@ def validate_completed_dino(
             "completed_candidates": budget,
             "successful_candidates": len(success_ids),
             "failed_candidates": budget - len(success_ids),
+            "recovered_canceled_candidate_ids": sorted(
+                recovered_cancellation_ids,
+                key=lambda value: int(value),
+            ),
             "model_based_candidate_ids": sorted(
                 adaptive_ids,
                 key=lambda value: int(value),
