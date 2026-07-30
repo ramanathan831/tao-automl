@@ -6,19 +6,39 @@ import copy
 import concurrent.futures
 import json
 import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from omegaconf import OmegaConf
 
 from tao_automl.ptm_registry import canonical_sha256
 
 from . import manifest_generator as generator
 from . import qualification_evidence
 from . import run_campaign
+from . import deformable_detr_latency_worker as latency_worker
 
 
 HERE = Path(__file__).resolve().parent
+
+
+@dataclass
+class _EvaluateDefaults:
+    input_width: int | None = None
+    input_height: int | None = None
+
+
+@dataclass
+class _ExportDefaults:
+    format: str = "onnx"
+
+
+@dataclass
+class _ExperimentDefaults:
+    evaluate: _EvaluateDefaults = field(default_factory=_EvaluateDefaults)
+    export: _ExportDefaults = field(default_factory=_ExportDefaults)
 
 
 @pytest.fixture(scope="module")
@@ -256,6 +276,18 @@ def test_stabilized_latency_contract_and_worker_are_deformable_detr_specific(
         checkpoint="/lustre/model.pth",
         candidate_fingerprint="a" * 64,
     )
+
+
+def test_latency_worker_materializes_complete_structured_model_defaults():
+    config = latency_worker._materialize_experiment_config(
+        {"evaluate": {"input_width": 960}},
+        omega_conf=OmegaConf,
+        experiment_config_type=_ExperimentDefaults,
+    )
+
+    assert config.evaluate.input_width == 960
+    assert config.evaluate.input_height is None
+    assert config.export.format == "onnx"
 
 
 def test_first_candidate_gate_releases_automatically(manifest, tmp_path):

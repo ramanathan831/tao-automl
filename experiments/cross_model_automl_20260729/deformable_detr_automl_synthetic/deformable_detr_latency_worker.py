@@ -67,6 +67,19 @@ def _tensor_sha256(tensor: Any) -> str:
     ).hexdigest()
 
 
+def _materialize_experiment_config(
+    specification: Any,
+    *,
+    omega_conf: Any,
+    experiment_config_type: Any,
+) -> Any:
+    """Merge raw worker YAML with the model's complete structured defaults."""
+    if not isinstance(specification, dict):
+        raise TypeError("Deformable DETR latency specification must be a mapping")
+    defaults = omega_conf.structured(experiment_config_type())
+    return omega_conf.merge(defaults, omega_conf.create(specification))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, required=True)
@@ -83,6 +96,9 @@ def main() -> int:
     import torch.distributed as dist
     import yaml
     from omegaconf import OmegaConf
+    from nvidia_tao_pytorch.config.deformable_detr.default_config import (
+        ExperimentConfig,
+    )
     from nvidia_tao_pytorch.cv.deformable_detr.dataloader.pl_od_data_module import (
         ODDataModule,
     )
@@ -174,7 +190,15 @@ def main() -> int:
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
 
-    config = OmegaConf.create(specification)
+    # The TAO Hydra entrypoints merge raw YAML with ExperimentConfig before
+    # constructing the model and datamodule.  This direct latency worker must
+    # reproduce that contract so optional defaults such as export.format and
+    # evaluate.input_width/input_height cannot disappear from raw OmegaConf.
+    config = _materialize_experiment_config(
+        specification,
+        omega_conf=OmegaConf,
+        experiment_config_type=ExperimentConfig,
+    )
     config.dataset.batch_size = 1
     config.dataset.workers = 0
     config.dataset.pin_memory = False
@@ -355,4 +379,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
