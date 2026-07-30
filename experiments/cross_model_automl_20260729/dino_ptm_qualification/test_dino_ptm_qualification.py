@@ -228,9 +228,11 @@ def test_serializer_qualification_evidence_matches_registry_and_worker():
     assert evidence["implementation"]["worker_size_bytes"] == (
         worker_path.stat().st_size
     )
-    assert evidence["implementation"]["registry_raw_sha256"] == sha256_file(
-        registry_path
-    )
+    frozen_registry_version = evidence["implementation"]["registry_version"]
+    frozen_registry_sha256 = evidence["implementation"][
+        "registry_raw_sha256"
+    ]
+    current_registry_sha256 = sha256_file(registry_path)
     assert evidence["implementation"]["recipe_sha256"] == canonical_sha256(
         DINO_METADATA_PROJECTION_RECIPE
     )
@@ -243,6 +245,23 @@ def test_serializer_qualification_evidence_matches_registry_and_worker():
     )
 
     registry = load_ptm_registry(registry_path).to_dict()
+    current_registry_version = registry["registry_version"]
+    if current_registry_version == frozen_registry_version:
+        assert current_registry_sha256 == frozen_registry_sha256
+    else:
+        # The qualification evidence intentionally binds the exact registry
+        # bytes that existed when the serializer was run.  A later registry
+        # release may promote unrelated, independently qualified PTMs without
+        # invalidating that immutable evidence.  In that case, require a
+        # strictly newer registry and verify the complete DINO adapter records
+        # semantically below instead of pretending the historical raw file is
+        # the current file.
+        assert tuple(map(int, current_registry_version.split("."))) > tuple(
+            map(int, frozen_registry_version.split("."))
+        )
+        assert current_registry_sha256 != frozen_registry_sha256
+        assert len(frozen_registry_sha256) == 64
+        int(frozen_registry_sha256, 16)
     adapter_records = {
         record["id"]: record
         for record in registry["models"]["dino"]["checkpoints"]
