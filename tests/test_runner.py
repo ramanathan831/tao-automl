@@ -2480,6 +2480,69 @@ def test_run_one_job_cancels_hard_failure_and_recovers_remote_best_score(tmp_pat
     fake_sdk.cancel_job.assert_called_once_with("job-hard")
 
 
+def test_run_one_job_preserves_backend_retry_for_infrastructure_failure(tmp_path):
+    from tao_automl.runner import AutoMLRunner
+
+    skill_dir = _write_fake_skill(tmp_path)
+    fake_sdk = MagicMock()
+    fake_sdk.create_job.return_value = MagicMock(
+        id="job-retryable", backend_job_id="be-retryable"
+    )
+    log_snapshots = iter(
+        (
+            "NVIDIA driver on your system is too old\n"
+            "torch.distributed.elastic.multiprocessing.errors."
+            "ChildFailedError\n",
+            "[cosmos] Validation rank 0: avg_loss=0.751, samples=6\n",
+        )
+    )
+    latest_logs = [
+        "NVIDIA driver on your system is too old\n"
+        "torch.distributed.elastic.multiprocessing.errors.ChildFailedError\n"
+    ]
+
+    def get_logs(_job_id, tail=None):
+        del tail
+        try:
+            latest_logs[0] = next(log_snapshots)
+        except StopIteration:
+            pass
+        return latest_logs[0]
+
+    fake_sdk.get_job_logs.side_effect = get_logs
+    fake_sdk.get_failure_analysis.return_value = {
+        "reason": "infrastructure_failure_pattern",
+        "retriable": True,
+    }
+    fake_sdk.get_job_status.side_effect = (
+        MagicMock(status="Pending"),
+        MagicMock(status="Complete"),
+    )
+
+    runner = AutoMLRunner(sdk=fake_sdk, skill_dir=skill_dir, action="train")
+    runner._poll_interval = 0
+    rec = MagicMock(id=11)
+
+    with patch(
+        "tao_sdk.script_runner.build_entrypoint",
+        return_value={"command": "BAKED_HEREDOC_COMMAND", "args_template": ""},
+    ):
+        metric, status = runner._run_one_job(
+            image="nvcr.io/test:1",
+            action_cfg=runner.skill_ctx.action_cfg,
+            specs={"train": {"num_epochs": 1}},
+            rec=rec,
+            metric_name="val/avg_loss",
+            workspace_path=str(tmp_path),
+            platform_kwargs={},
+        )
+
+    assert metric == pytest.approx(0.751)
+    assert status == "success"
+    assert fake_sdk.get_job_status.call_count == 2
+    fake_sdk.cancel_job.assert_not_called()
+
+
 def test_run_one_job_preserves_metric_when_slurm_reports_canceled(tmp_path):
     from tao_automl.runner import AutoMLRunner
 

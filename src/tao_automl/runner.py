@@ -2418,6 +2418,33 @@ def _classify_failure(logs: str) -> str | None:
     return None
 
 
+def _platform_failure_is_retriable(sdk: Any, job_id: str) -> bool:
+    """Return whether the execution backend owns retry for this failure.
+
+    Some execution SDKs, notably SLURM, classify infrastructure failures from
+    the job logs and resubmit the same durable job identity after the scheduler
+    reaches a terminal state.  AutoML must not cancel that writer merely
+    because the same retryable text becomes visible slightly before the
+    scheduler reports ``FAILED``.
+    """
+    analyze = getattr(sdk, "get_failure_analysis", None)
+    if not callable(analyze):
+        return False
+    try:
+        analysis = analyze(job_id)
+    except Exception as exc:
+        logger.warning(
+            "Could not obtain platform failure analysis for job %s: %s",
+            job_id,
+            exc,
+        )
+        return False
+    return (
+        isinstance(analysis, dict)
+        and analysis.get("retriable") is True
+    )
+
+
 def _compare_to_baseline(
     baseline_metric: float | None,
     best_metric: float | None,
@@ -4353,7 +4380,21 @@ class AutoMLRunner:
                                         rec.id,
                                         _format_metric_payload(primary_metric),
                                     )
-                    if es:
+                    if es == "FAIL" and _platform_failure_is_retriable(
+                        self._sdk, job.id
+                    ):
+                        # The backend must observe the scheduler's terminal
+                        # state to perform its bounded retry.  Canceling here
+                        # would convert a retryable infrastructure incident
+                        # into an AutoML candidate failure.
+                        cached_exec_status = None
+                        logger.warning(
+                            "Rec %d: job %s has a retryable platform failure; "
+                            "deferring cancellation to preserve backend retry",
+                            rec.id,
+                            job.id,
+                        )
+                    elif es:
                         cached_exec_status = es
                         if es == "FAIL":
                             logger.warning(
@@ -4712,7 +4753,18 @@ class AutoMLRunner:
                                             )
                                         ),
                                     )
-                    if es:
+                    if es == "FAIL" and _platform_failure_is_retriable(
+                        self._sdk, job_id
+                    ):
+                        cached_exec_status = None
+                        logger.warning(
+                            "Resume: rec %d job %s has a retryable platform "
+                            "failure; deferring cancellation to preserve "
+                            "backend retry",
+                            rec_id,
+                            job_id,
+                        )
+                    elif es:
                         cached_exec_status = es
                         if es == "FAIL":
                             logger.warning(
