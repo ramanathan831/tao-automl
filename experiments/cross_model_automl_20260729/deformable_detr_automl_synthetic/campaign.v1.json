@@ -316,14 +316,14 @@
     },
     "manifest_generator": {
       "path": "/localhome/local-rarunachalam/tao-automl/experiments/cross_model_automl_20260729/deformable_detr_automl_synthetic/manifest_generator.py",
-      "sha256": "8e69f978325c43019a3d2bbf0e50944da8346e02b19cff9b548069c5361141dc"
+      "sha256": "209322b248f36584480deb0464ac4363abfb35248a1c54046121411757478299"
     },
     "qualification_evidence": {
       "path": "/localhome/local-rarunachalam/tao-automl/experiments/cross_model_automl_20260729/deformable_detr_automl_synthetic/qualification_evidence.py",
       "sha256": "188cd26b179d6eccd3c69e8e3b6b220cc64b37a69f3a0b443052ca9ca4c5f319"
     }
   },
-  "manifest_sha256": "09285bf1d9479c35348c82d81a7e5786e17972aeded96fcaf3bc17d49f9783cc",
+  "manifest_sha256": "3d3b9118de610c23e7d7801fe712d64fff98d6c3b085c57e3f28ab8f16e6f97e",
   "model": "deformable_detr",
   "modes": [
     {
@@ -737,11 +737,11 @@
     "selector_invoked_on_matched_measurements": false
   },
   "source": {
-    "commit": "d527c5091af4e741b045fdbcfc37fac114991f03",
+    "commit": "1919228616b80fcb0e5e06fae1d1f1c12f0d83e2",
     "launch_head_policy": "clean_descendant",
     "repository": "/localhome/local-rarunachalam/tao-automl",
-    "wheel_path": "/localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/wheel/af06b3073155/nvidia_tao_automl-0.1.0-py3-none-any.whl",
-    "wheel_sha256": "af06b3073155372cfb3392a71631aa0b350dbf54fea05ff5b5243809af191173"
+    "wheel_path": "/localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/wheel/1919228616b8/nvidia_tao_automl-0.1.0-py3-none-any.whl",
+    "wheel_sha256": "3463187cb76ec3d07c64a21eaf34140e56bf251b46e56ce3c89c33728ee22784"
   },
   "task": "object_detection"
 }
