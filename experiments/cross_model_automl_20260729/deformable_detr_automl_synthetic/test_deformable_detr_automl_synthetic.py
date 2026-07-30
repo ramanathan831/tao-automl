@@ -34,8 +34,8 @@ def test_campaign_is_direct_three_mode_and_preserves_frozen_budget(manifest):
         "local_model_runs": 0,
         "shared_archive": False,
         "independent_mode_jobs": True,
-        "submission_ready": False,
-        "blocked_before_sdk_construction": True,
+        "submission_ready": True,
+        "blocked_before_sdk_construction": False,
     }
     assert manifest["search"]["candidate_budget_per_mode"] == 20
     assert manifest["search"]["training_epochs"] == 10
@@ -302,18 +302,18 @@ def test_qualification_adapter_gates_on_shared_dataset_campaign(manifest):
     assert evidence["expected_manifest_sha256"] == (
         qualification_evidence.EXPECTED_QUALIFICATION_MANIFEST_SHA256
     )
-    assert evidence["runtime_ready"] is False
-    assert evidence["blockers"]
+    assert evidence["runtime_ready"] is True
+    assert evidence["blockers"] == []
 
 
-def test_launch_fails_before_sdk_while_qualification_or_registry_is_blocked(
-    manifest,
-):
+def test_launch_fails_before_sdk_for_a_synthetic_blocked_projection(manifest):
+    blocked = _blocked_projection(manifest)
     with pytest.raises(
         run_campaign.CampaignExecutionError,
         match="fail-closed|changed after sealing",
     ):
-        run_campaign.assert_launchable(manifest)
+        run_campaign.assert_launchable(blocked)
+    run_campaign.assert_launchable(manifest)
 
 
 def test_run_mode_rejects_non_typed_ptm_inventory_before_sdk_use(
@@ -333,8 +333,8 @@ def test_run_mode_rejects_non_typed_ptm_inventory_before_sdk_use(
 
 def test_launch_plan_exposes_automatic_gate_and_exact_blocker(manifest):
     plan = run_campaign.launch_plan(manifest)
-    assert plan["submission_ready"] is False
-    assert plan["qualification_blockers"]
+    assert plan["submission_ready"] is True
+    assert plan["qualification_blockers"] == []
     assert plan["first_candidate_gate"]["automatic_release"] is True
     assert plan["first_candidate_gate"]["remaining_candidates_per_mode"] == 19
     assert plan["per_candidate_children"] == [
@@ -351,7 +351,7 @@ def test_manifest_tampering_fails_closed(manifest):
         generator.validate_manifest(tampered)
 
     tampered = copy.deepcopy(manifest)
-    tampered["execution"]["submission_ready"] = True
+    tampered["execution"]["submission_ready"] = False
     tampered.pop("manifest_sha256")
     with pytest.raises(generator.ManifestError):
         generator.validate_manifest(tampered, require_seal=False)
@@ -362,16 +362,26 @@ def test_agent_and_selection_isolation_flags_are_false(manifest):
     assert all(not value for value in manifest["selection_isolation_flags"].values())
 
 
-def _ready_projection(manifest):
+def _blocked_projection(manifest):
     value = copy.deepcopy(manifest)
     value.pop("manifest_sha256")
-    value["qualification_evidence"]["blockers"] = []
-    value["qualification_evidence"]["runtime_ready"] = True
+    value["qualification_evidence"]["blockers"] = [
+        {
+            "checkpoint_id": ptm["id"],
+            "code": "registry_status_not_supported",
+            "observed_status": "unverified",
+            "reason": "synthetic automatic-trigger test blocker",
+            "required_status": "supported",
+            "stage": "registry_runtime_eligibility",
+        }
+        for ptm in value["ptms"]
+    ]
+    value["qualification_evidence"]["runtime_ready"] = False
     value["qualification_evidence"]["decision_sha256"] = "b" * 64
-    value["execution"]["submission_ready"] = True
-    value["execution"]["blocked_before_sdk_construction"] = False
+    value["execution"]["submission_ready"] = False
+    value["execution"]["blocked_before_sdk_construction"] = True
     for ptm in value["ptms"]:
-        ptm["registry_status"] = "supported"
+        ptm["registry_status"] = "unverified"
         ptm["registry_record_sha256"] = "c" * 64
     return generator.seal_manifest(value)
 
@@ -380,10 +390,10 @@ def test_automatic_trigger_waits_then_releases_same_frozen_campaign(
     manifest,
     tmp_path,
 ):
-    ready = _ready_projection(manifest)
-    documents = iter((manifest, ready))
+    blocked = _blocked_projection(manifest)
+    documents = iter((blocked, manifest))
     observed = run_campaign.wait_for_launch_authorization(
-        manifest,
+        blocked,
         runtime_root=tmp_path,
         poll_seconds=0.001,
         timeout_seconds=1,
@@ -392,20 +402,21 @@ def test_automatic_trigger_waits_then_releases_same_frozen_campaign(
         sleeper=lambda _seconds: None,
         monotonic=lambda: 0.0,
     )
-    assert observed == ready
+    assert observed == manifest
     assert run_campaign.frozen_campaign_signature(observed) == (
-        run_campaign.frozen_campaign_signature(manifest)
+        run_campaign.frozen_campaign_signature(blocked)
     )
     assert json.loads(
         (tmp_path / "automatic_trigger_status.json").read_text()
     )["status"] == "ready"
     assert json.loads(
         (tmp_path / "launch_manifest.json").read_text()
-    ) == ready
+    ) == manifest
 
 
 def test_automatic_trigger_rejects_preregistered_drift(manifest, tmp_path):
-    drifted = copy.deepcopy(_ready_projection(manifest))
+    blocked = _blocked_projection(manifest)
+    drifted = copy.deepcopy(manifest)
     drifted.pop("manifest_sha256")
     drifted["runtime"]["time_hours"] = 5.0
     drifted = generator.seal_manifest(drifted)
@@ -414,7 +425,7 @@ def test_automatic_trigger_rejects_preregistered_drift(manifest, tmp_path):
         match="campaign drift",
     ):
         run_campaign.wait_for_launch_authorization(
-            manifest,
+            blocked,
             runtime_root=tmp_path,
             poll_seconds=0.001,
             timeout_seconds=1,
@@ -491,7 +502,6 @@ def test_three_mode_controller_is_concurrent_and_inventory_typed_at_boundary(
     tmp_path,
     monkeypatch,
 ):
-    ready = _ready_projection(manifest)
     monkeypatch.setattr(run_campaign, "assert_launchable", lambda _value: None)
     barrier = threading.Barrier(3)
     observed = []
@@ -527,7 +537,7 @@ def test_three_mode_controller_is_concurrent_and_inventory_typed_at_boundary(
         return {"mode": kwargs["mode"], "status": "success"}
 
     completion = run_campaign.launch_mode_controllers(
-        manifest=ready,
+        manifest=manifest,
         report=Report(),
         runtime_root=tmp_path,
         sdk_factory=sdk_factory,

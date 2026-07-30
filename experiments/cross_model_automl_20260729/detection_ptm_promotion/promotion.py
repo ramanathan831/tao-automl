@@ -615,7 +615,10 @@ def derive_qualification_decision(
         or completion.get("manifest_sha256") != manifest_sha
         or completion.get("terminal") is not True
         or not isinstance(outcomes, Mapping)
-        or tuple(outcomes) != expected_workflows
+        # JSON object member order is not semantic, and the sealed writer
+        # canonicalizes mapping keys. The workflow evidence list below
+        # remains strictly ordered.
+        or set(outcomes) != set(expected_workflows)
         or not isinstance(workflows, list)
         or tuple(
             item.get("workflow_id")

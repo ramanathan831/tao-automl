@@ -126,7 +126,7 @@ def _registry(*records, default_ptm=None):
 def test_packaged_dino_registry_and_schema_load():
     registry = load_ptm_registry()
     assert registry.schema_version == 1
-    assert registry.registry_version == "1.2.1"
+    assert registry.registry_version == "1.3.0"
     assert "dino" in registry.models
     assert registry.models == tuple(sorted(registry.models))
     assert len(registry.document_sha256) == 64
@@ -811,12 +811,14 @@ def test_packaged_cross_model_inventory_is_exact_and_fail_closed():
         ),
     }
     assert set(document["models"]) == {"dino", *expected}
+    supported_models = {"deformable_detr", "rtdetr"}
 
     for model, exact_members in expected.items():
         config = document["models"][model]
         assert config["default_ptm"] is None
         assert all(
-            record["status"] == "unverified"
+            record["status"]
+            == ("supported" if model in supported_models else "unverified")
             for record in config["checkpoints"]
         )
         actual = {
@@ -840,6 +842,12 @@ def test_cross_model_ngc_checksums_are_authoritative_hex_when_available():
         if "sha256" in record
     }
     assert checksums == {
+        "deformable_detr.coco.resnet50.trainable.v1.0": (
+            "ddb80bd87fe5882c7b86e6402d9a7b91be874505330140b0d19a42b095fa7b3f"
+        ),
+        "deformable_detr.coco.gcvit_tiny.trainable.v1.0": (
+            "519937c15c6282a9628a8abb616d0f14f1363ea4992048c9357e8ae2f7fb29ba"
+        ),
         "rtdetr.trafficcam.resnet50.trainable.v2.0": (
             "9e21450a1eac2012ab713dc103e1655eb438a73a125e2f23b0a2ba8c0583ea6a"
         ),
@@ -885,7 +893,7 @@ def test_cross_model_ngc_checksums_are_authoritative_hex_when_available():
     )
 
 
-def test_cross_model_runtime_resolution_excludes_every_unverified_record():
+def test_cross_model_runtime_resolution_uses_qualified_status():
     registry = load_ptm_registry()
     tasks = {
         "deformable_detr": "object_detection",
@@ -902,13 +910,20 @@ def test_cross_model_runtime_resolution_excludes_every_unverified_record():
             tao_version="7.1.0",
             task=task,
         )
-        assert not result.ok, model
-        assert result.eligible_checkpoint_ids == ()
         assert result.default_checkpoint_id is None
-        assert all(
-            exclusion.codes == ("status_unverified",)
-            for exclusion in result.excluded
-        )
+        if model in {"deformable_detr", "rtdetr"}:
+            assert result.ok, model
+            assert len(result.eligible_checkpoint_ids) == (
+                2 if model == "deformable_detr" else 4
+            )
+            assert result.excluded == ()
+        else:
+            assert not result.ok, model
+            assert result.eligible_checkpoint_ids == ()
+            assert all(
+                exclusion.codes == ("status_unverified",)
+                for exclusion in result.excluded
+            )
 
 
 def test_cross_model_repository_sidecars_match_registered_path_free_overrides():
@@ -934,18 +949,35 @@ def test_cross_model_repository_sidecars_match_registered_path_free_overrides():
             *sidecar["path"].split("/")
         )
         sidecar_spec = yaml.safe_load(resource.read_text(encoding="utf-8"))
-        assert sidecar_spec == record["default_spec_overrides"], record["id"]
+        overrides = record["default_spec_overrides"]
+        if record["model_family"] == "rtdetr":
+            assert sidecar_spec == {"model": overrides["model"]}, record["id"]
+            augmentation = overrides["dataset"]["augmentation"]
+            assert augmentation["train_spatial_size"] == [
+                record["input_contract"]["height"],
+                record["input_contract"]["width"],
+            ]
+            assert augmentation["eval_spatial_size"] == [
+                record["input_contract"]["height"],
+                record["input_contract"]["width"],
+            ]
+            assert (
+                augmentation["preserve_aspect_ratio"]
+                == record["input_contract"]["preprocessing"][
+                    "preserve_aspect_ratio"
+                ]
+            )
+        else:
+            assert sidecar_spec == overrides, record["id"]
         serialized = resource.read_text(encoding="utf-8")
         assert "/lustre/" not in serialized
         assert "/datasets/" not in serialized
         assert "/checkpoints/" not in serialized
 
 
-def test_rich_cross_model_records_are_qualification_only():
+def test_rich_cross_model_records_follow_qualification_state():
     registry = load_ptm_registry()
     expected_counts = {
-        "deformable_detr": ("object_detection", 2),
-        "rtdetr": ("object_detection", 4),
         "grounding_dino": ("grounded_object_detection", 2),
         "mask2former": ("instance_segmentation", 1),
     }
@@ -958,6 +990,14 @@ def test_rich_cross_model_records_are_qualification_only():
         )
         assert len(result.candidate_checkpoint_ids) == expected_count, model
         assert result.to_dict()["runtime_eligible"] is False
+    for model, expected_count in {"deformable_detr": 2, "rtdetr": 4}.items():
+        result = registry.compatibility(
+            model,
+            tao_version="7.1.0",
+            task="object_detection",
+        )
+        assert len(result.eligible_checkpoint_ids) == expected_count, model
+        assert result.ok
 
 
 def test_complete_supported_record_is_valid():

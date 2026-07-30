@@ -38,6 +38,37 @@ def _rehash(value: dict, field: str) -> dict:
     return value
 
 
+def _test_case(model: str) -> tuple[PTMRegistry, dict]:
+    """Build an immutable pre-promotion fixture from the live registry."""
+    document = load_ptm_registry().to_dict()
+    document["registry_version"] = "test-pre-detection-promotion"
+    for record in document["models"][model]["checkpoints"]:
+        record["status"] = "unverified"
+        record["status_reason"] = "synthetic pre-promotion test fixture"
+        record.pop("validation", None)
+        if model == "rtdetr":
+            record["default_spec_overrides"].pop("dataset", None)
+    base = PTMRegistry(document)
+    manifest_path = (
+        DDETR_MANIFEST if model == "deformable_detr" else RTDETR_MANIFEST
+    )
+    manifest = _load(manifest_path)
+    manifest["integrity"]["ptm_registry_sha256"] = base.document_sha256
+    records = {
+        item["id"]: item
+        for item in base.to_dict()["models"][model]["checkpoints"]
+    }
+    for ptm in manifest["ptms"]:
+        record = records[ptm["id"]]
+        ptm["registry_status_before_qualification"] = "unverified"
+        ptm["registry_record_sha256"] = canonical_sha256(record)
+        ptm["default_spec_overrides"] = copy.deepcopy(
+            record["default_spec_overrides"]
+        )
+    _rehash(manifest, "manifest_sha256")
+    return base, manifest
+
+
 def _success_workflow(
     manifest: dict,
     ptm: dict,
@@ -253,8 +284,7 @@ def _records(document: dict, model: str) -> dict[str, dict]:
 
 
 def test_ddetr_promotes_exact_full_success_population_and_preserves_default():
-    base = load_ptm_registry()
-    manifest = _load(DDETR_MANIFEST)
+    base, manifest = _test_case("deformable_detr")
     evidence = _evidence(
         "deformable_detr",
         manifest,
@@ -286,8 +316,7 @@ def test_ddetr_promotes_exact_full_success_population_and_preserves_default():
 
 
 def test_partial_failure_is_untouched_and_preserved_in_audit():
-    base = load_ptm_registry()
-    manifest = _load(DDETR_MANIFEST)
+    base, manifest = _test_case("deformable_detr")
     failed_id = manifest["ptms"][0]["id"]
     evidence = _evidence(
         "deformable_detr",
@@ -321,8 +350,7 @@ def test_partial_failure_is_untouched_and_preserved_in_audit():
 
 
 def test_rtdetr_resume_promotes_and_projects_frozen_input_contracts():
-    base = load_ptm_registry()
-    manifest = _load(RTDETR_MANIFEST)
+    base, manifest = _test_case("rtdetr")
     evidence = _evidence(
         "rtdetr",
         manifest,
@@ -385,9 +413,26 @@ def test_rtdetr_resume_promotes_and_projects_frozen_input_contracts():
     }
 
 
+def test_outcome_mapping_order_is_not_treated_as_identity():
+    base, manifest = _test_case("rtdetr")
+    completion = _completion(manifest, resume=True)
+    completion["outcomes"] = dict(
+        sorted(completion["outcomes"].items())
+    )
+    _rehash(completion, "completion_sha256")
+
+    decision = derive_qualification_decision(
+        base,
+        _evidence("rtdetr", manifest, completion),
+    )
+
+    assert decision.promoted_checkpoint_ids == tuple(
+        item["id"] for item in manifest["ptms"]
+    )
+
+
 def test_rtdetr_rejects_nonresume_completion():
-    base = load_ptm_registry()
-    manifest = _load(RTDETR_MANIFEST)
+    base, manifest = _test_case("rtdetr")
     completion = _completion(manifest, resume=True)
     completion.pop("resume_completed_training")
     _rehash(completion, "completion_sha256")
@@ -426,8 +471,7 @@ def test_manifest_population_identity_and_intervention_drift_rejected(
     mutation,
     message,
 ):
-    base = load_ptm_registry()
-    manifest = _load(RTDETR_MANIFEST)
+    base, manifest = _test_case("rtdetr")
     completion = _completion(manifest, resume=True)
     mutation(manifest, completion)
     _rehash(manifest, "manifest_sha256")
@@ -443,8 +487,7 @@ def test_manifest_population_identity_and_intervention_drift_rejected(
 
 
 def test_status_evidence_and_completion_hash_tampering_rejected():
-    base = load_ptm_registry()
-    manifest = _load(DDETR_MANIFEST)
+    base, manifest = _test_case("deformable_detr")
     completion = _completion(manifest, resume=False)
     completion["workflows"][0]["jobs"]["train"]["status_evidence"][
         "validation_record_count"
@@ -472,7 +515,7 @@ def test_status_evidence_and_completion_hash_tampering_rejected():
 
 
 def test_cli_is_create_only_and_never_modifies_base_registry(tmp_path):
-    base = load_ptm_registry()
+    base, manifest = _test_case("deformable_detr")
     base_path = tmp_path / "base.json"
     manifest_path = tmp_path / "manifest.json"
     completion_path = tmp_path / "completion.json"
@@ -482,7 +525,6 @@ def test_cli_is_create_only_and_never_modifies_base_registry(tmp_path):
         json.dumps(base.to_dict(), sort_keys=True),
         encoding="utf-8",
     )
-    manifest = _load(DDETR_MANIFEST)
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     completion_path.write_text(
         json.dumps(_completion(manifest, resume=False)),
