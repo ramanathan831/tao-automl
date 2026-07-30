@@ -304,7 +304,7 @@
   "launcher_integrity": {
     "campaign_controller": {
       "path": "/localhome/local-rarunachalam/tao-automl/experiments/cross_model_automl_20260729/deformable_detr_automl_synthetic/run_campaign.py",
-      "sha256": "17883742dbfed45557043944d2fd5053ac1b4f0276ecdcbdb36f82aad58288f1"
+      "sha256": "b00fb18de561b48ca193315685aa33b09b5bf67b9669a452228cbb9b974b1a0d"
     },
     "latency_input": {
       "path": "/localhome/local-rarunachalam/tao-automl/experiments/cross_model_automl_20260729/deformable_detr_automl_synthetic/latency_input.v1.json",
@@ -323,7 +323,7 @@
       "sha256": "188cd26b179d6eccd3c69e8e3b6b220cc64b37a69f3a0b443052ca9ca4c5f319"
     }
   },
-  "manifest_sha256": "2d49b2161ae54caf53f96845c2a1d2bd1e724c3175dae0f6f05937ef906f320c",
+  "manifest_sha256": "af0a5577db308c88d8e777d3a8a4f554eb29de448edb627e304d58cd85d53e68",
   "model": "deformable_detr",
   "modes": [
     {
@@ -736,7 +736,7 @@
     "selector_invoked_on_matched_measurements": false
   },
   "source": {
-    "commit": "c0c15d3f727c685acbffa005d60772e1ad7acba3",
+    "commit": "d56e1a7d05b7d9c5535e079c48359a64d921138c",
     "launch_head_policy": "clean_descendant",
     "repository": "/localhome/local-rarunachalam/tao-automl",
     "wheel_path": "/localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/wheel/af06b3073155/nvidia_tao_automl-0.1.0-py3-none-any.whl",
