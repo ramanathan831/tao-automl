@@ -330,6 +330,10 @@ def main() -> int:
     if last_output is None:
         raise RuntimeError("DINO latency benchmark did not execute")
     record.pop("record_sha256")
+    tao_job_id = os.environ.get("TAO_JOB_ID")
+    if not tao_job_id:
+        raise RuntimeError("TAO_JOB_ID is required for job-isolated evidence")
+    record["tao_job_id"] = tao_job_id
     record["input_evidence"] = input_evidence
     record["rank_runtime_evidence"] = rank_runtime_evidence
     record["record_sha256"] = _canonical_sha256(record)

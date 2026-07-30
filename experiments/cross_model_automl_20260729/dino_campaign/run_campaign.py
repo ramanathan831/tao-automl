@@ -886,7 +886,7 @@ def _launch_latency(
             "--runtime-modules-root",
             "/tmp/dino_campaign_runtime",
             "--output-root",
-            '"$TAO_RESULTS_ROOT/latency"',
+            '"$TAO_RESULTS_ROOT/$TAO_JOB_ID/latency"',
         ]
     )
     action = yaml.safe_load(
@@ -977,6 +977,21 @@ def _launch_latency(
             f"{shlex.quote(root + '/latency')}"
         )
     )
+    if len(records) != manifest["latency_protocol"]["expected_replicas"]:
+        raise CampaignExecutionError(
+            f"latency job {job_id} produced {len(records)}/"
+            f"{manifest['latency_protocol']['expected_replicas']} "
+            "job-scoped replica records"
+        )
+    record_job_ids = {
+        item.get("tao_job_id")
+        for item in records
+        if isinstance(item, Mapping)
+    }
+    if record_job_ids != {job_id}:
+        raise CampaignExecutionError(
+            f"latency replica records are not isolated to TAO job {job_id}"
+        )
     input_hashes = set()
     rank_runtime_evidence = []
     for item in records:
@@ -1009,11 +1024,7 @@ def _launch_latency(
                     f"latency replica hardware changed: {key}"
                 )
         rank_runtime_evidence.append(dict(runtime_evidence))
-    if (
-        len(records) != 8
-        or len(input_hashes) != 1
-        or None in input_hashes
-    ):
+    if len(input_hashes) != 1 or None in input_hashes:
         raise CampaignExecutionError(
             "latency replicas did not use one identical preprocessed input set"
         )

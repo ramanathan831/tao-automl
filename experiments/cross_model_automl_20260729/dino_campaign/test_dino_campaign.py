@@ -538,7 +538,13 @@ def test_latency_child_job_is_persisted_and_reused(
     tmp_path: Path,
 ):
     script_runner = types.ModuleType("tao_sdk.script_runner")
-    script_runner.build_entrypoint = lambda **_kwargs: {"command": "latency"}
+    entrypoint_inputs = []
+
+    def _build_entrypoint(**kwargs):
+        entrypoint_inputs.append(copy.deepcopy(kwargs))
+        return {"command": "latency"}
+
+    script_runner.build_entrypoint = _build_entrypoint
     package = types.ModuleType("tao_sdk")
     package.script_runner = script_runner
     monkeypatch.setitem(sys.modules, "tao_sdk", package)
@@ -570,6 +576,7 @@ def test_latency_child_job_is_persisted_and_reused(
     evidence["sha256"] = run_campaign.manifest_sha256(evidence)
     records = [
         {
+            "tao_job_id": "latency-child",
             "input_evidence": copy.deepcopy(evidence),
             "rank_runtime_evidence": {
                 **sealed_manifest["runtime"]["hardware_contract"],
@@ -580,11 +587,14 @@ def test_latency_child_job_is_persisted_and_reused(
         }
         for rank in range(8)
     ]
-    monkeypatch.setattr(
-        run_campaign,
-        "remote_output",
-        lambda _command, timeout=900: json.dumps(records),
-    )
+    remote_commands = []
+
+    def _remote_output(command, timeout=900):
+        del timeout
+        remote_commands.append(command)
+        return json.dumps(records)
+
+    monkeypatch.setattr(run_campaign, "remote_output", _remote_output)
 
     class SDK:
         def __init__(self):
@@ -623,6 +633,11 @@ def test_latency_child_job_is_persisted_and_reused(
     assert ledger[0]["tao_job_id"] == "latency-child"
     assert child["aggregate_evidence"]["aggregate"] == aggregate
     assert sdk.created == 1
+    assert (
+        '"$TAO_RESULTS_ROOT/$TAO_JOB_ID/latency"'
+        in entrypoint_inputs[0]["command"]
+    )
+    assert "/results/latency-child/latency" in remote_commands[0]
 
     run_campaign._launch_latency(
         sdk,
