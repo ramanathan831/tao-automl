@@ -51,7 +51,10 @@ def _canonical_sha256(value: Any) -> str:
     ).hexdigest()
 
 
-def build() -> dict[str, Any]:
+def build(
+    *,
+    source_repository: Path | None = None,
+) -> dict[str, Any]:
     manifest = json.loads(BASE.read_text(encoding="utf-8"))
     manifest.pop("manifest_sha256")
     dataset = json.loads(DATASET_MANIFEST.read_text(encoding="utf-8"))
@@ -60,6 +63,8 @@ def build() -> dict[str, Any]:
     manifest["campaign_id"] = (
         "deformable-detr-synthetic-direct-qualification-20260730"
     )
+    if source_repository is not None:
+        manifest["source"]["repository"] = str(source_repository.resolve())
     manifest["runtime"].update(
         {
             "sdk_dir": str(SDK_DIR),
@@ -102,8 +107,9 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--verify", action="store_true")
+    parser.add_argument("--source-repository", type=Path)
     args = parser.parse_args()
-    expected = build()
+    expected = build(source_repository=args.source_repository)
     if args.verify:
         observed = json.loads(args.output.read_text(encoding="utf-8"))
         if observed != expected:
