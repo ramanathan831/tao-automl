@@ -94,6 +94,17 @@ repository-owned path-free YAML sidecar. Known checkpoint hashes are retained;
 the older commercial v1.0 member must be hashed while staging. All four remain
 `unverified` and are not runtime eligible.
 
+`ptm_stage.py` is the repository-owned data-only staging path. It must run on a
+login host where `/lustre` is mounted. It resolves each exact NGC member with
+the production authenticated HTTPS client, verifies the remote and downloaded
+size, verifies registered checksums (or records the observed checksum for the
+immutable v1.0 member), uses `AtomicArtifactCache`, and atomically publishes an
+exact read-only four-file stage. Reuse is byte-verified; unexpected files,
+symlinks, writable completed artifacts, partial completed manifests, or
+identity drift fail closed. The local and Lustre manifest copies are
+byte-identical and use exactly the schema consumed by `ptm_stage_record()` and
+`load_ptm_stage()`.
+
 Qualification is deliberately stronger than a smoke test. Each staged arm must
 complete one real three-epoch full-dataset train and standalone full-validation
 workflow on one node/eight A100s. In-epoch and standalone mask AP must be finite
@@ -155,7 +166,7 @@ per mode are released automatically.
 
 Current exact blockers:
 
-- the four-PTM immutable stage manifest is absent;
+- the four-PTM immutable stage manifest has not been executed;
 - direct full-run qualification evidence is absent;
 - all four registry records remain `unverified`;
 - a clean post-change source commit and matching production wheel have not been
@@ -166,8 +177,23 @@ exist would create invalid evidence.
 
 ## Reproduction sequence
 
-After staging the exact four PTMs and building a wheel from a clean reviewed
-commit:
+Run the data-only PTM stage on the SLURM login host (not as a SLURM job):
+
+```bash
+set -a
+source /localhome/local-rarunachalam/.tao/config.env
+set +a
+ssh -t "${SLURM_USER}@${SLURM_HOSTNAME%%,*}" \
+  "cd /localhome/local-rarunachalam/tao-automl && \
+   PATH=/localhome/local-rarunachalam/.tao/venvs/dino-multiobjective-py314/bin:\$PATH \
+   PYTHONPATH=\$PWD:\$PWD/src \
+   python -m \
+   experiments.cross_model_automl_20260729.mask_grounding_dino_coco2017_campaign.ptm_stage \
+   --env-file /localhome/local-rarunachalam/.tao/config.env"
+```
+
+The CLI records zero model, smoke, mini-step, GPU, and SLURM executions in its
+secret-free summary. After this stage and a wheel from a clean reviewed commit:
 
 ```bash
 cd /localhome/local-rarunachalam/tao-automl

@@ -63,6 +63,14 @@ node/eight A100s per arm. Every unsuccessful arm is preserved as a terminal
 exclusion. Success is still blocked until the exact registry record is
 independently promoted to `supported`; evidence never bypasses registry policy.
 
+The repository now includes a minimal data-only `ptm_stage.py` path for all
+four arms. It uses `NGCHTTPSClient` and `AtomicArtifactCache`, verifies exact
+immutable member identity, size, and checksum, and atomically publishes
+read-only bytes plus the existing stage-manifest schema on Lustre. It is
+create-or-verify idempotent and rejects unexpected content, symlinks, writable
+completed artifacts, checksum drift, and manifest replacement. It contains no
+model or scheduler import and records zero model and SLURM executions.
+
 ## Three independent mode jobs
 
 Each mode has 24 recommendations, three full epochs per candidate, its own
@@ -95,7 +103,7 @@ the remaining 23 recommendations per mode are automatically released.
 
 | Blocker | State |
 | --- | --- |
-| Four-checkpoint immutable PTM stage manifest | Missing |
+| Four-checkpoint immutable PTM stage manifest | Stager implemented; execution pending |
 | Direct-full qualification completion | Missing |
 | Runtime-supported Mask Grounding DINO registry record | None; 4/4 unverified |
 | Clean final source commit and matching wheel | Not yet sealed |
@@ -115,10 +123,10 @@ specification, and integrity failure paths.
 The final static verification completed with:
 
 ```text
-campaign-specific suite: 26 passed
-focused metric/PTM/runtime/wheel/campaign suite: 278 passed
+campaign-specific suite: 31 passed
+focused metric/PTM/runtime/wheel/campaign suite: 283 passed
 full production suite: 969 passed, 1 skipped
-complete cross-model experiment suite: 344 passed
+complete cross-model experiment suite: 349 passed
 python compilation: passed
 git diff --check: passed
 ```
