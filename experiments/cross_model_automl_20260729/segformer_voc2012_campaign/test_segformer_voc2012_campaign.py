@@ -1091,6 +1091,80 @@ def test_direct_qualification_submission_is_pinned_one_node_eight_gpu(
     assert "segformer train -e {config_path}" in guard
 
 
+def test_training_status_evidence_counts_one_evaluation_record_per_epoch(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    records = []
+    for epoch in range(campaign_contract.FROZEN_TRAINING_EPOCHS):
+        metric = 0.10 + epoch / 100
+        kpi = {"val_miou": metric}
+        records.extend(
+            [
+                {
+                    "message": "Eval metrics generated.",
+                    "kpi": copy.deepcopy(kpi),
+                },
+                {
+                    "message": "Training loop in progress",
+                    "kpi": copy.deepcopy(kpi),
+                },
+            ]
+        )
+    records.append({"message": "Train finished successfully."})
+    monkeypatch.setattr(
+        qualification_campaign,
+        "_status_records",
+        lambda *_args, **_kwargs: (
+            records,
+            {"path": "/immutable/status.json", "record_count": len(records)},
+        ),
+    )
+
+    evidence = qualification_campaign._training_status_evidence(
+        object(),
+        "job-id",
+    )
+
+    assert evidence["validation_record_count"] == 10
+    assert [row["val_miou"] for row in evidence["validation_metrics"]] == [
+        0.10 + epoch / 100 for epoch in range(10)
+    ]
+    assert evidence["val_miou"] == pytest.approx(0.19)
+    assert evidence["terminal_success"] is True
+
+
+def test_training_status_evidence_rejects_missing_epoch_evaluation_record(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    records = [
+        {
+            "message": "Eval metrics generated.",
+            "kpi": {"val_miou": 0.2},
+        }
+        for _ in range(campaign_contract.FROZEN_TRAINING_EPOCHS - 1)
+    ]
+    records.extend(
+        [
+            {
+                "message": "Training loop in progress",
+                "kpi": {"val_miou": 0.2},
+            },
+            {"message": "Train finished successfully."},
+        ]
+    )
+    monkeypatch.setattr(
+        qualification_campaign,
+        "_status_records",
+        lambda *_args, **_kwargs: (records, {"record_count": len(records)}),
+    )
+
+    with pytest.raises(
+        qualification_campaign.CampaignExecutionError,
+        match="emitted 9 val_miou records; expected 10",
+    ):
+        qualification_campaign._training_status_evidence(object(), "job-id")
+
+
 def test_qualification_slurm_preflight_is_read_only_and_job_free(
     contract,
     monkeypatch: pytest.MonkeyPatch,

@@ -1080,7 +1080,14 @@ def _training_status_evidence(
     validation = []
     for record in records:
         kpi = record.get("kpi")
-        if not isinstance(kpi, Mapping) or "val_miou" not in kpi:
+        # TAO writes the same validation snapshot twice per epoch: first when
+        # evaluation generates it, then again with the training-loop progress
+        # record. Only the evaluation record is an independent observation.
+        if (
+            record.get("message") != "Eval metrics generated."
+            or not isinstance(kpi, Mapping)
+            or "val_miou" not in kpi
+        ):
             continue
         validation.append(
             {
