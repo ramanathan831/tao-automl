@@ -24,10 +24,7 @@ from .contract import (
 )
 from .dataset_conversion import validate_conversion_manifest
 from .dataset_stage import validate_stage_record
-from .future_contract import (
-    build_future_contract,
-    validate_future_contract,
-)
+from .future_contract import validate_future_contract
 from .qualification_campaign import (
     CampaignExecutionError,
     _gpu_guard,
@@ -136,7 +133,25 @@ def test_every_official_repository_ptm_is_derived_without_manual_filtering():
     )
     assert [item["id"] for item in records] == expected
     assert len(records) == 2
-    assert all(item["status"] == "unverified" for item in records)
+    assert all(item["status"] == "supported" for item in records)
+    assert all(
+        item["validation"]["status"] == "validated"
+        and item["validation"]["tao_version"] == "7.1.0-rc-245"
+        for item in records
+    )
+    for item in records:
+        validation = item["validation"]
+        assert "sqsh-sha256:e36640f9" in validation["container_identity"]
+        assert (
+            "completion_sha256="
+            "172688d1af2479886c46f55fa148bf43a7487b517b2ea145c3359136100de698"
+            in validation["evidence"]
+        )
+        assert (
+            "pilot_handoff_sha256="
+            "318d93fc04260650a67452eb00a710658744bf83fe3462115a9c320b12315ec8"
+            in validation["evidence"]
+        )
 
 
 def test_schema_search_space_is_repository_derived(preparation):
@@ -209,7 +224,7 @@ def test_metric_contract_is_task_specific_and_ptm_gate_remains_closed(preparatio
     codes = {item["code"] for item in gate["blockers"]}
     assert "referring_expression_annotation_contract_missing" in codes
     assert "category_detection_metric_policy_not_supported" not in codes
-    assert "official_ptms_not_production_qualified" in codes
+    assert "official_ptms_not_production_qualified" not in codes
     assert "converted_dataset_artifacts_not_sealed" in codes
 
 
@@ -410,19 +425,16 @@ def test_future_contract_binds_only_fresh_ddetr_candidate_zero_gate():
     )
 
 
-def test_future_contract_is_reproducible_and_uses_staged_bert():
-    inputs = read_json(HERE / "campaign.inputs.v3.json")
+def test_sealed_future_contract_remains_valid_after_registry_promotion():
     stage = read_json(HERE / "runtime_inputs.stage.v1.json")
     expected = read_json(HERE / "successor.runtime.contract.v2.json")
-
-    observed = build_future_contract(
-        experiment_dir=HERE,
-        inputs=inputs,
-        stage=stage,
-    )
-    assert observed == expected
+    validate_future_contract(expected)
+    assert {
+        job["registry_status_before_qualification"]
+        for job in expected["qualification"]["jobs"]
+    } == {"unverified"}
     text_root = stage["text_encoder"]["lustre_root"]
-    for job in observed["qualification"]["jobs"]:
+    for job in expected["qualification"]["jobs"]:
         assert job["train"]["spec"]["model"]["text_encoder_type"] == text_root
         assert job["evaluate"]["spec"]["model"]["text_encoder_type"] == text_root
         assert job["resources"]["gpus_per_node"] == 8

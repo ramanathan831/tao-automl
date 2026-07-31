@@ -100,9 +100,10 @@ PYTHONPATH=src \
   --check-only
 ```
 
-The historical `campaign.preparation.v1.json` is retained unchanged. The
-current successor contract intentionally states `launch_authorized: false`;
-no GPU job has been submitted from this directory.
+The historical `campaign.preparation.v1.json` is retained unchanged. Its
+preparation-only authorization fields describe that historical stage; later
+qualification execution is recorded separately by the v2 runtime contract
+and its immutable completion evidence.
 
 ## Future structured-config successor
 
@@ -165,3 +166,83 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src:. \
   --output experiments/cross_model_automl_20260729/grounding_dino_shared_detection/successor.runtime.contract.v2.json \
   --check-only
 ```
+
+## Qualification-driven three-mode pilot
+
+The integrated successor qualification completed both official PTM arms with
+ten training epochs, ten validation records, standalone evaluation of each
+exact terminal checkpoint, one node, and all eight A100 GPUs. Both arms are
+eligible regardless of their observed metric:
+
+| PTM | final `val_mAP50` | standalone `test_mAP50` |
+| --- | ---: | ---: |
+| `grounding_dino.commercial.swin_tiny.trainable.v1.0` | `0.15590265377426205` | `0.15600353298044012` |
+| `grounding_dino.commercial.swin_tiny.trainable.v1.1` | `0.7452574943938746` | `0.7466380476209992` |
+
+The two metrics are independently required to be finite and valid. They are
+not required to be bit-equal; the qualification adapter records their signed
+difference without applying a result-fitted tolerance. Terminal checkpoint
+identity must match exactly between training and standalone evaluation.
+
+The repository registry promotes exactly these two successful qualifications
+to `supported` for TAO 7.1.0. The validation records are bound to:
+
+- qualification completion canonical SHA-256
+  `172688d1af2479886c46f55fa148bf43a7487b517b2ea145c3359136100de698`;
+- qualification completion file SHA-256
+  `d09b9940aaa98c4f1f5b24dd802546e6dad98b9cf34ff5ce1d8504c0652edb13`;
+- automatic handoff canonical SHA-256
+  `318d93fc04260650a67452eb00a710658744bf83fe3462115a9c320b12315ec8`;
+- automatic handoff file SHA-256
+  `82ee846b27b42bffeb559a88dcf18d353d72eea8cc1e9b0eae241725124807cf`.
+
+`pilot.inputs.v1.json` freezes one portable, input-driven campaign:
+
+- three independent Bayesian jobs and observation namespaces;
+- 20 algorithm-generated candidates per mode;
+- accuracy EI, constrained-latency EI with a self-calibrated 90% retention
+  guard, and multi-objective ParEGO EI;
+- hierarchical nonordinal PTM arms derived from all successful
+  qualifications;
+- the same shared synthetic dataset and ten-epoch training fidelity;
+- one node and eight GPUs for training, standalone evaluation, and latency;
+- the pinned RC245 SQSH, SDK, skills, offline BERT tree, and A100 hardware
+  contract;
+- 50 warm-ups and five rounds of 100 timed requests on each of eight
+  replicas, yielding 4,000 latency samples per candidate;
+- an automatic cross-mode candidate-zero gate that releases candidates 1–19
+  only after all three candidate-zero records pass.
+
+There is no CPU/model smoke path, manual candidate injection, manual PTM
+exclusion, shared observation archive, or confirmation pause. Failed
+recommendations are preserved and are not replaced.
+
+After the controller commit is integrated into the clean source checkout,
+seal the launch manifest outside the repository and start the automatic
+handoff consumer:
+
+```bash
+RUNTIME_ROOT=/localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/grounding_dino_three_mode_pilot_v1
+mkdir -p "$RUNTIME_ROOT"
+
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src:. \
+  python -m \
+  experiments.cross_model_automl_20260729.grounding_dino_shared_detection.pilot_manifest \
+  --inputs experiments/cross_model_automl_20260729/grounding_dino_shared_detection/pilot.inputs.v1.json \
+  --output "$RUNTIME_ROOT/pilot.campaign.v1.json"
+
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src:. \
+  python -m \
+  experiments.cross_model_automl_20260729.grounding_dino_shared_detection.pilot_campaign \
+  --automatic-trigger \
+  --inputs experiments/cross_model_automl_20260729/grounding_dino_shared_detection/pilot.inputs.v1.json \
+  --manifest "$RUNTIME_ROOT/pilot.campaign.v1.json" \
+  --runtime-root "$RUNTIME_ROOT" \
+  --env-file /localhome/local-rarunachalam/.tao/config.env
+```
+
+The controller re-audits the completion, handoff, registry, source, SDK,
+skills, SQSH, dataset, and latency-input hashes before constructing the SDK.
+The automatic consumer then submits the three candidate-zero jobs in parallel
+and continues with the frozen remaining budget without user confirmation.
+This controller branch does not itself submit pilot jobs.

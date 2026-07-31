@@ -126,7 +126,7 @@ def _registry(*records, default_ptm=None):
 def test_packaged_dino_registry_and_schema_load():
     registry = load_ptm_registry()
     assert registry.schema_version == 1
-    assert registry.registry_version == "1.3.0"
+    assert registry.registry_version == "1.4.0"
     assert "dino" in registry.models
     assert registry.models == tuple(sorted(registry.models))
     assert len(registry.document_sha256) == 64
@@ -811,7 +811,11 @@ def test_packaged_cross_model_inventory_is_exact_and_fail_closed():
         ),
     }
     assert set(document["models"]) == {"dino", *expected}
-    supported_models = {"deformable_detr", "rtdetr"}
+    supported_models = {
+        "deformable_detr",
+        "rtdetr",
+        "grounding_dino",
+    }
 
     for model, exact_members in expected.items():
         config = document["models"][model]
@@ -863,6 +867,9 @@ def test_cross_model_ngc_checksums_are_authoritative_hex_when_available():
         "grounding_dino.commercial.swin_tiny.trainable.v1.1": (
             "8ea7e089e174e72a7fe57ff63cdba5e1e4994b159e41cf72122a7e0d841beaa6"
         ),
+        "grounding_dino.commercial.swin_tiny.trainable.v1.0": (
+            "20c3ea116d1b841063aa5efffdd386b3d85a1c35f2d702d3c95150ef1efead73"
+        ),
         "oneformer.ade20k.research.swin_large.trainable.v1.0": (
             "bd727f429eba64978afdf87fadb98a801a0574b45fe033faf3514b4045e561f4"
         ),
@@ -911,11 +918,13 @@ def test_cross_model_runtime_resolution_uses_qualified_status():
             task=task,
         )
         assert result.default_checkpoint_id is None
-        if model in {"deformable_detr", "rtdetr"}:
+        if model in {"deformable_detr", "rtdetr", "grounding_dino"}:
             assert result.ok, model
-            assert len(result.eligible_checkpoint_ids) == (
-                2 if model == "deformable_detr" else 4
-            )
+            assert len(result.eligible_checkpoint_ids) == {
+                "deformable_detr": 2,
+                "rtdetr": 4,
+                "grounding_dino": 2,
+            }[model]
             assert result.excluded == ()
         else:
             assert not result.ok, model
@@ -978,7 +987,6 @@ def test_cross_model_repository_sidecars_match_registered_path_free_overrides():
 def test_rich_cross_model_records_follow_qualification_state():
     registry = load_ptm_registry()
     expected_counts = {
-        "grounding_dino": ("grounded_object_detection", 2),
         "mask2former": ("instance_segmentation", 1),
     }
     for model, (task, expected_count) in expected_counts.items():

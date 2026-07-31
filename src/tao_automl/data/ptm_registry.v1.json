@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "registry_version": "1.3.0",
+  "registry_version": "1.4.0",
   "models": {
     "dino": {
       "default_ptm": "dino.coco.resnet50.trainable.v1.0",
@@ -2938,8 +2938,13 @@
       "checkpoints": [
         {
           "id": "grounding_dino.commercial.swin_tiny.trainable.v1.1",
-          "status": "unverified",
-          "status_reason": "Official NGC checkpoint and experiment-YAML identities, SHA-256 values, sizes, multimodal input contract, and license are recorded. The path-bearing official YAML was reduced to architecture-only defaults; TAO compatibility and checkpoint load, training, validation, and inference mini-steps remain unverified.",
+          "status": "supported",
+          "validation": {
+            "status": "validated",
+            "tao_version": "7.1.0-rc-245",
+            "container_identity": "nvcr.io/nvstaging/tao/tao-toolkit-pyt:7.1.0-rc-245-multiarch@sqsh-sha256:e36640f9ae7a03bc80828cf7de93bd6bdbbb0fecf509a71a243be0ab5b497fc2",
+            "evidence": "/localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/grounding_dino_synthetic_integrated_successor_v1/qualification_completion.json#completion_sha256=172688d1af2479886c46f55fa148bf43a7487b517b2ea145c3359136100de698;file_sha256=d09b9940aaa98c4f1f5b24dd802546e6dad98b9cf34ff5ce1d8504c0652edb13;pilot_handoff_sha256=318d93fc04260650a67452eb00a710658744bf83fe3462115a9c320b12315ec8;pilot_handoff_file_sha256=82ee846b27b42bffeb559a88dcf18d353d72eea8cc1e9b0eae241725124807cf;contract_sha256=d8ddb091aa4b8f15c50660cb8394ec24073fe9fa27c102fd562d2037f6f1fee5"
+          },
           "source": {
             "provider": "ngc",
             "registry": "nvidia/tao",
@@ -2951,6 +2956,9 @@
           },
           "sha256": "8ea7e089e174e72a7fe57ff63cdba5e1e4994b159e41cf72122a7e0d841beaa6",
           "expected_size_bytes": 2070860191,
+          "compatible_tao_versions": [
+            "==7.1.0"
+          ],
           "model_family": "grounding_dino",
           "architecture": "grounding_dino",
           "backbone": "swin_tiny_224_1k",
@@ -3006,8 +3014,13 @@
         },
         {
           "id": "grounding_dino.commercial.swin_tiny.trainable.v1.0",
-          "status": "unverified",
-          "status_reason": "Official immutable NGC checkpoint and experiment-YAML identities, sizes, multimodal input contract, and license are recorded. NGC publishes no checkpoint checksum for this older member; TAO compatibility and checkpoint load, training, validation, and inference mini-steps remain unverified.",
+          "status": "supported",
+          "validation": {
+            "status": "validated",
+            "tao_version": "7.1.0-rc-245",
+            "container_identity": "nvcr.io/nvstaging/tao/tao-toolkit-pyt:7.1.0-rc-245-multiarch@sqsh-sha256:e36640f9ae7a03bc80828cf7de93bd6bdbbb0fecf509a71a243be0ab5b497fc2",
+            "evidence": "/localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/grounding_dino_synthetic_integrated_successor_v1/qualification_completion.json#completion_sha256=172688d1af2479886c46f55fa148bf43a7487b517b2ea145c3359136100de698;file_sha256=d09b9940aaa98c4f1f5b24dd802546e6dad98b9cf34ff5ce1d8504c0652edb13;pilot_handoff_sha256=318d93fc04260650a67452eb00a710658744bf83fe3462115a9c320b12315ec8;pilot_handoff_file_sha256=82ee846b27b42bffeb559a88dcf18d353d72eea8cc1e9b0eae241725124807cf;contract_sha256=d8ddb091aa4b8f15c50660cb8394ec24073fe9fa27c102fd562d2037f6f1fee5"
+          },
           "source": {
             "provider": "ngc",
             "registry": "nvidia/tao",
@@ -3017,7 +3030,11 @@
             "official": true,
             "immutable_identity": "ngc://nvidia/tao/grounding_dino:grounding_dino_swin_tiny_commercial_trainable_v1.0#grounding_dino_swin_tiny_commercial_trainable.pth"
           },
+          "sha256": "20c3ea116d1b841063aa5efffdd386b3d85a1c35f2d702d3c95150ef1efead73",
           "expected_size_bytes": 2070704394,
+          "compatible_tao_versions": [
+            "==7.1.0"
+          ],
           "model_family": "grounding_dino",
           "architecture": "grounding_dino",
           "backbone": "swin_tiny_224_1k",
