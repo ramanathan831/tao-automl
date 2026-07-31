@@ -93,8 +93,8 @@
     "training_seed": 1234
   },
   "source": {
-    "minimum_ancestor_commit": "f3120ce7fdfbf6ad49bf79885fa81206c92a6408",
-    "repository": "/localhome/local-rarunachalam/.tao/worktrees/tao-automl-grounding-dino"
+    "minimum_ancestor_commit": "8c2c24bb5d5a4919819fc548b802e22e5850ee19",
+    "repository": "/localhome/local-rarunachalam/tao-automl"
   },
   "tao_dataservices": {
     "coco_to_contiguous_sha256": "3e06c65928945087b8c827a5c1ec3d7c5aa8a927e683d885702abc3a66722249",
