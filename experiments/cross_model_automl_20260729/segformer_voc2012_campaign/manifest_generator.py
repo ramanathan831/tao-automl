@@ -44,12 +44,12 @@ DEFAULT_STAGE_MANIFEST = (
 DEFAULT_QUALIFICATION = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "segformer_voc2012_ptm_qualification_v1/completion.json"
+    "segformer_voc2012_ptm_qualification_v2/completion.json"
 )
 DEFAULT_PTM_STAGE_MANIFEST = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "segformer_voc2012_ptm_qualification_v1/ptm_stage_manifest.json"
+    "segformer_voc2012_ptm_qualification_v2/ptm_stage_manifest.json"
 )
 EXPECTED_DATASET_FILE_MANIFEST_SHA256 = (
     "051ab20215b8e6976763ac82a3db20a68264759edef3d62fd0c8553c501123ff"
@@ -270,7 +270,7 @@ def build_contract(
     repository_path = Path(repository).resolve()
     value = campaign_contract.build_preregistered_contract(
         campaign_id=(
-            "segformer-voc2012-objective-aware-three-mode-20260731"
+            "segformer-voc2012-objective-aware-three-mode-20260731-v2"
         ),
         dataset=dataset_record(dataset_manifest, stage_manifest),
         skill_dir=(

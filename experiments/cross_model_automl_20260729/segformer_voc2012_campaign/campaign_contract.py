@@ -63,7 +63,11 @@ SEARCH_SPACE = {
 }
 
 FROZEN_CANDIDATE_BUDGET = 30
+# The already-preregistered AutoML search remains a ten-epoch experiment.
+# Qualification v2 is a distinct, higher-fidelity boundary and must not
+# silently mutate the search budget.
 FROZEN_TRAINING_EPOCHS = 10
+FROZEN_QUALIFICATION_TRAINING_EPOCHS = 50
 FROZEN_SEARCH_SEED = 271828
 FROZEN_TRAINING_SEED = 1234
 FROZEN_CALIBRATION_POINTS_PER_ARM = 2
@@ -94,6 +98,100 @@ FROZEN_SQSH = {
         "nvcr.io/nvstaging/tao/tao-toolkit-pyt:"
         "7.1.0-rc-245-multiarch"
     ),
+}
+QUALIFICATION_REVISION = 2
+QUALIFICATION_CAMPAIGN_ID = (
+    "segformer-voc2012-direct-full-ptm-qualification-v2"
+)
+FROZEN_QUALIFICATION_FIDELITY = {
+    "source_recipe": (
+        "nvidia_tao_pytorch/cv/segformer/experiment_specs/"
+        "experiment_multi-class.yaml"
+    ),
+    "source_recipe_sha256": (
+        "210b6b6c4952289e3dbc1f025b3f0b8f17a073702290cb565796ed6c6ea36b21"
+    ),
+    "training_epochs": FROZEN_QUALIFICATION_TRAINING_EPOCHS,
+    "checkpoint_interval": FROZEN_QUALIFICATION_TRAINING_EPOCHS,
+    "validation_interval": 1,
+    "optimizer": "adamw",
+    "learning_rate": 1.0e-4,
+    "weight_decay": 5.0e-4,
+    "random_color_enabled": False,
+    "random_blur_enabled": False,
+    "use_distributed_sampler": True,
+}
+FROZEN_QUALIFICATION_RUNTIME_OVERLAY = {
+    "artifact_type": "tao_pytorch_source_overlay",
+    "scope": "segformer_ptm_loading_and_global_ddp_metrics",
+    "archive_path": (
+        "/lustre/fsw/portfolios/edgeai/users/rarunachalam/"
+        "tao-pytorch-overlays/segformer-product-fixes/"
+        "3b1e073571f3bbf3702b0ae837e9279ad12f4286/"
+        "tao-pytorch-segformer-product-fixes-3b1e073571f3.tar"
+    ),
+    "archive_sha256": (
+        "b055100d0d3e9e8c5daf94dfd4caf3cccacfb54fbebb423129fb5832066e420b"
+    ),
+    "archive_size_bytes": 51200,
+    "installer_path": (
+        "/lustre/fsw/portfolios/edgeai/users/rarunachalam/"
+        "tao-pytorch-overlays/segformer-product-fixes/"
+        "3b1e073571f3bbf3702b0ae837e9279ad12f4286/"
+        "install_segformer_source_overlay.py"
+    ),
+    "installer_sha256": (
+        "8be49911491db19ec632c2847c6684fb8b42423d25f96ae567de1af3a8dda52e"
+    ),
+    "installer_size_bytes": 8275,
+    "receipt_path": (
+        "/tmp/segformer-product-fixes-overlay-receipt.json"
+    ),
+    "source_repository": "tao-pytorch",
+    "base_commit": "99741bc8229617d0d3dd52e30540111d55efd1af",
+    "source_commits": [
+        "eacc0c0e2e59776266bb07f0be205c71bd0830c3",
+        "3b1e073571f3bbf3702b0ae837e9279ad12f4286",
+    ],
+    "source_commit": "3b1e073571f3bbf3702b0ae837e9279ad12f4286",
+    "combined_commit": "3b1e073571f3bbf3702b0ae837e9279ad12f4286",
+    "file_count": 4,
+    "required_actions": ["train", "evaluate"],
+    "remediates": [
+        "trainable_ptm_loaded_as_lightning_checkpoint",
+        "ddp_metrics_not_globally_reduced",
+        "nonzero_rank_status_kpi_writes",
+    ],
+}
+FROZEN_V1_QUALIFICATION_EVIDENCE = {
+    "campaign_id": "segformer-voc2012-direct-full-ptm-qualification-v1",
+    "completion_path": (
+        "/localhome/local-rarunachalam/.tao/artifacts/"
+        "cross_model_automl_20260729/"
+        "segformer_voc2012_ptm_qualification_v1/completion.json"
+    ),
+    "completion_whole_file_sha256": (
+        "e7d604d63b2e79a54e21f7cac708ad6b1ff12ea8ad24556f911d662876412661"
+    ),
+    "evidence_sha256": (
+        "23669ac5a091ed3b9b6841b9c06218e4bdaa01515860dd3c771f3d43eb34a08f"
+    ),
+    "ptm_stage_manifest_path": (
+        "/localhome/local-rarunachalam/.tao/artifacts/"
+        "cross_model_automl_20260729/"
+        "segformer_voc2012_ptm_qualification_v1/ptm_stage_manifest.json"
+    ),
+    "ptm_stage_manifest_whole_file_sha256": (
+        "f4f4d5a165f70cf4d67570143825c74406b4303224ed4cffad6e1577025a067a"
+    ),
+    "ptm_stage_manifest_sha256": (
+        "06de8d1618739a358ca7bdc3912ff2d05bf262a8e702310cf25a381fe1a1393e"
+    ),
+    "status": "terminal_with_failures",
+    "successful_workflows": 0,
+    "failed_workflows": 13,
+    "preserve_immutable": True,
+    "reuse_for_v2": False,
 }
 LATENCY_PROTOCOL = {
     "warmup_iterations": 50,
@@ -426,6 +524,34 @@ def profile_overrides(dataset_root: str) -> dict[str, Any]:
     }
 
 
+def qualification_profile_overrides(dataset_root: str) -> dict[str, Any]:
+    """Return the v2 official multi-class fidelity for every PTM arm."""
+    value = profile_overrides(dataset_root)
+    fidelity = FROZEN_QUALIFICATION_FIDELITY
+    value["dataset"]["segment"]["augmentation"] = {
+        "random_color": {
+            "enable": fidelity["random_color_enabled"],
+        },
+        "with_random_blur": fidelity["random_blur_enabled"],
+    }
+    value["train"].update(
+        {
+            "num_epochs": fidelity["training_epochs"],
+            "checkpoint_interval": fidelity["checkpoint_interval"],
+            "validation_interval": fidelity["validation_interval"],
+            "optim": {
+                "optim": fidelity["optimizer"],
+                "lr": fidelity["learning_rate"],
+                "weight_decay": fidelity["weight_decay"],
+            },
+            "use_distributed_sampler": fidelity[
+                "use_distributed_sampler"
+            ],
+        }
+    )
+    return value
+
+
 def validate_dataset_record(dataset: Mapping[str, Any]) -> dict[str, Any]:
     required = {
         "id": "pascal_voc_2012_full_semantic_segmentation",
@@ -500,6 +626,8 @@ def build_preregistered_contract(
         "schema": schema,
         "ptm_inventory": ptm_inventory,
         "qualification_policy": {
+            "revision": QUALIFICATION_REVISION,
+            "campaign_id": QUALIFICATION_CAMPAIGN_ID,
             "kind": "direct_full_gpu_train_eval_then_supported_registry",
             "cpu_model_runs": 0,
             "smoke_model_runs": 0,
@@ -507,9 +635,18 @@ def build_preregistered_contract(
             "nodes_per_job": 1,
             "gpus_per_job": 8,
             "full_dataset": True,
-            "training_epochs": FROZEN_TRAINING_EPOCHS,
+            "training_epochs": FROZEN_QUALIFICATION_TRAINING_EPOCHS,
             "standalone_evaluation": True,
             "registry_bypass_allowed": False,
+            "recipe_fidelity": copy.deepcopy(
+                FROZEN_QUALIFICATION_FIDELITY
+            ),
+            "runtime_overlay": copy.deepcopy(
+                FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+            ),
+            "prior_revision_evidence": copy.deepcopy(
+                FROZEN_V1_QUALIFICATION_EVIDENCE
+            ),
             "qualification_evidence_path": runtime[
                 "qualification_evidence_path"
             ],
@@ -621,6 +758,22 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
     validate_dataset_record(value["dataset"])
     if value.get("sqsh") != FROZEN_SQSH:
         raise CampaignContractError("pinned SQSH identity changed")
+    qualification = value.get("qualification_policy", {})
+    if (
+        qualification.get("revision") != QUALIFICATION_REVISION
+        or qualification.get("campaign_id") != QUALIFICATION_CAMPAIGN_ID
+        or qualification.get("training_epochs")
+        != FROZEN_QUALIFICATION_TRAINING_EPOCHS
+        or qualification.get("recipe_fidelity")
+        != FROZEN_QUALIFICATION_FIDELITY
+        or qualification.get("runtime_overlay")
+        != FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+        or qualification.get("prior_revision_evidence")
+        != FROZEN_V1_QUALIFICATION_EVIDENCE
+    ):
+        raise CampaignContractError(
+            "qualification v2 fidelity or provenance changed"
+        )
     if any(value["agent_intervention_flags"].values()):
         raise CampaignContractError("agent intervention flags must remain false")
     if any(value["selection_isolation_flags"].values()):
@@ -639,6 +792,9 @@ __all__ = [
     "FROZEN_IMAGE_SIZE",
     "FROZEN_LATENCY_RETENTION",
     "FROZEN_LATENCY_TOLERANCE_MS",
+    "FROZEN_QUALIFICATION_FIDELITY",
+    "FROZEN_QUALIFICATION_RUNTIME_OVERLAY",
+    "FROZEN_QUALIFICATION_TRAINING_EPOCHS",
     "FROZEN_SEARCH_SEED",
     "FROZEN_SLURM_RETRY_CAP",
     "FROZEN_SLURM_PARTITION",
@@ -647,8 +803,11 @@ __all__ = [
     "FROZEN_SQSH",
     "FROZEN_TRAINING_EPOCHS",
     "FROZEN_VALIDATION_SANITY_MIN_MIOU",
+    "FROZEN_V1_QUALIFICATION_EVIDENCE",
     "LATENCY_PROTOCOL",
     "MODES",
+    "QUALIFICATION_CAMPAIGN_ID",
+    "QUALIFICATION_REVISION",
     "SEARCH_PARAMETERS",
     "SEARCH_SPACE",
     "SELECTION_FLAGS",
@@ -658,6 +817,7 @@ __all__ = [
     "mode_objective",
     "mode_settings",
     "profile_overrides",
+    "qualification_profile_overrides",
     "segformer_registry_snapshot",
     "sha256_file",
     "validate_contract",

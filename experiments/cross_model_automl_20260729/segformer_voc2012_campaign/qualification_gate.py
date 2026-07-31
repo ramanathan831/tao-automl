@@ -27,9 +27,14 @@ from tao_automl.ptm_registry import canonical_sha256, load_ptm_registry
 
 from .campaign_contract import (
     AGENT_FLAGS,
+    FROZEN_QUALIFICATION_FIDELITY,
+    FROZEN_QUALIFICATION_RUNTIME_OVERLAY,
+    FROZEN_QUALIFICATION_TRAINING_EPOCHS,
     FROZEN_SQSH,
-    FROZEN_TRAINING_EPOCHS,
     FROZEN_VALIDATION_SANITY_MIN_MIOU,
+    FROZEN_V1_QUALIFICATION_EVIDENCE,
+    QUALIFICATION_CAMPAIGN_ID,
+    QUALIFICATION_REVISION,
     segformer_registry_snapshot,
     sha256_file,
 )
@@ -133,10 +138,19 @@ def _stage_evidence(
         )
     rows = stage.get("ptms")
     if (
-        stage.get("model") != "segformer"
+        stage.get("schema_version") != 2
+        or stage.get("qualification_revision") != QUALIFICATION_REVISION
+        or stage.get("campaign_id") != QUALIFICATION_CAMPAIGN_ID
+        or stage.get("model") != "segformer"
         or stage.get("task") != "semantic_segmentation"
         or stage.get("registry_sha256")
         != document.get("registry_sha256")
+        or stage.get("recipe_fidelity")
+        != FROZEN_QUALIFICATION_FIDELITY
+        or stage.get("runtime", {}).get("runtime_overlay")
+        != FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+        or stage.get("prior_revision_evidence")
+        != FROZEN_V1_QUALIFICATION_EVIDENCE
         or not isinstance(rows, list)
     ):
         raise QualificationGateError(
@@ -258,8 +272,8 @@ class QualificationDecision:
 
     def stable_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
-            "gate": "segformer_direct_full_gpu_then_supported_registry_v1",
+            "schema_version": 2,
+            "gate": "segformer_direct_full_gpu_then_supported_registry_v2",
             "evidence_path": self.evidence_path,
             "evidence_sha256": self.evidence_sha256,
             "qualification_campaign_id": self.qualification_campaign_id,
@@ -320,10 +334,16 @@ def _successful_workflow(
     registry_record: Mapping[str, Any],
 ) -> QualifiedPTM:
     if (
-        workflow.get("checkpoint_id") != checkpoint_id
+        workflow.get("schema_version") != 2
+        or workflow.get("qualification_revision") != QUALIFICATION_REVISION
+        or workflow.get("checkpoint_id") != checkpoint_id
         or workflow.get("status") != "success"
         or workflow.get("terminal") is not True
         or workflow.get("failure_preserved") is not False
+        or workflow.get("recipe_fidelity")
+        != FROZEN_QUALIFICATION_FIDELITY
+        or workflow.get("runtime_overlay")
+        != FROZEN_QUALIFICATION_RUNTIME_OVERLAY
     ):
         raise QualificationGateError(
             f"{checkpoint_id} did not finish qualification successfully"
@@ -357,14 +377,26 @@ def _successful_workflow(
         not isinstance(train, Mapping)
         or train.get("status") != "Complete"
         or train.get("full_dataset") is not True
-        or train.get("training_epochs") != FROZEN_TRAINING_EPOCHS
+        or train.get("training_epochs")
+        != FROZEN_QUALIFICATION_TRAINING_EPOCHS
         or train.get("validation_interval") != 1
-        or train.get("validation_record_count") != FROZEN_TRAINING_EPOCHS
+        or train.get("validation_record_count")
+        != FROZEN_QUALIFICATION_TRAINING_EPOCHS
+        or train.get("recipe_fidelity")
+        != FROZEN_QUALIFICATION_FIDELITY
+        or train.get("runtime_overlay")
+        != FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+        or not isinstance(train.get("job"), Mapping)
+        or train["job"].get("runtime_overlay_required") is not True
         or train.get("nodes") != 1
         or train.get("gpus") != 8
         or not isinstance(evaluation, Mapping)
         or evaluation.get("status") != "Complete"
         or evaluation.get("full_validation_split") is not True
+        or evaluation.get("runtime_overlay")
+        != FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+        or not isinstance(evaluation.get("job"), Mapping)
+        or evaluation["job"].get("runtime_overlay_required") is not True
         or evaluation.get("nodes") != 1
         or evaluation.get("gpus") != 8
     ):
@@ -421,10 +453,18 @@ def audit_qualification(path: str | Path) -> QualificationDecision:
     snapshot = segformer_registry_snapshot()
     registry = load_ptm_registry()
     if (
-        document.get("schema_version") != 1
+        document.get("schema_version") != 2
+        or document.get("qualification_revision") != QUALIFICATION_REVISION
+        or document.get("campaign_id") != QUALIFICATION_CAMPAIGN_ID
         or document.get("model") != "segformer"
         or document.get("task") != "semantic_segmentation"
         or document.get("sqsh_sha256") != FROZEN_SQSH["sha256"]
+        or document.get("recipe_fidelity")
+        != FROZEN_QUALIFICATION_FIDELITY
+        or document.get("runtime_overlay")
+        != FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+        or document.get("prior_revision_evidence")
+        != FROZEN_V1_QUALIFICATION_EVIDENCE
         or document.get("cpu_model_runs") != 0
         or document.get("smoke_model_runs") != 0
         or document.get("mini_step_runs") != 0
@@ -462,6 +502,18 @@ def audit_qualification(path: str | Path) -> QualificationDecision:
         record = registry.checkpoint(checkpoint_id)
         status = workflow.get("status")
         try:
+            if (
+                workflow.get("schema_version") != 2
+                or workflow.get("qualification_revision")
+                != QUALIFICATION_REVISION
+                or workflow.get("recipe_fidelity")
+                != FROZEN_QUALIFICATION_FIDELITY
+                or workflow.get("runtime_overlay")
+                != FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+            ):
+                raise QualificationGateError(
+                    f"{checkpoint_id} qualification v2 identity changed"
+                )
             workflow_sha = _workflow_integrity(
                 workflow,
                 checkpoint_id=checkpoint_id,
@@ -627,7 +679,8 @@ class QualificationLoadEvidence:
             code="direct_full_train_eval_qualification_reused",
             reason=(
                 "Exact checkpoint passed full-dataset one-node/eight-GPU "
-                "training, validation, terminal reload, and standalone eval"
+                "50-epoch training, validation, terminal reload, and "
+                "standalone eval with the sealed v2 runtime overlay"
             ),
             details={
                 "cpu_or_smoke_model_job_launched": False,

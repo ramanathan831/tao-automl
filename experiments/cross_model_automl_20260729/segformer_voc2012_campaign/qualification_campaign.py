@@ -8,7 +8,7 @@ The controller has two explicit phases:
   their immutable identities and sizes, generates the per-PTM train/evaluate
   specifications, and publishes every input read-only on Lustre.
 * ``--launch`` verifies the sealed stage and submits exactly one independent
-  full-VOC2012 10-epoch train plus standalone-evaluate workflow per PTM.
+  full-VOC2012 50-epoch train plus standalone-evaluate workflow per PTM.
 
 There is no CPU/model smoke, mini-step, fallback checkpoint, replacement
 workflow, or manual PTM exclusion path.  Every terminal outcome is preserved.
@@ -68,26 +68,24 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_CONTRACT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "segformer_voc2012_three_mode/campaign.v1.json"
+    "segformer_voc2012_three_mode/campaign.v2.json"
 )
 DEFAULT_RUNTIME_ROOT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "segformer_voc2012_ptm_qualification_v1"
+    "segformer_voc2012_ptm_qualification_v2"
 )
 DEFAULT_STAGE_MANIFEST = DEFAULT_RUNTIME_ROOT / "ptm_stage_manifest.json"
 DEFAULT_LOCAL_CACHE = Path(
     "/localhome/local-rarunachalam/.tao/cache/"
-    "segformer_voc2012_ptm_qualification_v1"
+    "segformer_voc2012_ptm_qualification_v2"
 )
 DEFAULT_LUSTRE_INPUT_ROOT = Path(
     "/lustre/fsw/portfolios/edgeai/users/rarunachalam/"
     "cross_model_automl_20260729/"
-    "segformer_voc2012_ptm_qualification_v1/inputs"
+    "segformer_voc2012_ptm_qualification_v2/inputs"
 )
-QUALIFICATION_CAMPAIGN_ID = (
-    "segformer-voc2012-direct-full-ptm-qualification-v1"
-)
+QUALIFICATION_CAMPAIGN_ID = campaign_contract.QUALIFICATION_CAMPAIGN_ID
 EVALUATION_CHECKPOINT_SENTINEL = (
     "__TERMINAL_CHECKPOINT_FROM_THIS_WORKFLOW__"
 )
@@ -233,6 +231,19 @@ def verify_slurm_preflight(
         raise CampaignExecutionError(
             "frozen SLURM resource policy changed"
         )
+    qualification = contract["qualification_policy"]
+    overlay = qualification.get("runtime_overlay")
+    if (
+        qualification.get("revision")
+        != campaign_contract.QUALIFICATION_REVISION
+        or qualification.get("recipe_fidelity")
+        != campaign_contract.FROZEN_QUALIFICATION_FIDELITY
+        or overlay
+        != campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+    ):
+        raise CampaignExecutionError(
+            "qualification v2 fidelity or runtime overlay changed"
+        )
     run_campaign.configure_slurm_runtime(contract)
     sdk_dir = Path(runtime["sdk_dir"]).resolve()
     sdk_source = (sdk_dir / "tao_sdk" / "__init__.py").resolve()
@@ -242,11 +253,23 @@ def verify_slurm_preflight(
         )
     partition = shlex.quote(runtime["partition"])
     sqsh = shlex.quote(contract["sqsh"]["path"])
+    overlay_archive = shlex.quote(overlay["archive_path"])
+    overlay_installer = shlex.quote(overlay["installer_path"])
     output = remote_output(
         "set -eu; "
         "for command in sbatch squeue sacct srun; do "
         "command -v \"$command\" >/dev/null; done; "
         f"test -r {sqsh}; "
+        f"test -r {overlay_archive}; "
+        f"test \"$(stat -c '%s' {overlay_archive})\" = "
+        f"{overlay['archive_size_bytes']}; "
+        f"test \"$(sha256sum {overlay_archive} | awk '{{print $1}}')\" = "
+        f"{shlex.quote(overlay['archive_sha256'])}; "
+        f"test -r {overlay_installer}; "
+        f"test \"$(stat -c '%s' {overlay_installer})\" = "
+        f"{overlay['installer_size_bytes']}; "
+        f"test \"$(sha256sum {overlay_installer} | awk '{{print $1}}')\" = "
+        f"{shlex.quote(overlay['installer_sha256'])}; "
         f"scontrol show partition {partition} -o "
         "| grep -q 'MaxTime=04:00:00'; "
         "printf 'READY\\n'"
@@ -263,6 +286,7 @@ def verify_slurm_preflight(
         "partition_max_time": "04:00:00",
         "sdk_source": str(sdk_source),
         "sqsh_readable": True,
+        "qualification_runtime_overlay": copy.deepcopy(overlay),
         "scheduler_jobs_submitted": 0,
     }
 
@@ -405,7 +429,7 @@ def qualification_specs(
             skill_dir / "references/spec_template_evaluate.yaml"
         ).read_text(encoding="utf-8")
     )
-    profile = campaign_contract.profile_overrides(
+    profile = campaign_contract.qualification_profile_overrides(
         contract["dataset"]["prepared_root"]
     )
     train = run_campaign._merge_spec(train, profile)
@@ -585,7 +609,8 @@ def stage_runtime_inputs(
         )
 
     document = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "qualification_revision": campaign_contract.QUALIFICATION_REVISION,
         "campaign_id": QUALIFICATION_CAMPAIGN_ID,
         "automl_contract_sha256": contract["contract_sha256"],
         "created_at_utc": utc_timestamp(),
@@ -619,7 +644,16 @@ def stage_runtime_inputs(
             "required_gpu": copy.deepcopy(
                 campaign_contract.FROZEN_HARDWARE
             ),
+            "runtime_overlay": copy.deepcopy(
+                campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+            ),
         },
+        "recipe_fidelity": copy.deepcopy(
+            campaign_contract.FROZEN_QUALIFICATION_FIDELITY
+        ),
+        "prior_revision_evidence": copy.deepcopy(
+            campaign_contract.FROZEN_V1_QUALIFICATION_EVIDENCE
+        ),
         "ptms": rows,
         "execution": {
             "operation": (
@@ -657,7 +691,9 @@ def validate_stage_manifest(
     expected_ids = tuple(record["id"] for record in _records())
     rows = value.get("ptms")
     if (
-        value.get("schema_version") != 1
+        value.get("schema_version") != 2
+        or value.get("qualification_revision")
+        != campaign_contract.QUALIFICATION_REVISION
         or value.get("campaign_id") != QUALIFICATION_CAMPAIGN_ID
         or value.get("automl_contract_sha256")
         != contract["contract_sha256"]
@@ -690,7 +726,14 @@ def validate_stage_manifest(
             "nodes_per_workflow": 1,
             "gpus_per_workflow": 8,
             "required_gpu": campaign_contract.FROZEN_HARDWARE,
+            "runtime_overlay": (
+                campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+            ),
         }
+        or value.get("recipe_fidelity")
+        != campaign_contract.FROZEN_QUALIFICATION_FIDELITY
+        or value.get("prior_revision_evidence")
+        != campaign_contract.FROZEN_V1_QUALIFICATION_EVIDENCE
         or not isinstance(rows, list)
         or tuple(item.get("checkpoint_id") for item in rows)
         != expected_ids
@@ -819,14 +862,69 @@ def validate_stage_manifest(
         evaluate = specs["evaluate"]["document"]
         if (
             train["train"]["num_epochs"]
-            != campaign_contract.FROZEN_TRAINING_EPOCHS
-            or train["train"]["validation_interval"] != 1
+            != campaign_contract.FROZEN_QUALIFICATION_TRAINING_EPOCHS
+            or train["train"]["checkpoint_interval"]
+            != campaign_contract.FROZEN_QUALIFICATION_TRAINING_EPOCHS
+            or train["train"]["validation_interval"]
+            != campaign_contract.FROZEN_QUALIFICATION_FIDELITY[
+                "validation_interval"
+            ]
+            or train["train"]["optim"]["optim"]
+            != campaign_contract.FROZEN_QUALIFICATION_FIDELITY[
+                "optimizer"
+            ]
+            or train["train"]["optim"]["lr"]
+            != campaign_contract.FROZEN_QUALIFICATION_FIDELITY[
+                "learning_rate"
+            ]
+            or train["train"]["optim"]["weight_decay"]
+            != campaign_contract.FROZEN_QUALIFICATION_FIDELITY[
+                "weight_decay"
+            ]
+            or train["dataset"]["segment"]["augmentation"][
+                "random_color"
+            ]["enable"]
+            is not False
+            or train["dataset"]["segment"]["augmentation"][
+                "with_random_blur"
+            ]
+            is not False
+            or train["train"]["use_distributed_sampler"] is not True
             or train["train"]["num_gpus"] != 8
             or train["train"]["gpu_ids"] != list(range(8))
             or train["train"]["num_nodes"] != 1
             or train["dataset"]["segment"]["root_dir"]
             != contract["dataset"]["prepared_root"]
             or train["model"]["backbone"]["type"] != record["backbone"]
+            or evaluate["train"]["num_epochs"]
+            != campaign_contract.FROZEN_QUALIFICATION_TRAINING_EPOCHS
+            or evaluate["train"]["checkpoint_interval"]
+            != campaign_contract.FROZEN_QUALIFICATION_TRAINING_EPOCHS
+            or evaluate["train"]["validation_interval"]
+            != campaign_contract.FROZEN_QUALIFICATION_FIDELITY[
+                "validation_interval"
+            ]
+            or evaluate["train"]["optim"]["optim"]
+            != campaign_contract.FROZEN_QUALIFICATION_FIDELITY[
+                "optimizer"
+            ]
+            or evaluate["train"]["optim"]["lr"]
+            != campaign_contract.FROZEN_QUALIFICATION_FIDELITY[
+                "learning_rate"
+            ]
+            or evaluate["train"]["optim"]["weight_decay"]
+            != campaign_contract.FROZEN_QUALIFICATION_FIDELITY[
+                "weight_decay"
+            ]
+            or evaluate["dataset"]["segment"]["augmentation"][
+                "random_color"
+            ]["enable"]
+            is not False
+            or evaluate["dataset"]["segment"]["augmentation"][
+                "with_random_blur"
+            ]
+            is not False
+            or evaluate["train"]["use_distributed_sampler"] is not True
             or evaluate["evaluate"]["checkpoint"]
             != EVALUATION_CHECKPOINT_SENTINEL
             or evaluate["evaluate"]["num_gpus"] != 8
@@ -903,7 +1001,8 @@ def verify_stage_remote(
                 }
             )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
+        "qualification_revision": campaign_contract.QUALIFICATION_REVISION,
         "stage_manifest_sha256": stage["stage_manifest_sha256"],
         "checked_artifacts": checked,
         "checked_artifact_count": len(checked),
@@ -951,6 +1050,43 @@ def _gpu_guard(command: str) -> str:
     )
 
 
+def _runtime_overlay_install_command(
+    contract: Mapping[str, Any],
+    *,
+    action_name: str,
+) -> str:
+    """Return the fail-closed v2 overlay pre-entrypoint."""
+    overlay = contract["qualification_policy"].get("runtime_overlay")
+    if (
+        overlay
+        != campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+        or action_name not in overlay["required_actions"]
+    ):
+        raise CampaignExecutionError(
+            "qualification runtime overlay is not authorized for action"
+        )
+    archive = shlex.quote(overlay["archive_path"])
+    installer = shlex.quote(overlay["installer_path"])
+    receipt = shlex.quote(overlay["receipt_path"])
+    archive_sha = shlex.quote(overlay["archive_sha256"])
+    installer_sha = shlex.quote(overlay["installer_sha256"])
+    return " && ".join(
+        [
+            f"test \"$(stat -c '%s' {archive})\" = "
+            f"{overlay['archive_size_bytes']}",
+            f"test \"$(sha256sum {archive} | cut -d ' ' -f1)\" = "
+            f"{archive_sha}",
+            f"test \"$(stat -c '%s' {installer})\" = "
+            f"{overlay['installer_size_bytes']}",
+            f"test \"$(sha256sum {installer} | cut -d ' ' -f1)\" = "
+            f"{installer_sha}",
+            f"python {installer} --archive {archive} "
+            f"--expected-sha256 {archive_sha} --receipt {receipt}",
+            f"test -s {receipt}",
+        ]
+    )
+
+
 def _entrypoint(
     contract: Mapping[str, Any],
     action_name: str,
@@ -959,8 +1095,12 @@ def _entrypoint(
     from tao_sdk.script_runner import build_entrypoint
 
     action = _action(contract, action_name)
+    overlay = _runtime_overlay_install_command(
+        contract,
+        action_name=action_name,
+    )
     entrypoint = build_entrypoint(
-        command=_gpu_guard(action["command"]),
+        command=_gpu_guard(f"{overlay} && {action['command']}"),
         specs=copy.deepcopy(dict(specification)),
         inputs=action["inputs"],
         outputs=action["outputs"],
@@ -1098,10 +1238,13 @@ def _training_status_evidence(
                 ),
             }
         )
-    if len(validation) != campaign_contract.FROZEN_TRAINING_EPOCHS:
+    expected_epochs = (
+        campaign_contract.FROZEN_QUALIFICATION_TRAINING_EPOCHS
+    )
+    if len(validation) != expected_epochs:
         raise CampaignExecutionError(
             f"training emitted {len(validation)} val_miou records; "
-            f"expected {campaign_contract.FROZEN_TRAINING_EPOCHS}"
+            f"expected {expected_epochs}"
         )
     if not any(
         record.get("message") == "Train finished successfully."
@@ -1210,12 +1353,20 @@ def _run_workflow(
     evidence_path = workflow_root / "workflow_completion.json"
     events = workflow_root / "events.jsonl"
     evidence: dict[str, Any] = {
+        "schema_version": 2,
+        "qualification_revision": campaign_contract.QUALIFICATION_REVISION,
         "checkpoint_id": checkpoint_id,
         "status": "running",
         "terminal": False,
         "failure_preserved": False,
         "source_checkpoint": copy.deepcopy(row["checkpoint"]),
         "stage_manifest_sha256": stage["stage_manifest_sha256"],
+        "recipe_fidelity": copy.deepcopy(
+            campaign_contract.FROZEN_QUALIFICATION_FIDELITY
+        ),
+        "runtime_overlay": copy.deepcopy(
+            campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+        ),
         "jobs": {},
         "agent_intervention_flags": {
             name: False for name in campaign_contract.AGENT_FLAGS
@@ -1262,6 +1413,7 @@ def _run_workflow(
                 "raw_yaml_sha256"
             ],
             "command_sha256": train_command_sha,
+            "runtime_overlay_required": True,
             "nodes": 1,
             "gpus": 8,
         }
@@ -1333,6 +1485,7 @@ def _run_workflow(
             ],
             "resolved_spec_sha256": canonical_sha256(evaluation_spec),
             "command_sha256": evaluation_command_sha,
+            "runtime_overlay_required": True,
             "checkpoint": checkpoint,
             "nodes": 1,
             "gpus": 8,
@@ -1380,9 +1533,15 @@ def _run_workflow(
                     "status": "Complete",
                     "full_dataset": True,
                     "training_epochs": (
-                        campaign_contract.FROZEN_TRAINING_EPOCHS
+                        campaign_contract.FROZEN_QUALIFICATION_TRAINING_EPOCHS
                     ),
                     "validation_interval": 1,
+                    "recipe_fidelity": copy.deepcopy(
+                        campaign_contract.FROZEN_QUALIFICATION_FIDELITY
+                    ),
+                    "runtime_overlay": copy.deepcopy(
+                        campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+                    ),
                     "validation_record_count": train_evidence[
                         "validation_record_count"
                     ],
@@ -1396,6 +1555,9 @@ def _run_workflow(
                 "evaluation": {
                     "status": "Complete",
                     "full_validation_split": True,
+                    "runtime_overlay": copy.deepcopy(
+                        campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+                    ),
                     "nodes": 1,
                     "gpus": 8,
                     "test_miou": evaluation_evidence["test_miou"],
@@ -1407,6 +1569,10 @@ def _run_workflow(
         atomic_json(evidence_path, _finalize_workflow(evidence))
     except BaseException as exc:
         failure = {
+            "schema_version": 2,
+            "qualification_revision": (
+                campaign_contract.QUALIFICATION_REVISION
+            ),
             "checkpoint_id": checkpoint_id,
             "status": "failure",
             "terminal": True,
@@ -1417,6 +1583,12 @@ def _run_workflow(
             "replacement_submitted": False,
             "source_checkpoint": copy.deepcopy(row["checkpoint"]),
             "stage_manifest_sha256": stage["stage_manifest_sha256"],
+            "recipe_fidelity": copy.deepcopy(
+                campaign_contract.FROZEN_QUALIFICATION_FIDELITY
+            ),
+            "runtime_overlay": copy.deepcopy(
+                campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+            ),
             "jobs": copy.deepcopy(evidence.get("jobs", {})),
             "terminal_at_utc": utc_timestamp(),
             "agent_intervention_flags": {
@@ -1433,6 +1605,10 @@ def _missing_workflow(
 ) -> dict[str, Any]:
     return _finalize_workflow(
         {
+            "schema_version": 2,
+            "qualification_revision": (
+                campaign_contract.QUALIFICATION_REVISION
+            ),
             "checkpoint_id": checkpoint_id,
             "status": "failure",
             "terminal": True,
@@ -1444,6 +1620,12 @@ def _missing_workflow(
             "failure_phase": "controller",
             "replacement_submitted": False,
             "stage_manifest_sha256": stage_sha256,
+            "recipe_fidelity": copy.deepcopy(
+                campaign_contract.FROZEN_QUALIFICATION_FIDELITY
+            ),
+            "runtime_overlay": copy.deepcopy(
+                campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+            ),
             "terminal_at_utc": utc_timestamp(),
             "agent_intervention_flags": {
                 name: False for name in campaign_contract.AGENT_FLAGS
@@ -1485,7 +1667,8 @@ def build_completion(
         workflow["status"] == "success" for workflow in workflows
     )
     value = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "qualification_revision": campaign_contract.QUALIFICATION_REVISION,
         "campaign_id": QUALIFICATION_CAMPAIGN_ID,
         "automl_contract_sha256": contract["contract_sha256"],
         "model": "segformer",
@@ -1497,6 +1680,15 @@ def build_completion(
         ],
         "ptm_stage_manifest_sha256": stage["stage_manifest_sha256"],
         "source_commit": contract["runtime"]["source_commit"],
+        "recipe_fidelity": copy.deepcopy(
+            campaign_contract.FROZEN_QUALIFICATION_FIDELITY
+        ),
+        "runtime_overlay": copy.deepcopy(
+            campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+        ),
+        "prior_revision_evidence": copy.deepcopy(
+            campaign_contract.FROZEN_V1_QUALIFICATION_EVIDENCE
+        ),
         "qualification_controller_sha256": contract[
             "launcher_integrity"
         ]["qualification_campaign_sha256"],
@@ -1543,7 +1735,8 @@ def build_handoff(
         if item["status"] == "failure"
     ]
     value = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "qualification_revision": campaign_contract.QUALIFICATION_REVISION,
         "campaign_id": QUALIFICATION_CAMPAIGN_ID,
         "automl_contract_sha256": contract["contract_sha256"],
         "qualification_evidence_path": str(qualification_path),
@@ -1584,7 +1777,8 @@ def qualification_plan(
     contract: Mapping[str, Any],
 ) -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
+        "qualification_revision": campaign_contract.QUALIFICATION_REVISION,
         "campaign_id": QUALIFICATION_CAMPAIGN_ID,
         "automl_contract_sha256": contract["contract_sha256"],
         "model": "segformer",
@@ -1592,7 +1786,16 @@ def qualification_plan(
         "checkpoint_ids": [record["id"] for record in _records()],
         "workflow_count": 13,
         "workflow": (
-            "full_voc2012_10_epoch_train_then_standalone_full_validation"
+            "full_voc2012_50_epoch_train_then_standalone_full_validation"
+        ),
+        "recipe_fidelity": copy.deepcopy(
+            campaign_contract.FROZEN_QUALIFICATION_FIDELITY
+        ),
+        "runtime_overlay": copy.deepcopy(
+            campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+        ),
+        "prior_revision_evidence": copy.deepcopy(
+            campaign_contract.FROZEN_V1_QUALIFICATION_EVIDENCE
         ),
         "resources_per_job": {
             "nodes": 1,
@@ -1643,7 +1846,10 @@ def launch(
     atomic_json(
         runtime_root / "qualification_launch_preflight.json",
         {
-            "schema_version": 1,
+            "schema_version": 2,
+            "qualification_revision": (
+                campaign_contract.QUALIFICATION_REVISION
+            ),
             "contract_sha256": contract["contract_sha256"],
             "local": local,
             "platform": platform,
@@ -1692,6 +1898,10 @@ def launch(
                 path,
                 _finalize_workflow(
                     {
+                        "schema_version": 2,
+                        "qualification_revision": (
+                            campaign_contract.QUALIFICATION_REVISION
+                        ),
                         "checkpoint_id": checkpoint_id,
                         "status": "failure",
                         "terminal": True,
@@ -1709,6 +1919,12 @@ def launch(
                         "stage_manifest_sha256": stage[
                             "stage_manifest_sha256"
                         ],
+                        "recipe_fidelity": copy.deepcopy(
+                            campaign_contract.FROZEN_QUALIFICATION_FIDELITY
+                        ),
+                        "runtime_overlay": copy.deepcopy(
+                            campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+                        ),
                         "terminal_at_utc": utc_timestamp(),
                         "agent_intervention_flags": {
                             name: False

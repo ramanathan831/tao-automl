@@ -26,7 +26,7 @@ VOC experiment sanity gate is not an AutoML selection constraint.
 
 The repository currently records 13 official SegFormer PTMs, all as
 `unverified`. The campaign does not reinterpret that state. Each arm must first
-complete a real full-dataset, ten-epoch, one-node/eight-GPU train and standalone
+complete a real full-dataset, 50-epoch, one-node/eight-GPU train and standalone
 validation workflow. A successful arm becomes eligible only after its exact
 repository registry record is independently promoted to `supported`; terminal
 failures remain exclusions. The runtime never mutates or bypasses the registry.
@@ -42,12 +42,29 @@ publishes every checkpoint and spec read-only on Lustre. It does not import a
 model framework, load a checkpoint, or construct a scheduler job.
 
 The launch phase re-hashes the complete stage and submits exactly 13 independent
-workflows. Each workflow runs full VOC2012 training for ten epochs with
-validation every epoch, resolves its exact terminal checkpoint, and then runs
-standalone evaluation over the complete validation split. Each train and
-evaluation job uses one node, eight `NVIDIA A100-SXM4-80GB` GPUs, and the pinned
-SQSH. `polar3` is capped at four hours, so the controller freezes the
-skill-compliant `4.0`-hour scheduler limit and `3.8`-hour SDK timeout.
+workflows. Each workflow applies the same official multi-class recipe fidelity:
+50 epochs, AdamW learning rate `1e-4`, weight decay `5e-4`, random-color and
+random-blur augmentation disabled, and the distributed sampler enabled.
+Validation runs every epoch, followed by standalone evaluation over the
+complete validation split. Each train and evaluation job uses one node, eight
+`NVIDIA A100-SXM4-80GB` GPUs, and the pinned SQSH. `polar3` is capped at four
+hours, so the controller freezes the skill-compliant `4.0`-hour scheduler limit
+and `3.8`-hour SDK timeout.
+
+Qualification v2 also requires the combined TAO PyTorch SegFormer product-fix
+overlay from commit
+`3b1e073571f3bbf3702b0ae837e9279ad12f4286`, archive SHA-256
+`b055100d0d3e9e8c5daf94dfd4caf3cccacfb54fbebb423129fb5832066e420b`.
+Every train and evaluate command verifies and installs that overlay before TAO
+starts. It provides generic trainable-PTM loading and global DDP metric
+reduction, which makes the distributed sampler valid for this qualification.
+
+The terminal v1 evidence remains immutable at
+`/localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/segformer_voc2012_ptm_qualification_v1`.
+Its completion SHA-256 is
+`e7d604d63b2e79a54e21f7cac708ad6b1ff12ea8ad24556f911d662876412661`;
+v2 uses distinct local, cache, Lustre-input, campaign, stage, completion, and
+handoff identities and never resumes or overwrites v1.
 
 All arms are attempted. A failed arm is retained as a terminal structured
 failure; it is never replaced with a fallback checkpoint. Completion
@@ -83,7 +100,7 @@ First seal the clean integrated source into an external campaign contract:
 cd /localhome/local-rarunachalam/tao-automl
 PYTHONPATH="$PWD/src" \
 python -m experiments.cross_model_automl_20260729.segformer_voc2012_campaign.manifest_generator \
-  --output /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/segformer_voc2012_three_mode/campaign.v1.json
+  --output /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/segformer_voc2012_three_mode/campaign.v2.json
 ```
 
 Stage and independently verify all PTM/spec inputs without reserving GPUs:
@@ -116,7 +133,7 @@ trigger:
 ```bash
 PYTHONPATH="$PWD/src" \
 python -m experiments.cross_model_automl_20260729.segformer_voc2012_campaign.run_campaign \
-  --contract /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/segformer_voc2012_three_mode/campaign.v1.json \
+  --contract /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/segformer_voc2012_three_mode/campaign.v2.json \
   --automatic-trigger \
   --launch
 ```
