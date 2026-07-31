@@ -197,7 +197,7 @@ python -m \
   experiments.cross_model_automl_20260729.mask_grounding_dino_coco2017_campaign.ptm_stage \
   --env-file /localhome/local-rarunachalam/.tao/config.env \
   --lustre-root \
-  /lustre/fsw/portfolios/edgeai/users/rarunachalam/ptms/cross_model_automl_20260729/mask_grounding_dino_v1 \
+  /lustre/fsw/portfolios/edgeai/projects/edgeai_tao-ptm_image-foundation-model-clip/users/rarunachalam/ptms/cross_model_automl_20260729/mask_grounding_dino_v1 \
   --physical-lustre-mount \
   /localhome/local-rarunachalam/.tao/mounts/slurm-lustre
 ```

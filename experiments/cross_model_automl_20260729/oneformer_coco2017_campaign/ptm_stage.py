@@ -47,7 +47,8 @@ DEFAULT_CACHE_ROOT = Path(
     "cross_model_automl_20260729/oneformer_ptms_v1"
 )
 DEFAULT_CANONICAL_PUBLICATION_ROOT = PurePosixPath(
-    "/lustre/fsw/portfolios/edgeai/users/rarunachalam/ptms/"
+    "/lustre/fsw/portfolios/edgeai/projects/"
+    "edgeai_tao-ptm_image-foundation-model-clip/users/rarunachalam/ptms/"
     "cross_model_automl_20260729/oneformer_v1"
 )
 DEFAULT_PHYSICAL_PUBLICATION_ROOT = Path(

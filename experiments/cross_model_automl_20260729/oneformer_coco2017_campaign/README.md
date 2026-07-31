@@ -83,7 +83,7 @@ python -m experiments.cross_model_automl_20260729.oneformer_coco2017_campaign.pt
   --stage \
   --env-file /localhome/local-rarunachalam/.tao/config.env \
   --physical-publication-root /path/to/sshfs/mount/oneformer_v1 \
-  --canonical-publication-root /lustre/fsw/portfolios/edgeai/users/rarunachalam/ptms/cross_model_automl_20260729/oneformer_v1
+  --canonical-publication-root /lustre/fsw/portfolios/edgeai/projects/edgeai_tao-ptm_image-foundation-model-clip/users/rarunachalam/ptms/cross_model_automl_20260729/oneformer_v1
 ```
 
 Revalidation is network-free and uses the same explicit mapping:
@@ -92,7 +92,7 @@ Revalidation is network-free and uses the same explicit mapping:
 python -m experiments.cross_model_automl_20260729.oneformer_coco2017_campaign.ptm_stage \
   --check-stage \
   --physical-publication-root /path/to/sshfs/mount/oneformer_v1 \
-  --canonical-publication-root /lustre/fsw/portfolios/edgeai/users/rarunachalam/ptms/cross_model_automl_20260729/oneformer_v1
+  --canonical-publication-root /lustre/fsw/portfolios/edgeai/projects/edgeai_tao-ptm_image-foundation-model-clip/users/rarunachalam/ptms/cross_model_automl_20260729/oneformer_v1
 ```
 
 An existing destination is reused only when its size, SHA-256, and read-only

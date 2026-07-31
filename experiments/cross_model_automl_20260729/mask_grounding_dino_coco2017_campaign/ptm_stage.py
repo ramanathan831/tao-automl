@@ -49,7 +49,8 @@ DEFAULT_CACHE_ROOT = Path(
     "cross_model_automl_20260729/mask_grounding_dino_ptms_v1"
 )
 DEFAULT_LUSTRE_ROOT = Path(
-    "/lustre/fsw/portfolios/edgeai/users/rarunachalam/ptms/"
+    "/lustre/fsw/portfolios/edgeai/projects/"
+    "edgeai_tao-ptm_image-foundation-model-clip/users/rarunachalam/ptms/"
     "cross_model_automl_20260729/mask_grounding_dino_v1"
 )
 DEFAULT_MANIFEST = Path(
