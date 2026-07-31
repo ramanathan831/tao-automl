@@ -11,6 +11,19 @@ SLURM submission was performed while preparing it. TAO PyTorch commit
 validation and the split-correct `segm_test_mAP` during standalone evaluation.
 The deterministic source overlay is staged on Lustre with SHA-256
 `c395474592d557e0179066c1f99d5cb8f352e10e501621d57043782440dea8c2`.
+The production campaign now binds source commit
+`c2e86fe1646ebe89fc280083797dcc544ce88322`, archive and installer byte
+identities, and read-only remote state. Every Mask2Former action prepares the
+overlay as a temporary package mirror and injects it through `PYTHONPATH`;
+the package installed in the SQSH is not modified.
+
+The exact official 569,716,712-byte Mask2Former Swin-T checkpoint is also
+staged read-only on Lustre. Its observed SHA-256 is
+`93f7e5a3ed960a9d6723b42e55e3cecc4aca9ef11bd5e96680bef2789fa3c356`;
+the stage content SHA-256 is
+`141d14f9b11e3cf81c087d7d05f4e054c885ced1be18554f9832e0cbc9b28bcc`
+and its raw manifest-file SHA-256 is
+`3d51ad23d237b8472ebff629dc9ceb7909123c462683f899f4eabb6f4cc3166e`.
 
 The launch gate still fails closed because the exact runtime has not completed
 the direct full-GPU qualification and the one official Mask2Former PTM remains
@@ -92,35 +105,33 @@ audit, and provenance checks.
 
 ## Required next sequence
 
-1. Review the task-correct TAO PyTorch commit and apply its checksum-pinned
-   source overlay to the pinned SQSH launch path.
-2. Stage the exact official NGC PTM on Lustre using the repository preflight
-   downloader; freeze its observed digest, size, immutable source identity,
-   and read-only stage manifest.
-3. Seal the pre-promotion direct-full qualification contract.
-4. Run the one real three-epoch, one-node/eight-A100 qualification workflow
+1. Review the task-correct TAO PyTorch commit and sealed PYTHONPATH overlay
+   contract.
+2. Seal the pre-promotion direct-full qualification contract using the
+   completed read-only PTM stage.
+3. Run the one real three-epoch, one-node/eight-A100 qualification workflow
    and retain success or terminal failure unchanged.
-5. If and only if it succeeds, independently promote the exact registry
+4. If and only if it succeeds, independently promote the exact registry
    record to `supported`, binding the evidence and observed checkpoint digest.
-6. Seal the final AutoML campaign on the promoted source and start the
+5. Seal the final AutoML campaign on the promoted source and start the
    automatic trigger.
 
 No additional model or dataset is implicated by these blockers.
 
 ## Verification performed
 
-The campaign-specific suite passed:
+The campaign-specific suite passed after the runtime/staging integration:
 
 ```text
-26 passed
+33 passed
 ```
 
 The combined production objective-acquisition, selection, PTM,
 recommendation-audit, runtime, wheel, and campaign suites passed:
 
 ```text
-553 passed
+722 passed
 ```
 
-Only the established sklearn Gaussian-process convergence warnings were
+Only three established sklearn Gaussian-process convergence warnings were
 observed. Python compilation and `git diff --check` also passed.

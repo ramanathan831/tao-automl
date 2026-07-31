@@ -17,6 +17,7 @@ from . import (
     manifest_generator,
     qualification_campaign,
     run_campaign,
+    runtime_overlay,
 )
 from .qualification_gate import (
     QualificationGateError,
@@ -72,6 +73,7 @@ def _runtime(tmp_path: Path) -> dict:
         "ptm_stage_manifest_path": str(tmp_path / "ptms.json"),
         "ptm_stage_manifest_sha256": "e" * 64,
         "ptm_stage_content_sha256": "f" * 64,
+        "tao_pytorch_overlay": runtime_overlay.contract_record(),
         "partition": "polar3",
         "account": "edgeai_tao-ptm_image-foundation-model-clip",
         "base_results_dir": (
@@ -113,6 +115,9 @@ def contract(tmp_path: Path) -> dict:
             campaign_contract.sha256_file(
                 HERE / "mask2former_latency_worker.py"
             )
+        ),
+        "runtime_overlay_sha256": campaign_contract.sha256_file(
+            HERE / "runtime_overlay.py"
         ),
     }
     value["contract_sha256"] = canonical_sha256(value)
@@ -238,6 +243,7 @@ def _qualification_document(
         "ptm_stage_manifest_sha256": "d" * 64,
         "registry_sha256": snapshot["registry_sha256"],
         "sqsh_sha256": campaign_contract.FROZEN_SQSH["sha256"],
+        "tao_pytorch_overlay": runtime_overlay.contract_record(),
         "cpu_model_runs": 0,
         "smoke_model_runs": 0,
         "mini_step_runs": 0,
@@ -691,8 +697,10 @@ def test_ptm_stage_is_exact_content_addressed_inventory(
         "stage_complete": True,
         "remote_read_only": True,
         "cpu_model_runs": 0,
+        "gpu_model_runs": 0,
         "smoke_model_runs": 0,
         "mini_step_runs": 0,
+        "scheduler_jobs_submitted": 0,
         "checkpoints": [
             {
                 "id": record["id"],
@@ -935,3 +943,144 @@ def test_contract_integrity_rejects_policy_mutation(contract):
     changed["contract_sha256"] = canonical_sha256(changed)
     with pytest.raises(campaign_contract.CampaignContractError):
         campaign_contract.validate_contract(changed)
+
+
+def test_runtime_overlay_contract_is_sealed_and_pythonpath_only(contract):
+    overlay = contract["runtime"]["tao_pytorch_overlay"]
+    assert overlay == runtime_overlay.contract_record()
+    assert overlay["source_commit"] == (
+        "c2e86fe1646ebe89fc280083797dcc544ce88322"
+    )
+    assert overlay["archive"]["sha256"] == (
+        "c395474592d557e0179066c1f99d5cb8f352e10e501621d57043782440dea8c2"
+    )
+    assert overlay["injection"]["mechanism"] == "PYTHONPATH"
+    assert overlay["injection"]["installed_package_mutated"] is False
+
+    changed = copy.deepcopy(contract)
+    changed["runtime"]["tao_pytorch_overlay"]["archive"]["sha256"] = "0" * 64
+    changed.pop("contract_sha256")
+    changed["contract_sha256"] = canonical_sha256(changed)
+    with pytest.raises(runtime_overlay.RuntimeOverlayError):
+        campaign_contract.validate_contract(changed)
+
+
+def test_runtime_overlay_wrap_is_fail_closed_and_precedes_action(contract):
+    overlay = contract["runtime"]["tao_pytorch_overlay"]
+    command = runtime_overlay.wrap_command(
+        "mask2former train -e {config_path}",
+        overlay,
+    )
+    assert overlay["installer"]["path"] in command
+    assert overlay["installer"]["sha256"] in command
+    assert overlay["archive"]["path"] in command
+    assert overlay["archive"]["sha256"] in command
+    assert overlay["source_commit"] in command
+    assert (
+        f"export PYTHONPATH={overlay['injection']['pythonpath_root']}:"
+        "\"$(printenv PYTHONPATH || true)\""
+    ) in command
+    assert command.index(overlay["installer"]["path"]) < command.index(
+        "mask2former train"
+    )
+    changed = copy.deepcopy(overlay)
+    changed["source_commit"] = "0" * 40
+    with pytest.raises(runtime_overlay.RuntimeOverlayError):
+        runtime_overlay.wrap_command("mask2former train", changed)
+
+
+def test_runtime_overlay_remote_identity_and_readonly_are_launch_gates(
+    contract,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    overlay = contract["runtime"]["tao_pytorch_overlay"]
+
+    def identity(path: str) -> dict:
+        if path == overlay["archive"]["path"]:
+            return {
+                "path": path,
+                "size_bytes": overlay["archive"]["size_bytes"],
+                "sha256": overlay["archive"]["sha256"],
+            }
+        return {
+            "path": path,
+            "size_bytes": overlay["installer"]["size_bytes"],
+            "sha256": overlay["installer"]["sha256"],
+        }
+
+    monkeypatch.setattr(run_campaign, "_remote_file_identity", identity)
+    monkeypatch.setattr(run_campaign, "remote_output", lambda command: "")
+    evidence = run_campaign.verify_runtime_overlay_remote(contract)
+    assert evidence["remote_read_only"] is True
+    assert evidence["injection"]["mechanism"] == "PYTHONPATH"
+
+    monkeypatch.setattr(
+        run_campaign,
+        "remote_output",
+        lambda command: f"{overlay['directory']}/writable.py\n",
+    )
+    with pytest.raises(run_campaign.CampaignExecutionError):
+        run_campaign.verify_runtime_overlay_remote(contract)
+
+    def mismatched(path: str) -> dict:
+        value = identity(path)
+        if path == overlay["installer"]["path"]:
+            value["sha256"] = "0" * 64
+        return value
+
+    monkeypatch.setattr(run_campaign, "_remote_file_identity", mismatched)
+    monkeypatch.setattr(run_campaign, "remote_output", lambda command: "")
+    with pytest.raises(run_campaign.CampaignExecutionError):
+        run_campaign.verify_runtime_overlay_remote(contract)
+
+
+def test_runner_training_command_uses_same_sealed_overlay(contract):
+    original = "mask2former train -e {config_path}"
+    runner = SimpleNamespace(
+        skill_ctx=SimpleNamespace(action_cfg={"command": original})
+    )
+    digest = run_campaign.configure_runner_runtime_overlay(runner, contract)
+    wrapped = runner.skill_ctx.action_cfg["command"]
+    assert digest == run_campaign.text_sha256(wrapped)
+    assert contract["runtime"]["tao_pytorch_overlay"]["archive"][
+        "sha256"
+    ] in wrapped
+    assert wrapped.endswith(original)
+
+
+def test_data_only_stage_manifest_has_no_model_or_scheduler_execution():
+    record = qualification_campaign._records()[0]
+    stage = {
+        "schema_version": 1,
+        "model": "mask2former",
+        "registry_sha256": (
+            campaign_contract.mask2former_registry_snapshot()[
+                "registry_sha256"
+            ]
+        ),
+        "created_at_utc": "2026-07-31T00:00:00Z",
+        "stage_complete": True,
+        "remote_read_only": True,
+        "cpu_model_runs": 0,
+        "gpu_model_runs": 0,
+        "smoke_model_runs": 0,
+        "mini_step_runs": 0,
+        "scheduler_jobs_submitted": 0,
+        "checkpoints": [
+            {
+                "id": record["id"],
+                "path": "/lustre/ptms/mask2former_swint.pth",
+                "size_bytes": record["expected_size_bytes"],
+                "sha256": "d" * 64,
+                "mode": "444",
+                "immutable_source_identity": record["source"][
+                    "immutable_identity"
+                ],
+                "remote_read_only": True,
+            }
+        ],
+    }
+    stage["manifest_sha256"] = canonical_sha256(stage)
+    validated = qualification_campaign.validate_stage_document(stage)
+    assert validated["gpu_model_runs"] == 0
+    assert validated["scheduler_jobs_submitted"] == 0

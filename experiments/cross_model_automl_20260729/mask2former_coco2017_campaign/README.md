@@ -30,10 +30,16 @@ and is staged at:
 /lustre/fsw/portfolios/edgeai/users/rarunachalam/tao-pytorch-overlays/mask2former-instance-ap/c2e86fe1646ebe89fc280083797dcc544ce88322
 ```
 
-The implementation blocker is fixed in source, but the model remains
-fail-closed until that exact runtime is applied to the pinned SQSH, the direct
-full-GPU qualification succeeds, and the PTM registry record is independently
-promoted to `supported`.
+The directory and every file are read-only. Every qualification, AutoML
+training, standalone evaluation, and latency command checks the sealed
+installer identity, verifies the archive, prepares a complete temporary
+package mirror, and prepends it through `PYTHONPATH`. The package installed in
+the pinned SQSH is never mutated. A changed archive, installer, source commit,
+or writable remote stage fails before the TAO action starts.
+
+The implementation blocker is fixed and bound into the campaign, but the
+model remains fail-closed until direct full-GPU qualification succeeds and the
+PTM registry record is independently promoted to `supported`.
 
 ## Frozen dataset
 
@@ -94,6 +100,18 @@ resource/version/member identity, observed checkpoint SHA and size, read-only
 state, and explicit zero CPU/smoke/mini-step counters. A self-signed or
 unbound stage file cannot authorize qualification.
 
+The completed data-only stage contains the exact 569,716,712-byte NGC member:
+
+```text
+checkpoint SHA-256: 93f7e5a3ed960a9d6723b42e55e3cecc4aca9ef11bd5e96680bef2789fa3c356
+manifest content SHA-256: 141d14f9b11e3cf81c087d7d05f4e054c885ced1be18554f9832e0cbc9b28bcc
+manifest file SHA-256: 3d51ad23d237b8472ebff629dc9ceb7909123c462683f899f4eabb6f4cc3166e
+remote mode: 0444
+```
+
+The staging operation performed zero CPU/GPU model runs and submitted zero
+scheduler jobs.
+
 PTM identity is represented as a hierarchical non-ordinal outer arm. The one
 current arm is not encoded as an ordinal scalar. The common inner search is
 frozen before any result:
@@ -152,19 +170,22 @@ or scheduler job was launched while preparing this directory.
 
 ## Reproduction after prerequisites are reviewed
 
-The dataset staging commit must first be integrated byte-for-byte so the
-manifest generator can bind the recorded semantic SHA:
-
 ```bash
 cd /localhome/local-rarunachalam/tao-automl
+
+# Data-only and idempotent. This downloads/checksums/publishes the official
+# PTM and does not load a model or construct a scheduler client.
+python -m \
+  experiments.cross_model_automl_20260729.mask2former_coco2017_campaign.qualification_campaign \
+  --stage
 
 python -m \
   experiments.cross_model_automl_20260729.mask2former_coco2017_campaign.manifest_generator \
   --output \
   /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask2former_coco2017_three_mode/campaign.v1.json
 
-# Inspect the direct-full qualification plan. Add --launch only after the
-# task-correct mask-AP runtime and immutable PTM stage are independently ready.
+# Inspect the direct-full qualification plan. Add --launch only after review
+# of the sealed runtime overlay and immutable PTM stage.
 python -m \
   experiments.cross_model_automl_20260729.mask2former_coco2017_campaign.qualification_campaign \
   --contract \

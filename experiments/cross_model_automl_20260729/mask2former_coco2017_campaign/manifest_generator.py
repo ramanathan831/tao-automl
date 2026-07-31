@@ -13,7 +13,7 @@ from typing import Any
 
 from tao_automl.ptm_registry import canonical_sha256
 
-from . import campaign_contract
+from . import campaign_contract, runtime_overlay
 
 
 HERE = Path(__file__).resolve().parent
@@ -243,8 +243,10 @@ def ptm_stage_record(path: str | Path) -> dict[str, Any]:
         or document.get("stage_complete") is not True
         or document.get("remote_read_only") is not True
         or document.get("cpu_model_runs") != 0
+        or document.get("gpu_model_runs") != 0
         or document.get("smoke_model_runs") != 0
         or document.get("mini_step_runs") != 0
+        or document.get("scheduler_jobs_submitted") != 0
         or not isinstance(records, list)
     ):
         raise ManifestGenerationError(
@@ -336,6 +338,7 @@ def _runtime(
         "ptm_stage_manifest_path": ptm_stage["path"],
         "ptm_stage_manifest_sha256": ptm_stage["sha256"],
         "ptm_stage_content_sha256": ptm_stage["manifest_sha256"],
+        "tao_pytorch_overlay": runtime_overlay.contract_record(),
         "partition": "polar3",
         "account": "edgeai_tao-ptm_image-foundation-model-clip",
         "base_results_dir": (
@@ -399,6 +402,9 @@ def build_contract(
             campaign_contract.sha256_file(
                 HERE / "mask2former_latency_worker.py"
             )
+        ),
+        "runtime_overlay_sha256": campaign_contract.sha256_file(
+            HERE / "runtime_overlay.py"
         ),
         "manifest_generator_sha256": campaign_contract.sha256_file(
             HERE / "manifest_generator.py"

@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 
-"""Run the direct full-COCO Mask2Former PTM qualification workflow.
+"""Stage and qualify the official Mask2Former PTM on full COCO.
 
-The default invocation is plan-only. ``--launch`` is the only path that
-constructs a scheduler client or submits jobs. It runs no CPU/model smoke and
-no mini-step: the official PTM receives a real three-epoch, one-node/eight-A100
-full-dataset train followed by standalone full validation. Missing task-correct
-COCO mask AP is retained as a terminal failure, never replaced by semantic
-mIoU and never retried with a different PTM or specification.
+``--stage`` is strictly data-only: it resolves the exact official NGC member,
+downloads and checksums it, and publishes it read-only on Lustre. ``--launch``
+is the only path that constructs a scheduler client or submits jobs. It runs
+no CPU/model smoke and no mini-step: the official PTM receives a real
+three-epoch, one-node/eight-A100 full-dataset train followed by standalone full
+validation. Missing task-correct COCO mask AP is retained as a terminal
+failure, never replaced by semantic mIoU and never retried with a different
+PTM or specification.
 """
 
 from __future__ import annotations
@@ -16,21 +18,29 @@ import argparse
 import copy
 import json
 import math
+import os
 import re
 import shlex
-from collections.abc import Mapping
+import subprocess
+import uuid
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from tao_automl.ptm_preflight import (
+    AtomicArtifactCache,
+    NGCCredential,
+    NGCHTTPSClient,
+)
 from tao_automl.ptm_registry import (
     canonical_sha256,
     load_ptm_registry,
     merge_ptm_spec_precedence,
 )
 
-from . import campaign_contract, run_campaign
+from . import campaign_contract, run_campaign, runtime_overlay
 
 
 DEFAULT_CONTRACT = run_campaign.DEFAULT_CONTRACT
@@ -38,6 +48,16 @@ DEFAULT_RUNTIME_ROOT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
     "mask2former_coco2017_ptm_qualification_v1"
+)
+DEFAULT_STAGE_MANIFEST = DEFAULT_RUNTIME_ROOT / "ptm_stage_manifest.json"
+DEFAULT_LOCAL_CACHE = Path(
+    "/localhome/local-rarunachalam/.tao/cache/"
+    "mask2former_coco2017_ptm_qualification_v1"
+)
+DEFAULT_LUSTRE_INPUT_ROOT = Path(
+    "/lustre/fsw/portfolios/edgeai/users/rarunachalam/"
+    "cross_model_automl_20260729/"
+    "mask2former_coco2017_ptm_qualification_v1/inputs"
 )
 ENV_PATH = run_campaign.ENV_PATH
 CampaignExecutionError = run_campaign.CampaignExecutionError
@@ -47,6 +67,307 @@ utc_timestamp = run_campaign.utc_timestamp
 VALIDATION_MASK_AP_METRIC = "segm_val_mAP"
 STANDALONE_MASK_AP_METRIC = "segm_test_mAP"
 STANDALONE_MASK_AP50_METRIC = "segm_test_mAP50"
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _records() -> tuple[dict[str, Any], ...]:
+    registry = load_ptm_registry()
+    snapshot = campaign_contract.mask2former_registry_snapshot()
+    return tuple(
+        copy.deepcopy(registry.checkpoint(item["id"]))
+        for item in snapshot["records"]
+    )
+
+
+def _safe_component(value: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._")
+    if not text:
+        raise CampaignExecutionError("empty qualification path component")
+    return text
+
+
+def _ssh_options() -> list[str]:
+    options = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
+    key = os.environ.get("SSH_KEY_PATH")
+    if key:
+        options.extend(["-i", key])
+    return options
+
+
+def _ssh_target() -> str:
+    hostname = os.environ["SLURM_HOSTNAME"].split(",", 1)[0].strip()
+    user = os.environ["SLURM_USER"].strip()
+    if not hostname or not user:
+        raise CampaignExecutionError("SLURM SSH routing is incomplete")
+    return f"{user}@{hostname}"
+
+
+def _run(
+    command: Sequence[str],
+    *,
+    timeout: float,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        list(command),
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _remote_mode(path: str) -> str:
+    mode = run_campaign.remote_output(
+        f"stat -c %a {shlex.quote(path)}"
+    ).strip()
+    if re.fullmatch(r"[0-7]{3,4}", mode) is None:
+        raise CampaignExecutionError(
+            f"remote file mode is invalid: {path}"
+        )
+    return mode
+
+
+def _publish_file(
+    source: Path,
+    destination: str,
+    *,
+    expected_size: int,
+    expected_sha256: str,
+) -> dict[str, Any]:
+    """Publish one PTM atomically and leave its final bytes read-only."""
+    if (
+        not source.is_file()
+        or source.stat().st_size != expected_size
+        or campaign_contract.sha256_file(source) != expected_sha256
+    ):
+        raise CampaignExecutionError(
+            f"local staged PTM identity changed: {source}"
+        )
+    try:
+        existing = run_campaign._remote_file_identity(destination)
+    except CampaignExecutionError:
+        existing = None
+    if existing is not None:
+        mode = _remote_mode(destination)
+        if (
+            existing["size_bytes"] != expected_size
+            or existing["sha256"] != expected_sha256
+            or int(mode, 8) & 0o222
+        ):
+            raise CampaignExecutionError(
+                f"existing immutable PTM differs: {destination}"
+            )
+        return {**existing, "mode": mode, "cache_hit": True}
+
+    final_path = Path(destination)
+    temporary = (
+        final_path.parent
+        / f".{final_path.name}.partial-{uuid.uuid4().hex}"
+    )
+    run_campaign.remote_output(
+        f"mkdir -p {shlex.quote(str(final_path.parent))}"
+    )
+    _run(
+        [
+            "scp",
+            *_ssh_options(),
+            str(source),
+            f"{_ssh_target()}:{temporary}",
+        ],
+        timeout=7200,
+    )
+    quoted_temporary = shlex.quote(str(temporary))
+    quoted_final = shlex.quote(destination)
+    run_campaign.remote_output(
+        " && ".join(
+            [
+                f"test \"$(stat -c %s {quoted_temporary})\" = "
+                f"{shlex.quote(str(expected_size))}",
+                f"test \"$(sha256sum {quoted_temporary} | cut -d ' ' -f1)\" "
+                f"= {shlex.quote(expected_sha256)}",
+                f"chmod 0444 {quoted_temporary}",
+                f"test ! -e {quoted_final}",
+                f"mv {quoted_temporary} {quoted_final}",
+            ]
+        ),
+        timeout=1800,
+    )
+    identity = run_campaign._remote_file_identity(destination)
+    mode = _remote_mode(destination)
+    if (
+        identity["size_bytes"] != expected_size
+        or identity["sha256"] != expected_sha256
+        or int(mode, 8) & 0o222
+    ):
+        raise CampaignExecutionError(
+            f"published PTM verification failed: {destination}"
+        )
+    return {**identity, "mode": mode, "cache_hit": False}
+
+
+def validate_stage_document(
+    document: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate a data-only stage independently of the later campaign seal."""
+    value = copy.deepcopy(dict(document))
+    supplied = value.pop("manifest_sha256", None)
+    if supplied != canonical_sha256(value):
+        raise CampaignExecutionError("PTM stage manifest integrity failed")
+    records = _records()
+    rows = value.get("checkpoints")
+    if (
+        value.get("schema_version") != 1
+        or value.get("model") != "mask2former"
+        or _SHA256_RE.fullmatch(
+            str(value.get("registry_sha256", ""))
+        )
+        is None
+        or value.get("stage_complete") is not True
+        or value.get("remote_read_only") is not True
+        or value.get("cpu_model_runs") != 0
+        or value.get("gpu_model_runs") != 0
+        or value.get("smoke_model_runs") != 0
+        or value.get("mini_step_runs") != 0
+        or value.get("scheduler_jobs_submitted") != 0
+        or not isinstance(rows, list)
+        or tuple(item.get("id") for item in rows)
+        != tuple(record["id"] for record in records)
+    ):
+        raise CampaignExecutionError(
+            "Mask2Former PTM stage campaign contract changed"
+        )
+    by_id = {record["id"]: record for record in records}
+    for row in rows:
+        record = by_id[row["id"]]
+        path = row.get("path")
+        if (
+            not isinstance(path, str)
+            or not path.startswith("/lustre/")
+            or row.get("size_bytes") != record["expected_size_bytes"]
+            or _SHA256_RE.fullmatch(str(row.get("sha256", ""))) is None
+            or row.get("immutable_source_identity")
+            != record["source"]["immutable_identity"]
+            or row.get("remote_read_only") is not True
+            or int(str(row.get("mode", "0")), 8) & 0o222
+            or (
+                record.get("sha256") is not None
+                and row["sha256"] != record["sha256"]
+            )
+        ):
+            raise CampaignExecutionError(
+                f"staged PTM identity changed: {row.get('id')}"
+            )
+    value["manifest_sha256"] = supplied
+    return value
+
+
+def verify_stage_remote(document: Mapping[str, Any]) -> dict[str, Any]:
+    """Re-hash the data-only stage without running or loading a model."""
+    stage = validate_stage_document(document)
+    checked = []
+    for row in stage["checkpoints"]:
+        observed = run_campaign._remote_file_identity(row["path"])
+        mode = _remote_mode(row["path"])
+        if (
+            observed["size_bytes"] != row["size_bytes"]
+            or observed["sha256"] != row["sha256"]
+            or int(mode, 8) & 0o222
+        ):
+            raise CampaignExecutionError(
+                f"remote staged PTM changed: {row['id']}"
+            )
+        checked.append({**observed, "mode": mode, "id": row["id"]})
+    return {
+        "stage_manifest_sha256": stage["manifest_sha256"],
+        "checked": checked,
+        "all_read_only": True,
+        "model_runs": 0,
+        "scheduler_jobs_submitted": 0,
+    }
+
+
+def stage_runtime_inputs(
+    *,
+    local_cache_root: str | Path = DEFAULT_LOCAL_CACHE,
+    lustre_input_root: str | Path = DEFAULT_LUSTRE_INPUT_ROOT,
+) -> dict[str, Any]:
+    """Download and publish every official Mask2Former PTM, data-only."""
+    cache = AtomicArtifactCache(
+        Path(local_cache_root).expanduser().resolve() / "ngc"
+    )
+    client = NGCHTTPSClient(NGCCredential.from_environment())
+    lustre_root = Path(lustre_input_root)
+    rows = []
+    for record in _records():
+        reference = client.resolve_member(record["source"])
+        probe = client.probe_member(reference)
+        if (
+            probe.ok is not True
+            or (
+                probe.remote_size_bytes is not None
+                and probe.remote_size_bytes
+                != record["expected_size_bytes"]
+            )
+        ):
+            raise CampaignExecutionError(
+                f"exact NGC member preflight failed for "
+                f"{record['id']}: {probe.code}"
+            )
+        checkpoint = cache.fetch_ngc_member(
+            checkpoint_id=record["id"],
+            reference=reference,
+            expected_size_bytes=record["expected_size_bytes"],
+            expected_sha256=record.get("sha256"),
+            client=client,
+        )
+        destination = (
+            lustre_root
+            / "ptms"
+            / _safe_component(record["id"])
+            / record["source"]["member"]
+        )
+        remote = _publish_file(
+            checkpoint.path,
+            str(destination),
+            expected_size=checkpoint.size_bytes,
+            expected_sha256=checkpoint.sha256,
+        )
+        rows.append(
+            {
+                "id": record["id"],
+                "path": remote["path"],
+                "size_bytes": remote["size_bytes"],
+                "sha256": remote["sha256"],
+                "mode": remote["mode"],
+                "immutable_source_identity": record["source"][
+                    "immutable_identity"
+                ],
+                "verification_mode": checkpoint.verification_mode,
+                "source_identity_sha256": (
+                    checkpoint.source_identity_sha256
+                ),
+                "access_probe": probe.to_dict(),
+                "remote_read_only": True,
+            }
+        )
+    document = {
+        "schema_version": 1,
+        "model": "mask2former",
+        "registry_sha256": campaign_contract.mask2former_registry_snapshot()[
+            "registry_sha256"
+        ],
+        "created_at_utc": utc_timestamp(),
+        "stage_complete": True,
+        "remote_read_only": True,
+        "cpu_model_runs": 0,
+        "gpu_model_runs": 0,
+        "smoke_model_runs": 0,
+        "mini_step_runs": 0,
+        "scheduler_jobs_submitted": 0,
+        "checkpoints": rows,
+    }
+    document["manifest_sha256"] = canonical_sha256(document)
+    return validate_stage_document(document)
 
 
 def _lower_sha(value: Any, name: str) -> str:
@@ -87,6 +408,9 @@ def qualification_plan(contract: Mapping[str, Any]) -> dict[str, Any]:
         "gpus_per_job": 8,
         "hardware": copy.deepcopy(campaign_contract.FROZEN_HARDWARE),
         "sqsh": copy.deepcopy(campaign_contract.FROZEN_SQSH),
+        "tao_pytorch_overlay": copy.deepcopy(
+            contract["runtime"]["tao_pytorch_overlay"]
+        ),
         "cpu_model_runs": 0,
         "smoke_model_runs": 0,
         "mini_step_runs": 0,
@@ -140,8 +464,10 @@ def load_ptm_stage(
         or document.get("stage_complete") is not True
         or document.get("remote_read_only") is not True
         or document.get("cpu_model_runs") != 0
+        or document.get("gpu_model_runs") != 0
         or document.get("smoke_model_runs") != 0
         or document.get("mini_step_runs") != 0
+        or document.get("scheduler_jobs_submitted") != 0
     ):
         raise CampaignExecutionError(
             "PTM stage identity or execution policy changed"
@@ -280,7 +606,12 @@ def _entrypoint(
     )
     action = metadata["actions"][action_name]
     entrypoint = build_entrypoint(
-        command=_gpu_guard(action["command"]),
+        command=_gpu_guard(
+            runtime_overlay.wrap_command(
+                action["command"],
+                contract["runtime"]["tao_pytorch_overlay"],
+            )
+        ),
         specs=specification,
         inputs=action["inputs"],
         outputs=action["outputs"],
@@ -595,6 +926,9 @@ def build_completion(
         ],
         "registry_sha256": contract["ptm_inventory"]["registry_sha256"],
         "sqsh_sha256": contract["sqsh"]["sha256"],
+        "tao_pytorch_overlay": copy.deepcopy(
+            contract["runtime"]["tao_pytorch_overlay"]
+        ),
         "cpu_model_runs": 0,
         "smoke_model_runs": 0,
         "mini_step_runs": 0,
@@ -621,6 +955,7 @@ def launch(
     sqsh = run_campaign._remote_file_identity(contract["sqsh"]["path"])
     if sqsh["sha256"] != contract["sqsh"]["sha256"]:
         raise CampaignExecutionError("pinned SQSH identity changed")
+    overlay = run_campaign.verify_runtime_overlay_remote(contract)
     staged = load_ptm_stage(
         contract["qualification_policy"]["ptm_stage_manifest_path"],
         contract,
@@ -636,6 +971,7 @@ def launch(
             "local_contract": local,
             "dataset": dataset,
             "sqsh": sqsh,
+            "tao_pytorch_overlay": overlay,
             "ptm_stage_manifest_path": contract[
                 "qualification_policy"
             ]["ptm_stage_manifest_path"],
@@ -690,9 +1026,62 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--runtime-root", type=Path, default=DEFAULT_RUNTIME_ROOT
     )
+    parser.add_argument(
+        "--stage-manifest",
+        type=Path,
+        default=DEFAULT_STAGE_MANIFEST,
+    )
+    parser.add_argument(
+        "--local-cache-root",
+        type=Path,
+        default=DEFAULT_LOCAL_CACHE,
+    )
+    parser.add_argument(
+        "--lustre-input-root",
+        type=Path,
+        default=DEFAULT_LUSTRE_INPUT_ROOT,
+    )
     parser.add_argument("--env-file", type=Path, default=ENV_PATH)
-    parser.add_argument("--launch", action="store_true")
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--stage", action="store_true")
+    actions.add_argument("--check-stage", action="store_true")
+    actions.add_argument("--launch", action="store_true")
     arguments = parser.parse_args(argv)
+
+    if arguments.stage or arguments.check_stage:
+        run_campaign.load_env_file(arguments.env_file.resolve())
+        stage_path = arguments.stage_manifest.resolve()
+        if stage_path.is_file():
+            stage = validate_stage_document(
+                json.loads(stage_path.read_text(encoding="utf-8"))
+            )
+        elif arguments.check_stage:
+            raise CampaignExecutionError(
+                f"PTM stage manifest is unavailable: {stage_path}"
+            )
+        else:
+            stage = stage_runtime_inputs(
+                local_cache_root=arguments.local_cache_root,
+                lustre_input_root=arguments.lustre_input_root,
+            )
+            atomic_json(stage_path, stage)
+        checked = verify_stage_remote(stage)
+        print(
+            json.dumps(
+                {
+                    "stage_manifest_path": str(stage_path),
+                    "stage_manifest_sha256": stage["manifest_sha256"],
+                    "ptm_count": len(stage["checkpoints"]),
+                    "remote_verification": checked,
+                    "model_runs": 0,
+                    "scheduler_jobs_submitted": 0,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
     contract = run_campaign.load_contract(arguments.contract)
     plan = qualification_plan(contract)
     if not arguments.launch:

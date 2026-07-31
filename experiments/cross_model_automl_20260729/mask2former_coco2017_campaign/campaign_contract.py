@@ -21,6 +21,8 @@ from typing import Any
 
 from tao_automl.ptm_registry import canonical_sha256, load_ptm_registry
 
+from . import runtime_overlay
+
 
 MODES = ("accuracy", "latency", "multi_objective")
 AGENT_FLAGS = (
@@ -513,6 +515,10 @@ def build_preregistered_contract(
     dataset_record = validate_dataset_record(dataset)
     schema = validate_packaged_train_schema(skill_dir)
     ptm_inventory = mask2former_registry_snapshot()
+    runtime_record = copy.deepcopy(dict(runtime))
+    runtime_overlay.validate_contract_record(
+        runtime_record.get("tao_pytorch_overlay", {})
+    )
     value = {
         "schema_version": 1,
         "campaign_id": campaign_id,
@@ -521,7 +527,7 @@ def build_preregistered_contract(
         "task": "instance_segmentation",
         "primary_accuracy_metric": "segm_val_mAP",
         "dataset": dataset_record,
-        "runtime": copy.deepcopy(dict(runtime)),
+        "runtime": runtime_record,
         "sqsh": copy.deepcopy(FROZEN_SQSH),
         "schema": schema,
         "ptm_inventory": ptm_inventory,
@@ -575,6 +581,8 @@ def build_preregistered_contract(
             "nodes_per_child": 1,
             "gpus_per_child": 8,
             "container_mode": "pinned_sqsh",
+            "tao_pytorch_overlay_injection": "PYTHONPATH",
+            "installed_tao_package_mutated": False,
         },
         "search": {
             "algorithm": "bayesian",
@@ -670,6 +678,14 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
         or value.get("execution", {}).get("gpus_per_child") != 8
         or value.get("execution", {}).get("container_mode")
         != "pinned_sqsh"
+        or value.get("execution", {}).get(
+            "tao_pytorch_overlay_injection"
+        )
+        != "PYTHONPATH"
+        or value.get("execution", {}).get(
+            "installed_tao_package_mutated"
+        )
+        is not False
         or value.get("search", {}).get("space") != SEARCH_SPACE
         or value.get("modes") != expected_modes
         or value.get("metric_contract", {}).get(
@@ -713,6 +729,9 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
     if value.get("sqsh") != FROZEN_SQSH:
         raise CampaignContractError("pinned SQSH identity changed")
     runtime = value.get("runtime", {})
+    runtime_overlay.validate_contract_record(
+        runtime.get("tao_pytorch_overlay", {})
+    )
     search = value.get("search", {})
     if (
         value.get("ptm_inventory") != mask2former_registry_snapshot()

@@ -33,6 +33,10 @@ from .campaign_contract import (
     mask2former_registry_snapshot,
     sha256_file,
 )
+from .runtime_overlay import (
+    RuntimeOverlayError,
+    validate_contract_record as validate_runtime_overlay,
+)
 
 
 class QualificationGateError(RuntimeError):
@@ -308,6 +312,14 @@ def audit_qualification(
             "ptm_stage_manifest_path must be absolute"
         )
     sealed_stage_by_id: dict[str, Mapping[str, Any]] = {}
+    try:
+        evidence_overlay = validate_runtime_overlay(
+            document.get("tao_pytorch_overlay", {})
+        )
+    except RuntimeOverlayError as exc:
+        raise QualificationGateError(
+            f"qualification runtime overlay is invalid: {exc}"
+        ) from exc
     if expected_contract is not None:
         runtime = expected_contract.get("runtime", {})
         launchers = expected_contract.get("launcher_integrity", {})
@@ -318,6 +330,7 @@ def audit_qualification(
             != runtime.get("ptm_stage_manifest_path")
             or document["ptm_stage_manifest_sha256"]
             != runtime.get("ptm_stage_manifest_sha256")
+            or evidence_overlay != runtime.get("tao_pytorch_overlay")
         ):
             raise QualificationGateError(
                 "qualification launcher or PTM stage differs from the "

@@ -36,7 +36,7 @@ from tao_automl.ptm_registry import canonical_sha256, load_ptm_registry
 from tao_automl.recommendation_audit import validate_recommendation_audit
 from tao_automl.selection import canonical_spec_fingerprint
 
-from . import campaign_contract
+from . import campaign_contract, runtime_overlay
 from .qualification_gate import (
     QualificationDecision,
     QualificationLoadEvidence,
@@ -152,6 +152,49 @@ def _remote_file_identity(path: str) -> dict[str, Any]:
         raise CampaignExecutionError(
             f"remote artifact unavailable or unreadable: {path}"
         ) from exc
+
+
+def verify_runtime_overlay_remote(
+    contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Verify the sealed overlay identity and read-only Lustre stage."""
+    overlay = runtime_overlay.validate_contract_record(
+        contract["runtime"].get("tao_pytorch_overlay", {})
+    )
+    directory = overlay["directory"]
+    expected_artifacts = {
+        "archive": overlay["archive"],
+        "installer": overlay["installer"],
+    }
+    identities = {}
+    for name, expected in expected_artifacts.items():
+        observed = _remote_file_identity(expected["path"])
+        if (
+            observed["size_bytes"] != expected["size_bytes"]
+            or observed["sha256"] != expected["sha256"]
+        ):
+            raise CampaignExecutionError(
+                f"sealed Mask2Former runtime overlay {name} changed"
+            )
+        identities[name] = observed
+    writable = remote_output(
+        "find "
+        f"{shlex.quote(directory)} "
+        "\\( -type f -o -type d \\) -perm /222 -print -quit"
+    ).strip()
+    if writable:
+        raise CampaignExecutionError(
+            "Mask2Former runtime overlay stage is writable: "
+            f"{writable}"
+        )
+    return {
+        "source_commit": overlay["source_commit"],
+        "directory": directory,
+        "archive": identities["archive"],
+        "installer": identities["installer"],
+        "injection": copy.deepcopy(overlay["injection"]),
+        "remote_read_only": True,
+    }
 
 
 def _verify_dataset_remote(contract: Mapping[str, Any]) -> dict[str, Any]:
@@ -329,6 +372,10 @@ def verify_local_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
                 "mask2former_latency_worker_sha256"
             ],
         ),
+        "runtime_overlay": (
+            HERE / "runtime_overlay.py",
+            contract["launcher_integrity"]["runtime_overlay_sha256"],
+        ),
     }
     evidence = {}
     for name, (path_value, expected_sha) in identities.items():
@@ -376,6 +423,12 @@ def launch_readiness(
             raise CampaignExecutionError("pinned SQSH SHA-256 changed")
     except Exception as exc:
         blockers.append({"code": "sqsh_not_ready", "reason": str(exc)})
+    try:
+        verify_runtime_overlay_remote(contract)
+    except Exception as exc:
+        blockers.append(
+            {"code": "runtime_overlay_not_ready", "reason": str(exc)}
+        )
     try:
         decision = audit_qualification(
             contract["qualification_policy"]["qualification_evidence_path"],
@@ -710,7 +763,10 @@ def _launch_evaluation(
         ).read_text(encoding="utf-8")
     )["actions"]["evaluate"]
     entrypoint = build_entrypoint(
-        command=action["command"],
+        command=runtime_overlay.wrap_command(
+            action["command"],
+            contract["runtime"]["tao_pytorch_overlay"],
+        ),
         specs=spec,
         inputs=action["inputs"],
         outputs=action["outputs"],
@@ -732,6 +788,12 @@ def _launch_evaluation(
         "submitted_at_utc": utc_timestamp(),
         "spec_sha256": canonical_sha256(spec),
         "command_sha256": text_sha256(entrypoint["command"]),
+        "tao_pytorch_overlay_source_commit": (
+            contract["runtime"]["tao_pytorch_overlay"]["source_commit"]
+        ),
+        "tao_pytorch_overlay_archive_sha256": (
+            contract["runtime"]["tao_pytorch_overlay"]["archive"]["sha256"]
+        ),
     }
     status = _wait_for_job(
         sdk,
@@ -969,6 +1031,10 @@ def _launch_latency(
             '"$TAO_RESULTS_ROOT/$TAO_JOB_ID/latency"',
         ]
     )
+    command = runtime_overlay.wrap_command(
+        command,
+        contract["runtime"]["tao_pytorch_overlay"],
+    )
     action = yaml.safe_load(
         (
             Path(contract["runtime"]["skill_dir"])
@@ -1002,6 +1068,12 @@ def _launch_latency(
         "input_descriptor": descriptor,
         "input_sha256": canonical_sha256(descriptor),
         "contract_sha256": canonical_sha256(latency_contract),
+        "tao_pytorch_overlay_source_commit": (
+            contract["runtime"]["tao_pytorch_overlay"]["source_commit"]
+        ),
+        "tao_pytorch_overlay_archive_sha256": (
+            contract["runtime"]["tao_pytorch_overlay"]["archive"]["sha256"]
+        ),
     }
     status = _wait_for_job(
         sdk,
@@ -1207,6 +1279,20 @@ def _await_first_candidate_release(
         )
 
 
+def configure_runner_runtime_overlay(
+    runner: Any,
+    contract: Mapping[str, Any],
+) -> str:
+    """Bind the sealed overlay to every AutoML training recommendation."""
+    action = copy.deepcopy(runner.skill_ctx.action_cfg)
+    action["command"] = runtime_overlay.wrap_command(
+        action["command"],
+        contract["runtime"]["tao_pytorch_overlay"],
+    )
+    runner.skill_ctx.action_cfg = action
+    return text_sha256(action["command"])
+
+
 def _run_mode(
     contract_path: str,
     runtime_root: str,
@@ -1224,6 +1310,18 @@ def _run_mode(
     mode_dir.mkdir(parents=True, exist_ok=True)
     events = mode_dir / "events.jsonl"
     evidence_path = mode_dir / "candidate_evidence.json"
+    train_action = yaml.safe_load(
+        (
+            Path(contract["runtime"]["skill_dir"])
+            / "references/skill_info.yaml"
+        ).read_text(encoding="utf-8")
+    )["actions"]["train"]
+    expected_training_command_sha256 = text_sha256(
+        runtime_overlay.wrap_command(
+            train_action["command"],
+            contract["runtime"]["tao_pytorch_overlay"],
+        )
+    )
     candidates: dict[str, Any] = {}
     if resume and evidence_path.is_file():
         document = json.loads(evidence_path.read_text(encoding="utf-8"))
@@ -1231,6 +1329,8 @@ def _run_mode(
             document.get("contract_sha256")
             != contract["contract_sha256"]
             or document.get("mode") != mode
+            or document.get("training_command_sha256")
+            != expected_training_command_sha256
             or not isinstance(document.get("candidates"), Mapping)
         ):
             raise CampaignExecutionError(
@@ -1267,6 +1367,14 @@ def _run_mode(
         action="train",
         poll_interval=10,
     )
+    training_command_sha256 = configure_runner_runtime_overlay(
+        runner,
+        contract,
+    )
+    if training_command_sha256 != expected_training_command_sha256:
+        raise CampaignExecutionError(
+            "sealed AutoML training command changed during runner setup"
+        )
 
     def persist() -> None:
         atomic_json(
@@ -1275,6 +1383,7 @@ def _run_mode(
                 "schema_version": 1,
                 "contract_sha256": contract["contract_sha256"],
                 "mode": mode,
+                "training_command_sha256": training_command_sha256,
                 "candidates": candidates,
             },
         )
@@ -1569,6 +1678,7 @@ def verify_live_runtime_preflight(
     decision: QualificationDecision,
     cache_root: str | Path,
 ) -> dict[str, Any]:
+    overlay = verify_runtime_overlay_remote(contract)
     modes: dict[str, Any] = {}
     for mode in campaign_contract.MODES:
         inventory = build_live_runtime_inventory(
@@ -1599,6 +1709,7 @@ def verify_live_runtime_preflight(
         "status": "success",
         "model_jobs_launched": False,
         "cpu_or_smoke_model_jobs_launched": False,
+        "tao_pytorch_overlay": overlay,
         "modes": modes,
     }
     value["record_sha256"] = canonical_sha256(value)
@@ -1696,6 +1807,9 @@ def main(argv: list[str] | None = None) -> int:
             "secret_values_recorded": False,
             "qualification_evidence_sha256": decision.evidence_sha256,
             "live_runtime_preflight_sha256": live["record_sha256"],
+            "tao_pytorch_overlay": copy.deepcopy(
+                live["tao_pytorch_overlay"]
+            ),
             "sqsh_path": contract["sqsh"]["path"],
             "sqsh_sha256": contract["sqsh"]["sha256"],
             "nodes_per_child": 1,
