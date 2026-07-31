@@ -103,3 +103,65 @@ PYTHONPATH=src \
 The historical `campaign.preparation.v1.json` is retained unchanged. The
 current successor contract intentionally states `launch_authorized: false`;
 no GPU job has been submitted from this directory.
+
+## Future structured-config successor
+
+The historical v1/v2 inputs and `successor.contract.v1.json` remain immutable.
+New execution is bound separately by `campaign.inputs.v3.json` and
+`successor.runtime.contract.v2.json`. The only accepted DDETR predecessor is:
+
+```text
+/localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/
+  deformable_detr_automl_synthetic_structured_config_fix_v1/
+  first_candidate_gate/automatic_release.json
+```
+
+Its required manifest identity is
+`d70063f3fc6c4ed7c44d8c7d979e2dc3ffc27f576ddd13cf000648a2c2a26e83`
+from source head `8386f52`. The release depends only on the three
+algorithm-generated candidate-zero gates. It explicitly does not wait for
+DDETR candidates 1–19.
+
+All auxiliary model bytes are already staged read-only on Lustre. No model was
+loaded and no scheduler job was submitted while staging:
+
+| Input | Immutable identity |
+| --- | --- |
+| Grounding DINO commercial Swin-T v1.0 | `20c3ea116d1b841063aa5efffdd386b3d85a1c35f2d702d3c95150ef1efead73` |
+| Grounding DINO commercial Swin-T v1.1 | `8ea7e089e174e72a7fe57ff63cdba5e1e4994b159e41cf72122a7e0d841beaa6` |
+| `google-bert/bert-base-uncased` revision | `86b5e0934494bd15c9632b12f734a8a67f723594` |
+| BERT staged tree | `04cd5cc67804f4752df93e7c05dd51d904e82fc05d28794ddb03504cca689fb5` |
+| Runtime-input stage record | `3b52818de9bd438330a8530c36c5e60c62fdb367b9f7ae93688eebafaa38db8f` |
+
+The automatic watcher is fail-closed. It requires the exact fresh DDETR
+candidate-zero release, the still-valid RT-DETR release, unchanged dataset and
+metric contracts, and the sealed PTM/BERT record. It then runs two official
+PTM qualifications in parallel. The first model operation is a real
+one-node/eight-A100-or-H100, ten-epoch train/validation job using the pinned
+RC245 SQSH, followed by standalone evaluation of one exact terminal
+checkpoint. No CPU, smoke, mini-step, fallback PTM, or replacement workflow is
+available.
+
+The qualification completion artifact automatically records the qualified PTM
+population and opens the algorithm-generated three-mode pilot handoff without
+manual confirmation. Candidate values remain the responsibility of the
+production search algorithm.
+
+Verify the new immutable records without launching:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src:. \
+  python -m \
+  experiments.cross_model_automl_20260729.grounding_dino_shared_detection.runtime_input_stage \
+  --inputs experiments/cross_model_automl_20260729/grounding_dino_shared_detection/campaign.inputs.v3.json \
+  --output experiments/cross_model_automl_20260729/grounding_dino_shared_detection/runtime_inputs.stage.v1.json \
+  --check-only
+
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src:. \
+  python -m \
+  experiments.cross_model_automl_20260729.grounding_dino_shared_detection.future_contract \
+  --inputs experiments/cross_model_automl_20260729/grounding_dino_shared_detection/campaign.inputs.v3.json \
+  --stage experiments/cross_model_automl_20260729/grounding_dino_shared_detection/runtime_inputs.stage.v1.json \
+  --output experiments/cross_model_automl_20260729/grounding_dino_shared_detection/successor.runtime.contract.v2.json \
+  --check-only
+```

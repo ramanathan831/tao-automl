@@ -24,7 +24,18 @@ from .contract import (
 )
 from .dataset_conversion import validate_conversion_manifest
 from .dataset_stage import validate_stage_record
+from .future_contract import (
+    build_future_contract,
+    validate_future_contract,
+)
+from .qualification_campaign import _gpu_guard
+from .runtime_input_stage import (
+    HF_REQUIRED_FILES,
+    validate_runtime_input_stage,
+)
 from .successor_contract import validate_successor_contract
+from .automatic_trigger import readiness
+from . import automatic_trigger
 
 
 HERE = Path(__file__).resolve().parent
@@ -344,3 +355,102 @@ def test_successor_mode_pilots_are_independent_and_algorithm_generated():
     ] == pytest.approx(0.90)
     assert jobs[0]["objective"]["latency_accuracy_retention"] is None
     assert jobs[2]["objective"]["latency_accuracy_retention"] is None
+
+
+def test_runtime_input_stage_seals_every_official_ptm_and_immutable_bert():
+    inputs = read_json(HERE / "campaign.inputs.v3.json")
+    document = read_json(HERE / "runtime_inputs.stage.v1.json")
+
+    validate_runtime_input_stage(document, inputs=inputs)
+    assert [item["id"] for item in document["official_ptms"]] == [
+        "grounding_dino.commercial.swin_tiny.trainable.v1.0",
+        "grounding_dino.commercial.swin_tiny.trainable.v1.1",
+    ]
+    assert document["official_ptms"][0]["verification_mode"] == (
+        "immutable_identity_observed_sha256"
+    )
+    assert document["official_ptms"][1]["observed_sha256"] == (
+        "8ea7e089e174e72a7fe57ff63cdba5e1e4994b159e41cf72122a7e0d841beaa6"
+    )
+    assert document["text_encoder"]["revision"] == (
+        "86b5e0934494bd15c9632b12f734a8a67f723594"
+    )
+    assert [item["path"] for item in document["text_encoder"]["files"]] == list(
+        HF_REQUIRED_FILES
+    )
+    assert document["execution"]["cpu_model_runs"] == 0
+    assert document["execution"]["gpu_model_runs"] == 0
+    assert document["execution"]["scheduler_jobs_submitted"] == 0
+
+
+def test_future_contract_binds_only_fresh_ddetr_candidate_zero_gate():
+    document = read_json(HERE / "successor.runtime.contract.v2.json")
+    validate_future_contract(document)
+
+    dependency = document["predecessor_release"]["deformable_detr"]
+    assert dependency["artifact_path"].endswith(
+        "deformable_detr_automl_synthetic_structured_config_fix_v1/"
+        "first_candidate_gate/automatic_release.json"
+    )
+    assert dependency["manifest_sha256"] == (
+        "d70063f3fc6c4ed7c44d8c7d979e2dc3ffc27f576ddd13cf000648a2c2a26e83"
+    )
+    assert dependency["source_head"] == "8386f52"
+    assert "candidates 1-19" in dependency["release_scope"]
+    assert (
+        document["automatic_trigger"]["predecessor_waits_for_full_budget"]
+        is False
+    )
+
+
+def test_future_contract_is_reproducible_and_uses_staged_bert():
+    inputs = read_json(HERE / "campaign.inputs.v3.json")
+    stage = read_json(HERE / "runtime_inputs.stage.v1.json")
+    expected = read_json(HERE / "successor.runtime.contract.v2.json")
+
+    observed = build_future_contract(
+        experiment_dir=HERE,
+        inputs=inputs,
+        stage=stage,
+    )
+    assert observed == expected
+    text_root = stage["text_encoder"]["lustre_root"]
+    for job in observed["qualification"]["jobs"]:
+        assert job["train"]["spec"]["model"]["text_encoder_type"] == text_root
+        assert job["evaluate"]["spec"]["model"]["text_encoder_type"] == text_root
+        assert job["resources"]["gpus_per_node"] == 8
+        assert job["train"]["spec"]["train"]["is_dry_run"] is False
+
+
+def test_missing_fresh_ddetr_release_is_the_only_trigger_blocker(monkeypatch):
+    contract = read_json(HERE / "successor.runtime.contract.v2.json")
+    inputs = read_json(HERE / "campaign.inputs.v3.json")
+    monkeypatch.setattr(
+        automatic_trigger,
+        "_evaluate_ddetr_gate",
+        lambda configuration: {
+            "model": "deformable_detr",
+            "artifact_path": configuration["artifact_path"],
+            "expected_manifest_sha256": configuration["manifest_sha256"],
+            "passed": False,
+            "blockers": ["required automatic release artifact is absent"],
+        },
+    )
+
+    result = readiness(contract=contract, inputs=inputs)
+    assert result["ready"] is False
+    assert result["waits_for_ddetr_full_budget"] is False
+    assert result["rtdetr"]["passed"] is True
+    assert result["deformable_detr"]["passed"] is False
+    assert [item["code"] for item in result["blockers"]] == [
+        "fresh_ddetr_three_mode_candidate_zero_gate_pending"
+    ]
+
+
+def test_gpu_qualification_guard_requires_eight_a100_or_h100_devices():
+    command = _gpu_guard("grounding_dino train -e {config_path}")
+    assert "wc -l)\" -eq 8" in command
+    assert "NVIDIA (A100|H100)" in command
+    assert "HF_HUB_OFFLINE=1" in command
+    assert "TRANSFORMERS_OFFLINE=1" in command
+    assert "grounding_dino train -e {config_path}" in command
