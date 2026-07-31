@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "registry_version": "1.4.0",
+  "registry_version": "1.5.0",
   "models": {
     "dino": {
       "default_ptm": "dino.coco.resnet50.trainable.v1.0",
@@ -3800,7 +3800,7 @@
         {
           "id": "oneformer.ade20k.research.swin_large.trainable.v1.0",
           "status": "unverified",
-          "status_reason": "Official NGC checkpoint identity, SHA-256, size, universal-segmentation task contract, Swin-Large backbone identity, and noncommercial license are recorded. No checkpoint-specific YAML member is exposed; dataset/task defaults, TAO compatibility, and load, training, validation, and inference mini-steps remain unverified.",
+          "status_reason": "Official NGC checkpoint identity, SHA-256, size, universal-segmentation task contract, Swin-Large backbone identity, noncommercial license, and a repository-owned path-free projection of TAO's official ADE architecture spec are recorded. TAO 7.1 transfer loading and direct full-dataset training/evaluation remain unverified.",
           "source": {
             "provider": "ngc",
             "registry": "nvidia/tao",
@@ -3812,6 +3812,9 @@
           },
           "sha256": "bd727f429eba64978afdf87fadb98a801a0574b45fe033faf3514b4045e561f4",
           "expected_size_bytes": 2840732008,
+          "compatible_tao_versions": [
+            "==7.1.0"
+          ],
           "model_family": "oneformer",
           "architecture": "oneformer",
           "backbone": "swin_large",
@@ -3830,6 +3833,43 @@
               ]
             }
           },
+          "default_spec_overrides": {
+            "model": {
+              "backbone": {
+                "name": "D2SwinTransformer",
+                "swin": {
+                  "embed_dim": 192,
+                  "depths": [2, 2, 18, 2],
+                  "num_heads": [6, 12, 24, 48],
+                  "window_size": 12,
+                  "mlp_ratio": 4.0,
+                  "patch_size": 4,
+                  "patch_norm": true,
+                  "ape": false,
+                  "pretrain_img_size": 384,
+                  "qkv_bias": true,
+                  "attn_drop_rate": 0.0,
+                  "drop_rate": 0.0,
+                  "drop_path_rate": 0.3,
+                  "out_features": ["res2", "res3", "res4", "res5"],
+                  "out_indices": [0, 1, 2, 3],
+                  "use_checkpoint": false
+                }
+              },
+              "one_former": {
+                "num_object_queries": 250
+              }
+            }
+          },
+          "checkpoint_spec_file": {
+            "source": "repository",
+            "path": "data/ptm_specs/oneformer/oneformer.ade20k.research.swin_large.trainable.v1.0.yaml",
+            "sha256": "da8997de338775ade30865ab3d500f1a968432a56ad979ac9302d90c742bf2ce",
+            "provenance": {
+              "source": "Path-free projection of TAO OneFormer's official spec_ade.yaml",
+              "evidence": "tao-pytorch:nvidia_tao_pytorch/cv/oneformer/experiment_specs/spec_ade.yaml"
+            }
+          },
           "task_compatibility": [
             "semantic_segmentation",
             "instance_segmentation",
@@ -3842,12 +3882,15 @@
               "NVIDIA NGC model access",
               "Acceptance of the noncommercial and additional model terms"
             ]
+          },
+          "deprecation": {
+            "is_deprecated": false
           }
         },
         {
           "id": "oneformer.coco.research.swin_large.trainable",
           "status": "unverified",
-          "status_reason": "Official NGC checkpoint identity, SHA-256, size, universal-segmentation task contract, Swin-Large backbone identity, and noncommercial license are recorded. No checkpoint-specific YAML member is exposed; dataset/task defaults, TAO compatibility, and load, training, validation, and inference mini-steps remain unverified.",
+          "status_reason": "Official NGC checkpoint identity, SHA-256, size, universal-segmentation task contract, Swin-Large backbone identity, noncommercial license, and a repository-owned path-free projection of TAO's official COCO architecture spec are recorded. TAO 7.1 transfer loading and direct full-dataset training/evaluation remain unverified.",
           "source": {
             "provider": "ngc",
             "registry": "nvidia/tao",
@@ -3859,6 +3902,9 @@
           },
           "sha256": "1627287f51067e8511973b914d94b071414e16b4830ecd9efe5ad78b97207c6c",
           "expected_size_bytes": 2840372264,
+          "compatible_tao_versions": [
+            "==7.1.0"
+          ],
           "model_family": "oneformer",
           "architecture": "oneformer",
           "backbone": "swin_large",
@@ -3877,6 +3923,43 @@
               ]
             }
           },
+          "default_spec_overrides": {
+            "model": {
+              "backbone": {
+                "name": "D2SwinTransformer",
+                "swin": {
+                  "embed_dim": 192,
+                  "depths": [2, 2, 18, 2],
+                  "num_heads": [6, 12, 24, 48],
+                  "window_size": 12,
+                  "mlp_ratio": 4.0,
+                  "patch_size": 4,
+                  "patch_norm": true,
+                  "ape": false,
+                  "pretrain_img_size": 384,
+                  "qkv_bias": true,
+                  "attn_drop_rate": 0.0,
+                  "drop_rate": 0.0,
+                  "drop_path_rate": 0.3,
+                  "out_features": ["res2", "res3", "res4", "res5"],
+                  "out_indices": [0, 1, 2, 3],
+                  "use_checkpoint": false
+                }
+              },
+              "one_former": {
+                "num_object_queries": 150
+              }
+            }
+          },
+          "checkpoint_spec_file": {
+            "source": "repository",
+            "path": "data/ptm_specs/oneformer/oneformer.coco.research.swin_large.trainable.yaml",
+            "sha256": "5d85e7be1a37690151e05195153c2f5eacd8e2027bf6f401a8846244aef28f3d",
+            "provenance": {
+              "source": "Path-free projection of TAO OneFormer's official spec_coco.yaml",
+              "evidence": "tao-pytorch:nvidia_tao_pytorch/cv/oneformer/experiment_specs/spec_coco.yaml"
+            }
+          },
           "task_compatibility": [
             "semantic_segmentation",
             "instance_segmentation",
@@ -3889,12 +3972,15 @@
               "NVIDIA NGC model access",
               "Acceptance of the noncommercial and additional model terms"
             ]
+          },
+          "deprecation": {
+            "is_deprecated": false
           }
         },
         {
           "id": "oneformer.its.commercial.dinat_large.trainable",
           "status": "unverified",
-          "status_reason": "Official NGC checkpoint identity, SHA-256, size, universal-segmentation task contract, DiNAT-Large backbone identity, and commercial license are recorded. No checkpoint-specific YAML member is exposed, and the current TAO configuration representation for this backbone has not been resolved; compatibility and all load/mini-step gates remain pending.",
+          "status_reason": "Official NGC checkpoint identity, SHA-256, size, universal-segmentation task contract, DiNAT-Large backbone identity, commercial license, and a repository-owned path-free projection of TAO's official DiNAT architecture spec are recorded. TAO 7.1 transfer loading and direct full-dataset training/evaluation remain unverified.",
           "source": {
             "provider": "ngc",
             "registry": "nvidia/tao",
@@ -3906,6 +3992,9 @@
           },
           "sha256": "6bbaacc876c686bcbeca1d87fc096bd59c60b567ef361f0a42fb2dacd8c75e1c",
           "expected_size_bytes": 2887215443,
+          "compatible_tao_versions": [
+            "==7.1.0"
+          ],
           "model_family": "oneformer",
           "architecture": "oneformer",
           "backbone": "dinat_large",
@@ -3924,6 +4013,39 @@
               ]
             }
           },
+          "default_spec_overrides": {
+            "model": {
+              "backbone": {
+                "name": "D2DiNAT",
+                "dinat": {
+                  "embed_dim": 192,
+                  "mlp_ratio": 2.0,
+                  "depths": [3, 4, 18, 5],
+                  "num_heads": [6, 12, 24, 48],
+                  "kernel_size": 7,
+                  "drop_path_rate": 0.3,
+                  "dilations": [
+                    [1, 20, 1],
+                    [1, 5, 1, 10],
+                    [1, 2, 1, 3, 1, 4, 1, 5, 1, 2, 1, 3, 1, 4, 1, 5, 1, 5],
+                    [1, 2, 1, 2, 1]
+                  ]
+                }
+              },
+              "one_former": {
+                "num_object_queries": 150
+              }
+            }
+          },
+          "checkpoint_spec_file": {
+            "source": "repository",
+            "path": "data/ptm_specs/oneformer/oneformer.its.commercial.dinat_large.trainable.yaml",
+            "sha256": "362abebb68337d55b918d2a70fc91fa8f816640b6aae62ebd1cd9c5a24281211",
+            "provenance": {
+              "source": "Path-free projection of TAO OneFormer's official spec_its_dinat.yaml",
+              "evidence": "tao-pytorch:nvidia_tao_pytorch/cv/oneformer/experiment_specs/spec_its_dinat.yaml"
+            }
+          },
           "task_compatibility": [
             "semantic_segmentation",
             "instance_segmentation",
@@ -3936,12 +4058,15 @@
               "NVIDIA NGC model access",
               "Acceptance of the model agreement"
             ]
+          },
+          "deprecation": {
+            "is_deprecated": false
           }
         },
         {
           "id": "oneformer.its.commercial.swin_large.trainable.v1.0",
           "status": "unverified",
-          "status_reason": "Official NGC checkpoint identity, SHA-256, size, universal-segmentation task contract, Swin-Large backbone identity, and commercial license are recorded. No checkpoint-specific YAML member is exposed; dataset/task defaults, TAO compatibility, and load, training, validation, and inference mini-steps remain unverified.",
+          "status_reason": "Official NGC checkpoint identity, SHA-256, size, universal-segmentation task contract, Swin-Large backbone identity, commercial license, and a repository-owned path-free projection of TAO's official ITS architecture spec are recorded. TAO 7.1 transfer loading and direct full-dataset training/evaluation remain unverified.",
           "source": {
             "provider": "ngc",
             "registry": "nvidia/tao",
@@ -3953,6 +4078,9 @@
           },
           "sha256": "59a06b8e80fca90f5392bb9d3a4fdd51b45c6f06f617e6749949781fa0fa3443",
           "expected_size_bytes": 2834018088,
+          "compatible_tao_versions": [
+            "==7.1.0"
+          ],
           "model_family": "oneformer",
           "architecture": "oneformer",
           "backbone": "swin_large",
@@ -3971,6 +4099,43 @@
               ]
             }
           },
+          "default_spec_overrides": {
+            "model": {
+              "backbone": {
+                "name": "D2SwinTransformer",
+                "swin": {
+                  "embed_dim": 192,
+                  "depths": [2, 2, 18, 2],
+                  "num_heads": [6, 12, 24, 48],
+                  "window_size": 7,
+                  "mlp_ratio": 4.0,
+                  "patch_size": 4,
+                  "patch_norm": true,
+                  "ape": false,
+                  "pretrain_img_size": 384,
+                  "qkv_bias": true,
+                  "attn_drop_rate": 0.0,
+                  "drop_rate": 0.0,
+                  "drop_path_rate": 0.3,
+                  "out_features": ["res2", "res3", "res4", "res5"],
+                  "out_indices": [0, 1, 2, 3],
+                  "use_checkpoint": false
+                }
+              },
+              "one_former": {
+                "num_object_queries": 150
+              }
+            }
+          },
+          "checkpoint_spec_file": {
+            "source": "repository",
+            "path": "data/ptm_specs/oneformer/oneformer.its.commercial.swin_large.trainable.v1.0.yaml",
+            "sha256": "444746e8c4b0a2f5ac3386e3945509272249b38c7993d498ec209ecb211ab851",
+            "provenance": {
+              "source": "Path-free projection of TAO OneFormer's official spec_its_swin.yaml",
+              "evidence": "tao-pytorch:nvidia_tao_pytorch/cv/oneformer/experiment_specs/spec_its_swin.yaml"
+            }
+          },
           "task_compatibility": [
             "semantic_segmentation",
             "instance_segmentation",
@@ -3983,6 +4148,9 @@
               "NVIDIA NGC model access",
               "Acceptance of the model agreement"
             ]
+          },
+          "deprecation": {
+            "is_deprecated": false
           }
         }
       ]

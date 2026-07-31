@@ -126,7 +126,7 @@ def _registry(*records, default_ptm=None):
 def test_packaged_dino_registry_and_schema_load():
     registry = load_ptm_registry()
     assert registry.schema_version == 1
-    assert registry.registry_version == "1.4.0"
+    assert registry.registry_version == "1.5.0"
     assert "dino" in registry.models
     assert registry.models == tuple(sorted(registry.models))
     assert len(registry.document_sha256) == 64
@@ -900,6 +900,52 @@ def test_cross_model_ngc_checksums_are_authoritative_hex_when_available():
     )
 
 
+def test_oneformer_records_package_exact_path_free_architecture_specs():
+    registry = load_ptm_registry().to_dict()
+    records = registry["models"]["oneformer"]["checkpoints"]
+    expected = {
+        "oneformer.ade20k.research.swin_large.trainable.v1.0": (
+            "da8997de338775ade30865ab3d500f1a968432a56ad979ac9302d90c742bf2ce",
+            "D2SwinTransformer",
+            250,
+        ),
+        "oneformer.coco.research.swin_large.trainable": (
+            "5d85e7be1a37690151e05195153c2f5eacd8e2027bf6f401a8846244aef28f3d",
+            "D2SwinTransformer",
+            150,
+        ),
+        "oneformer.its.commercial.dinat_large.trainable": (
+            "362abebb68337d55b918d2a70fc91fa8f816640b6aae62ebd1cd9c5a24281211",
+            "D2DiNAT",
+            150,
+        ),
+        "oneformer.its.commercial.swin_large.trainable.v1.0": (
+            "444746e8c4b0a2f5ac3386e3945509272249b38c7993d498ec209ecb211ab851",
+            "D2SwinTransformer",
+            150,
+        ),
+    }
+    assert {record["id"] for record in records} == set(expected)
+    package_root = Path(__file__).parents[1] / "src/tao_automl"
+    for record in records:
+        digest, backbone, queries = expected[record["id"]]
+        assert record["status"] == "unverified"
+        assert record["compatible_tao_versions"] == ["==7.1.0"]
+        assert record["default_spec_overrides"]["model"]["backbone"]["name"] == backbone
+        assert (
+            record["default_spec_overrides"]["model"]["one_former"][
+                "num_object_queries"
+            ]
+            == queries
+        )
+        spec = record["checkpoint_spec_file"]
+        assert spec["source"] == "repository"
+        assert spec["sha256"] == digest
+        path = package_root / spec["path"]
+        assert path.is_file()
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+
+
 def test_cross_model_runtime_resolution_uses_qualified_status():
     registry = load_ptm_registry()
     tasks = {
@@ -946,7 +992,7 @@ def test_cross_model_repository_sidecars_match_registered_path_free_overrides():
         for record in config["checkpoints"]
         if "checkpoint_spec_file" in record
     ]
-    assert len(records) == 9
+    assert len(records) == 13
     for record in records:
         sidecar = record["checkpoint_spec_file"]
         verification = verify_packaged_resource_sha256(
