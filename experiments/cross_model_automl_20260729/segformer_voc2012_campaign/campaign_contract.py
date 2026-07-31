@@ -438,6 +438,15 @@ def validate_dataset_record(dataset: Mapping[str, Any]) -> dict[str, Any]:
         "content_sha256": (
             "815b5d01b625238b449c4bca828bf96107b367f0f4d5d8a31d2f97c6161a5de0"
         ),
+        "manifest_sha256": (
+            "051ab20215b8e6976763ac82a3db20a68264759edef3d62fd0c8553c501123ff"
+        ),
+        "file_manifest_entry_count": 5827,
+        "stage_manifest_sha256": (
+            "437ff12490637950707b9b951d820ea34d38b926080a478a5d182c2d284a0c5d"
+        ),
+        "remote_read_only": True,
+        "remote_writable_entries_after_lock": 0,
     }
     for key, expected in required.items():
         if dataset.get(key) != expected:
@@ -447,6 +456,19 @@ def validate_dataset_record(dataset: Mapping[str, Any]) -> dict[str, Any]:
     root = dataset.get("prepared_root")
     if not isinstance(root, str) or not root.startswith("/lustre/"):
         raise CampaignContractError("VOC2012 prepared_root must be on Lustre")
+    if (
+        not isinstance(dataset.get("manifest_path"), str)
+        or not Path(dataset["manifest_path"]).is_absolute()
+        or not isinstance(dataset.get("stage_manifest_path"), str)
+        or not Path(dataset["stage_manifest_path"]).is_absolute()
+        or not isinstance(dataset.get("stage_manifest_lustre_path"), str)
+        or not dataset["stage_manifest_lustre_path"].startswith("/lustre/")
+        or not isinstance(dataset.get("remote_file_manifest_path"), str)
+        or not dataset["remote_file_manifest_path"].startswith("/lustre/")
+    ):
+        raise CampaignContractError(
+            "VOC2012 local and Lustre provenance paths are invalid"
+        )
     return copy.deepcopy(dict(dataset))
 
 

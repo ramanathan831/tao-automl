@@ -23,11 +23,22 @@ SKILL_DIR = (
     manifest_generator.DEFAULT_SKILLS
     / "skills/models/tao-train-segformer"
 )
+DATASET_STAGE_MANIFEST = manifest_generator.DEFAULT_STAGE_MANIFEST
+if not DATASET_STAGE_MANIFEST.is_file():
+    # The dataset-staging branch is an explicit integration dependency. This
+    # fallback keeps this isolated worktree testable until both commits land.
+    DATASET_STAGE_MANIFEST = Path(
+        "/localhome/local-rarunachalam/.tao/worktrees/"
+        "tao-automl-segmentation-datasets/experiments/"
+        "cross_model_automl_20260729/segmentation_datasets/"
+        "dataset_stage_manifest.v1.json"
+    )
 
 
 def _dataset() -> dict:
     value = manifest_generator.dataset_record(
-        manifest_generator.DEFAULT_DATASET_MANIFEST
+        manifest_generator.DEFAULT_DATASET_MANIFEST,
+        DATASET_STAGE_MANIFEST,
     )
     return value
 
@@ -229,6 +240,11 @@ def test_complete_voc2012_record_and_loss_preserving_palette():
     assert dataset["content_sha256"] == (
         "815b5d01b625238b449c4bca828bf96107b367f0f4d5d8a31d2f97c6161a5de0"
     )
+    assert dataset["stage_manifest_sha256"] == (
+        "437ff12490637950707b9b951d820ea34d38b926080a478a5d182c2d284a0c5d"
+    )
+    assert dataset["remote_read_only"] is True
+    assert dataset["remote_writable_entries_after_lock"] == 0
     palette = campaign_contract.voc_palette()
     assert [item["label_id"] for item in palette] == [*range(21), 255]
     assert all(item["rgb"] == [item["label_id"]] for item in palette)

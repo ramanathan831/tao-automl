@@ -44,7 +44,11 @@ The prepared root is:
 
 It contains 1,464 train and 1,449 validation image/mask pairs. Masks retain
 VOC IDs 0–20 and ignore ID 255. TAO uses `label_transform: "None"`,
-`num_classes: 21`, and an explicit grayscale palette.
+`num_classes: 21`, and an explicit grayscale palette. The byte-identical local
+and Lustre stage record is frozen at
+`437ff12490637950707b9b951d820ea34d38b926080a478a5d182c2d284a0c5d`;
+all 5,827 manifest entries passed and the remote dataset has zero writable
+files.
 
 ## Reproduction
 

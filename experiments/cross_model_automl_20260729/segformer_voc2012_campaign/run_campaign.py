@@ -177,6 +177,55 @@ def _verify_dataset_remote(contract: Mapping[str, Any]) -> dict[str, Any]:
             raise CampaignExecutionError(
                 f"VOC2012 {label} count changed: {counts.get(path)} != {count}"
             )
+    stage_identity = _remote_file_identity(
+        dataset["stage_manifest_lustre_path"]
+    )
+    if stage_identity["sha256"] != dataset["stage_manifest_sha256"]:
+        raise CampaignExecutionError(
+            "Lustre dataset stage manifest differs from the frozen record"
+        )
+    file_manifest_identity = _remote_file_identity(
+        dataset["remote_file_manifest_path"]
+    )
+    if file_manifest_identity["sha256"] != dataset["manifest_sha256"]:
+        raise CampaignExecutionError(
+            "Lustre VOC2012 file manifest differs from the frozen record"
+        )
+    stage_reader = (
+        "import json,sys;"
+        "d=json.load(open(sys.argv[1]));v=d['datasets']['voc2012'];"
+        "print(json.dumps({'remote_read_only':v['remote_read_only'],"
+        "'remote_writable_entries_after_lock':"
+        "v['remote_writable_entries_after_lock'],"
+        "'remote_sha256sum_check':"
+        "v['file_manifest']['remote_sha256sum_check'],"
+        "'remote_file_set_check':"
+        "v['file_manifest']['remote_file_set_check']}))"
+    )
+    stage = json.loads(
+        remote_output(
+            f"python3 -c {shlex.quote(stage_reader)} "
+            f"{shlex.quote(dataset['stage_manifest_lustre_path'])}"
+        )
+    )
+    if stage != {
+        "remote_read_only": True,
+        "remote_writable_entries_after_lock": 0,
+        "remote_sha256sum_check": "passed",
+        "remote_file_set_check": "passed",
+    }:
+        raise CampaignExecutionError(
+            "Lustre VOC2012 stage record is not final and read-only"
+        )
+    writable = remote_output(
+        "find "
+        f"{shlex.quote(str(Path(root).parent))} "
+        "-type f -perm /222 -print -quit"
+    ).strip()
+    if writable:
+        raise CampaignExecutionError(
+            f"Lustre VOC2012 staging contains a writable file: {writable}"
+        )
     return {
         "prepared_root": root,
         "counts": {
@@ -184,6 +233,9 @@ def _verify_dataset_remote(contract: Mapping[str, Any]) -> dict[str, Any]:
             for label, (path, _) in expected.items()
         },
         "content_sha256": dataset["content_sha256"],
+        "stage_manifest_sha256": dataset["stage_manifest_sha256"],
+        "remote_read_only": True,
+        "remote_writable_entries_after_lock": 0,
     }
 
 
@@ -216,6 +268,10 @@ def verify_local_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
         "dataset_manifest": (
             contract["dataset"]["manifest_path"],
             contract["dataset"]["manifest_sha256"],
+        ),
+        "dataset_stage_manifest": (
+            contract["dataset"]["stage_manifest_path"],
+            contract["dataset"]["stage_manifest_sha256"],
         ),
         "campaign_contract": (
             HERE / "campaign_contract.py",
