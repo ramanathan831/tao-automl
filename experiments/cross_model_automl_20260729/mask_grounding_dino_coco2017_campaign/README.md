@@ -94,16 +94,24 @@ repository-owned path-free YAML sidecar. Known checkpoint hashes are retained;
 the older commercial v1.0 member must be hashed while staging. All four remain
 `unverified` and are not runtime eligible.
 
-`ptm_stage.py` is the repository-owned data-only staging path. It must run on a
-login host where `/lustre` is mounted. It resolves each exact NGC member with
-the production authenticated HTTPS client, verifies the remote and downloaded
-size, verifies registered checksums (or records the observed checksum for the
-immutable v1.0 member), uses `AtomicArtifactCache`, and atomically publishes an
-exact read-only four-file stage. Reuse is byte-verified; unexpected files,
-symlinks, writable completed artifacts, partial completed manifests, or
-identity drift fail closed. The local and Lustre manifest copies are
-byte-identical and use exactly the schema consumed by `ptm_stage_record()` and
-`load_ptm_stage()`.
+`ptm_stage.py` is the repository-owned data-only staging path. It supports
+either direct execution where `/lustre` is mounted or local execution through
+an already-active SSHFS mount of the remote `/lustre` root. In mapped mode,
+`--lustre-root` remains the canonical remote identity and
+`--physical-lustre-mount` names only the local mount root; the physical stage
+path is derived and cannot be supplied independently. The stager verifies the
+mount point and canonical-to-physical correspondence before any network
+access.
+
+The stager resolves each exact NGC member with the production authenticated
+HTTPS client, verifies the remote and downloaded size, verifies registered
+checksums (or records the observed checksum for the immutable v1.0 member),
+uses `AtomicArtifactCache`, and atomically publishes an exact read-only
+four-file stage. Reuse is byte-verified; unexpected files, symlinks, writable
+completed artifacts, partial completed manifests, or identity drift fail
+closed. The local and Lustre manifest copies are byte-identical, contain
+canonical `/lustre/...` checkpoint identities even in mapped mode, and use
+exactly the schema consumed by `ptm_stage_record()` and `load_ptm_stage()`.
 
 Qualification is deliberately stronger than a smoke test. Each staged arm must
 complete one real three-epoch full-dataset train and standalone full-validation
@@ -177,20 +185,28 @@ exist would create invalid evidence.
 
 ## Reproduction sequence
 
-Run the data-only PTM stage on the SLURM login host (not as a SLURM job):
+After an operator has independently established an SSHFS mount of the remote
+`/lustre` root, run the data-only PTM stage locally (not as a SLURM job):
 
 ```bash
-set -a
-source /localhome/local-rarunachalam/.tao/config.env
-set +a
-ssh -t "${SLURM_USER}@${SLURM_HOSTNAME%%,*}" \
-  "cd /localhome/local-rarunachalam/tao-automl && \
-   PATH=/localhome/local-rarunachalam/.tao/venvs/dino-multiobjective-py314/bin:\$PATH \
-   PYTHONPATH=\$PWD:\$PWD/src \
-   python -m \
-   experiments.cross_model_automl_20260729.mask_grounding_dino_coco2017_campaign.ptm_stage \
-   --env-file /localhome/local-rarunachalam/.tao/config.env"
+cd /localhome/local-rarunachalam/tao-automl
+export PATH=/localhome/local-rarunachalam/.tao/venvs/dino-multiobjective-py314/bin:$PATH
+export PYTHONPATH=$PWD:$PWD/src
+
+python -m \
+  experiments.cross_model_automl_20260729.mask_grounding_dino_coco2017_campaign.ptm_stage \
+  --env-file /localhome/local-rarunachalam/.tao/config.env \
+  --lustre-root \
+  /lustre/fsw/portfolios/edgeai/users/rarunachalam/ptms/cross_model_automl_20260729/mask_grounding_dino_v1 \
+  --physical-lustre-mount \
+  /localhome/local-rarunachalam/.tao/mounts/slurm-lustre
 ```
+
+The command fails closed unless the physical root is an active mount point.
+When the repository and Python environment are available on a host with direct
+`/lustre` access, omit `--physical-lustre-mount`; direct behavior and the
+canonical publication root are unchanged. This preparation did not establish
+a mount or execute the command.
 
 The CLI records zero model, smoke, mini-step, GPU, and SLURM executions in its
 secret-free summary. After this stage and a wheel from a clean reviewed commit:

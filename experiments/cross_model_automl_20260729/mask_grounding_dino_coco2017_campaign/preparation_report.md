@@ -71,6 +71,15 @@ create-or-verify idempotent and rejects unexpected content, symlinks, writable
 completed artifacts, checksum drift, and manifest replacement. It contains no
 model or scheduler import and records zero model and SLURM executions.
 
+The publication root can now use direct `/lustre` access or an active SSHFS
+mount of remote `/lustre`. In mapped mode the operator provides the canonical
+`/lustre/...` stage root and the mount root only; the physical destination is
+derived, verified to correspond, and never accepted as an independent
+identity. Both manifest copies retain canonical `/lustre/...` checkpoint
+paths. Unsafe canonical roots, inactive or symlinked mounts, path escapes,
+non-corresponding roots, and non-inventory stage content fail closed. No mount
+was established and the stager was not executed during this preparation.
+
 ## Three independent mode jobs
 
 Each mode has 24 recommendations, three full epochs per candidate, its own
@@ -123,15 +132,20 @@ specification, and integrity failure paths.
 The final static verification completed with:
 
 ```text
-campaign-specific suite: 31 passed
-focused metric/PTM/runtime/wheel/campaign suite: 283 passed
+PTM-stage focused suite: 13 passed
+campaign-specific suite: 39 passed
 full production suite: 969 passed, 1 skipped
-complete cross-model experiment suite: 349 passed
+complete cross-model experiment suite: 357 passed
 python compilation: passed
 git diff --check: passed
 ```
 
-The three production-suite and three cross-model-suite warnings are the
-established sklearn Gaussian-process convergence warnings; no additional
-warning was observed. The source commit is recorded in the parent campaign
-handoff after this report is committed.
+The isolated campaign branch predates the already-integrated
+`fcf0aa6` one-line registry-sidecar count correction. The production total
+above was verified with that exact target-branch correction applied and then
+removed from this change to avoid duplicating it; without it, the isolated
+branch reports 968 passed, 1 skipped, and only the known 13-versus-17 inventory
+assertion failure. The three production-suite and three cross-model-suite
+warnings are the established sklearn Gaussian-process convergence warnings;
+no additional warning was observed. The source commit is recorded in the
+parent campaign handoff after this report is committed.

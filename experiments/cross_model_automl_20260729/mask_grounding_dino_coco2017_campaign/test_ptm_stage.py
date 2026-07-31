@@ -4,7 +4,7 @@ import ast
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -20,6 +20,9 @@ from . import ptm_stage
 
 
 SECRET = "unit-test-ngc-secret"
+CANONICAL_STAGE_ROOT = PurePosixPath(
+    "/lustre/fsw/unit-tests/mask-grounding-dino-v1"
+)
 
 
 class _Response:
@@ -175,6 +178,12 @@ def test_all_four_ptms_stage_atomically_read_only_and_idempotently(
             for item in manifest["checkpoints"]
         )
         assert manifest["manifest_sha256"] == first["manifest_sha256"]
+        assert first["remote_manifest_path"] == str(
+            publisher.manifest_path
+        )
+        assert first["physical_manifest_path"] == str(
+            publisher.manifest_path
+        )
         assert first["execution"] == {
             "data_only": True,
             "model_invoked": False,
@@ -205,6 +214,180 @@ def test_all_four_ptms_stage_atomically_read_only_and_idempotently(
         assert len(session.download_calls) == 4
     finally:
         _restore_write_bits(stage_root)
+
+
+def test_sshfs_mapped_stage_is_exact_and_uses_canonical_manifest_paths(
+    tmp_path: Path,
+):
+    registry, payloads = _registry_and_payloads()
+    session = _Session(payloads)
+    mount = tmp_path / "sshfs-lustre"
+    mount.mkdir()
+    publisher = ptm_stage.LustreStagePublisher.from_publication_roots(
+        CANONICAL_STAGE_ROOT,
+        physical_lustre_mount=mount,
+        mount_verifier=lambda _: True,
+    )
+    manifest_path = tmp_path / "evidence" / "ptm_stage_manifest.json"
+    expected_physical_root = mount.joinpath(
+        *CANONICAL_STAGE_ROOT.relative_to("/lustre").parts
+    ).resolve()
+    try:
+        summary = ptm_stage.stage_official_ptms(
+            registry=registry,
+            cache=AtomicArtifactCache(tmp_path / "cache"),
+            ngc_client=_client(session),
+            publisher=publisher,
+            manifest_path=manifest_path,
+        )
+        assert publisher.root == expected_physical_root
+        assert publisher.canonical_root == CANONICAL_STAGE_ROOT
+        assert manifest_path.read_bytes() == publisher.manifest_path.read_bytes()
+        local_manifest = json.loads(
+            manifest_path.read_text(encoding="utf-8")
+        )
+        remote_manifest = json.loads(
+            publisher.manifest_path.read_text(encoding="utf-8")
+        )
+        assert local_manifest == remote_manifest
+
+        expected_files = {publisher.manifest_path.resolve()}
+        for checkpoint in local_manifest["checkpoints"]:
+            canonical_path = PurePosixPath(checkpoint["path"])
+            assert canonical_path.is_relative_to(CANONICAL_STAGE_ROOT)
+            physical_path = publisher.physical_path(canonical_path)
+            assert publisher.canonical_path(physical_path) == canonical_path
+            assert physical_path.is_file()
+            assert physical_path.stat().st_size == checkpoint["size_bytes"]
+            assert (
+                hashlib.sha256(physical_path.read_bytes()).hexdigest()
+                == checkpoint["sha256"]
+            )
+            assert not physical_path.stat().st_mode & 0o222
+            expected_files.add(physical_path.resolve())
+
+        observed_files = {
+            path.resolve()
+            for path in publisher.root.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        }
+        assert observed_files == expected_files
+        assert summary["remote_manifest_path"] == str(
+            CANONICAL_STAGE_ROOT / ptm_stage.REMOTE_MANIFEST_NAME
+        )
+        assert summary["physical_manifest_path"] == str(
+            publisher.manifest_path
+        )
+        assert not publisher.manifest_path.stat().st_mode & 0o222
+        assert not publisher.root.stat().st_mode & 0o222
+    finally:
+        _restore_write_bits(publisher.root)
+
+
+def test_publication_path_mapping_is_bijective_and_direct_mode_is_unchanged(
+    tmp_path: Path,
+):
+    mount = tmp_path / "sshfs-lustre"
+    mount.mkdir()
+    publisher = ptm_stage.LustreStagePublisher.from_publication_roots(
+        CANONICAL_STAGE_ROOT,
+        physical_lustre_mount=mount,
+        mount_verifier=lambda _: True,
+    )
+    canonical_checkpoint = (
+        CANONICAL_STAGE_ROOT / "checkpoint-id" / "model.pth"
+    )
+    physical_checkpoint = publisher.physical_path(canonical_checkpoint)
+    assert physical_checkpoint == (
+        publisher.root / "checkpoint-id" / "model.pth"
+    )
+    assert (
+        publisher.canonical_path(physical_checkpoint)
+        == canonical_checkpoint
+    )
+    assert publisher.canonical_manifest_path == (
+        CANONICAL_STAGE_ROOT / ptm_stage.REMOTE_MANIFEST_NAME
+    )
+
+    with pytest.raises(ptm_stage.PTMStageError, match="physical artifact"):
+        publisher.canonical_path(tmp_path / "outside.bin")
+    with pytest.raises(ptm_stage.PTMStageError, match="canonical artifact"):
+        publisher.physical_path("/lustre/fsw/another-stage/model.pth")
+
+    direct = ptm_stage.LustreStagePublisher.from_publication_roots(
+        CANONICAL_STAGE_ROOT
+    )
+    assert direct.root == Path(str(CANONICAL_STAGE_ROOT))
+    assert direct.canonical_root == CANONICAL_STAGE_ROOT
+    assert direct.physical_lustre_mount is None
+    assert direct.canonical_manifest_path == PurePosixPath(
+        str(direct.manifest_path)
+    )
+
+
+@pytest.mark.parametrize(
+    "canonical_root",
+    (
+        "/tmp/not-lustre/stage",
+        "/lustre",
+        "lustre/relative/stage",
+        "/lustre/fsw/../escaped-stage",
+    ),
+)
+def test_sshfs_mapping_rejects_unsafe_canonical_roots(
+    tmp_path: Path,
+    canonical_root: str,
+):
+    mount = tmp_path / "sshfs-lustre"
+    mount.mkdir()
+    with pytest.raises(ptm_stage.PTMStageError, match="canonical PTM root"):
+        ptm_stage.LustreStagePublisher.from_publication_roots(
+            canonical_root,
+            physical_lustre_mount=mount,
+            mount_verifier=lambda _: True,
+        )
+
+
+def test_sshfs_mapping_rejects_inactive_symlinked_or_mismatched_roots(
+    tmp_path: Path,
+):
+    mount = tmp_path / "sshfs-lustre"
+    mount.mkdir()
+    with pytest.raises(ptm_stage.PTMStageError, match="active safe mount"):
+        ptm_stage.LustreStagePublisher.from_publication_roots(
+            CANONICAL_STAGE_ROOT,
+            physical_lustre_mount=mount,
+            mount_verifier=lambda _: False,
+        )
+
+    with pytest.raises(ptm_stage.PTMStageError, match="active safe mount"):
+        ptm_stage.LustreStagePublisher.from_publication_roots(
+            CANONICAL_STAGE_ROOT,
+            physical_lustre_mount="/",
+            mount_verifier=lambda _: True,
+        )
+
+    mount_target = tmp_path / "mount-target"
+    mount_target.mkdir()
+    mount_link = tmp_path / "mount-link"
+    mount_link.symlink_to(mount_target, target_is_directory=True)
+    with pytest.raises(ptm_stage.PTMStageError, match="active safe mount"):
+        ptm_stage.LustreStagePublisher.from_publication_roots(
+            CANONICAL_STAGE_ROOT,
+            physical_lustre_mount=mount_link,
+            mount_verifier=lambda _: True,
+        )
+
+    with pytest.raises(
+        ptm_stage.PTMStageError,
+        match="publication roots do not correspond",
+    ):
+        ptm_stage.LustreStagePublisher(
+            mount / "non-corresponding-stage",
+            canonical_root=CANONICAL_STAGE_ROOT,
+            physical_lustre_mount=mount,
+            mount_verifier=lambda _: True,
+        )
 
 
 def test_checksum_failure_never_emits_completed_stage(tmp_path: Path):
@@ -289,3 +472,18 @@ def test_stager_has_no_model_or_scheduler_execution_path():
     assert "create_job" not in source
     assert "sbatch" not in source
     assert "srun" not in source
+
+
+def test_cli_preserves_direct_lustre_default_and_accepts_only_mount_root(
+    tmp_path: Path,
+):
+    direct = ptm_stage._parser().parse_args(())
+    assert direct.lustre_root == ptm_stage.DEFAULT_LUSTRE_ROOT
+    assert direct.physical_lustre_mount is None
+
+    mount = tmp_path / "sshfs-lustre"
+    mapped = ptm_stage._parser().parse_args(
+        ("--physical-lustre-mount", str(mount))
+    )
+    assert mapped.lustre_root == ptm_stage.DEFAULT_LUSTRE_ROOT
+    assert mapped.physical_lustre_mount == mount

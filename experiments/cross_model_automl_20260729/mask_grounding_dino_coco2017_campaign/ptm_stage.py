@@ -2,9 +2,10 @@
 
 """Data-only staging for the four official Mask Grounding DINO PTMs.
 
-Run this CLI on a login host where the destination ``/lustre`` filesystem is
-mounted. It uses the production NGC HTTPS client and atomic verified cache,
-then atomically publishes immutable checkpoint bytes. It imports no model or
+Run this CLI where the destination ``/lustre`` filesystem is directly mounted,
+or map the canonical ``/lustre`` publication root through an active SSHFS
+mount. It uses the production NGC HTTPS client and atomic verified cache, then
+atomically publishes immutable checkpoint bytes. It imports no model or
 scheduler implementation and submits no job.
 """
 
@@ -20,7 +21,7 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Callable
 
 from tao_automl.ptm_preflight import (
     AtomicArtifactCache,
@@ -208,22 +209,147 @@ class LustreStagePublisher:
         self,
         root: str | Path,
         *,
+        canonical_root: str | PurePosixPath | None = None,
+        physical_lustre_mount: str | Path | None = None,
         enforce_lustre_prefix: bool = True,
+        mount_verifier: Callable[[str | Path], bool] = os.path.ismount,
     ):
-        self.root = Path(root).expanduser().resolve()
+        root_input = Path(root).expanduser()
+        if root_input.is_symlink():
+            raise PTMStageError("PTM stage root cannot be a symlink")
+        self.root = root_input.resolve()
+        canonical_value = (
+            PurePosixPath(str(self.root))
+            if canonical_root is None
+            else PurePosixPath(str(canonical_root))
+        )
         if (
-            enforce_lustre_prefix
-            and not str(self.root).startswith("/lustre/")
+            not canonical_value.is_absolute()
+            or ".." in canonical_value.parts
+            or canonical_value == PurePosixPath("/lustre")
+            or (
+                enforce_lustre_prefix
+                and not canonical_value.is_relative_to(
+                    PurePosixPath("/lustre")
+                )
+            )
         ):
             raise PTMStageError(
-                "PTM publication root must be a dedicated /lustre path"
+                "canonical PTM root must be a dedicated /lustre path"
             )
-        if self.root == Path("/lustre"):
-            raise PTMStageError("the broad /lustre root cannot be a stage")
+        self.canonical_root = canonical_value
+        if physical_lustre_mount is not None:
+            mount_input = Path(physical_lustre_mount).expanduser()
+            if mount_input.is_symlink():
+                raise PTMStageError(
+                    "physical Lustre root is not an active safe mount"
+                )
+            mount = mount_input.resolve()
+            if (
+                mount == Path("/")
+                or not mount.is_dir()
+                or not mount_verifier(mount)
+            ):
+                raise PTMStageError(
+                    "physical Lustre root is not an active safe mount"
+                )
+            if not self.canonical_root.is_relative_to(
+                PurePosixPath("/lustre")
+            ):
+                raise PTMStageError(
+                    "mapped canonical root must be below /lustre"
+                )
+            relative = self.canonical_root.relative_to(
+                PurePosixPath("/lustre")
+            )
+            expected_physical = (
+                mount.joinpath(*relative.parts).resolve()
+            )
+            if (
+                self.root != expected_physical
+                or not self.root.is_relative_to(mount)
+                or self.root == mount
+            ):
+                raise PTMStageError(
+                    "physical and canonical publication roots do not "
+                    "correspond"
+                )
+            self.physical_lustre_mount: Path | None = mount
+        else:
+            if (
+                canonical_root is not None
+                and self.root != Path(str(self.canonical_root)).resolve()
+            ):
+                raise PTMStageError(
+                    "a distinct canonical root requires its physical "
+                    "Lustre mount"
+                )
+            if (
+                enforce_lustre_prefix
+                and not str(self.root).startswith("/lustre/")
+            ):
+                raise PTMStageError(
+                    "direct PTM publication root must be below /lustre"
+                )
+            self.physical_lustre_mount = None
         if self.root.exists() and (
             self.root.is_symlink() or not self.root.is_dir()
         ):
             raise PTMStageError("PTM stage root is not a regular directory")
+
+    @classmethod
+    def from_publication_roots(
+        cls,
+        canonical_root: str | PurePosixPath,
+        *,
+        physical_lustre_mount: str | Path | None = None,
+        mount_verifier: Callable[[str | Path], bool] = os.path.ismount,
+    ) -> "LustreStagePublisher":
+        """Map canonical ``/lustre`` identity onto an optional mount root."""
+        canonical = PurePosixPath(str(canonical_root))
+        if physical_lustre_mount is None:
+            return cls(str(canonical))
+        if (
+            not canonical.is_absolute()
+            or ".." in canonical.parts
+            or not canonical.is_relative_to(PurePosixPath("/lustre"))
+            or canonical == PurePosixPath("/lustre")
+        ):
+            raise PTMStageError(
+                "canonical PTM root must be a dedicated /lustre path"
+            )
+        mount = Path(physical_lustre_mount).expanduser()
+        relative = canonical.relative_to(PurePosixPath("/lustre"))
+        physical = mount.joinpath(*relative.parts)
+        return cls(
+            physical,
+            canonical_root=canonical,
+            physical_lustre_mount=mount,
+            mount_verifier=mount_verifier,
+        )
+
+    def canonical_path(self, physical_path: str | Path) -> PurePosixPath:
+        path = Path(physical_path).expanduser().resolve()
+        try:
+            relative = path.relative_to(self.root)
+        except ValueError as exc:
+            raise PTMStageError(
+                "physical artifact is outside its publication root"
+            ) from exc
+        return self.canonical_root.joinpath(*relative.parts)
+
+    def physical_path(self, canonical_path: str | PurePosixPath) -> Path:
+        path = PurePosixPath(str(canonical_path))
+        try:
+            relative = path.relative_to(self.canonical_root)
+        except ValueError as exc:
+            raise PTMStageError(
+                "canonical artifact is outside its publication root"
+            ) from exc
+        physical = self.root.joinpath(*relative.parts).resolve()
+        if not physical.is_relative_to(self.root):
+            raise PTMStageError("canonical artifact escaped its stage")
+        return physical
 
     def checkpoint_path(
         self,
@@ -244,6 +370,10 @@ class LustreStagePublisher:
     @property
     def manifest_path(self) -> Path:
         return self.root / REMOTE_MANIFEST_NAME
+
+    @property
+    def canonical_manifest_path(self) -> PurePosixPath:
+        return self.canonical_path(self.manifest_path)
 
     @staticmethod
     def _existing(
@@ -574,7 +704,7 @@ def stage_official_ptms(
         checkpoints.append(
             {
                 "id": checkpoint_id,
-                "path": str(published.path),
+                "path": str(publisher.canonical_path(published.path)),
                 "size_bytes": published.size_bytes,
                 "sha256": published.sha256,
                 "immutable_source_identity": source[
@@ -602,8 +732,12 @@ def stage_official_ptms(
     content = _json_bytes(document)
     remote_manifest = publisher.publish_manifest(content)
     expected_files = {
-        Path(item["path"]): (item["size_bytes"], item["sha256"])
-        for item in checkpoints
+        destination: (item["size_bytes"], item["sha256"])
+        for destination, item in zip(
+            destinations,
+            checkpoints,
+            strict=True,
+        )
     }
     expected_files[remote_manifest.path] = (
         remote_manifest.size_bytes,
@@ -619,7 +753,10 @@ def stage_official_ptms(
         "manifest_path": str(Path(manifest_path).expanduser().resolve()),
         "manifest_file_sha256": hashlib.sha256(content).hexdigest(),
         "manifest_sha256": document["manifest_sha256"],
-        "remote_manifest_path": str(remote_manifest.path),
+        "remote_manifest_path": str(
+            publisher.canonical_path(remote_manifest.path)
+        ),
+        "physical_manifest_path": str(remote_manifest.path),
         "checkpoint_ids": [item["id"] for item in checkpoints],
         "cache_hits": cache_hits,
         "published_reuse": published_reuse,
@@ -646,6 +783,15 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_LUSTRE_ROOT,
     )
+    parser.add_argument(
+        "--physical-lustre-mount",
+        type=Path,
+        help=(
+            "Optional active SSHFS mount of remote /lustre. The physical "
+            "stage path is derived from --lustre-root and cannot be supplied "
+            "independently."
+        ),
+    )
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--registry", type=Path)
     return parser
@@ -660,7 +806,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         ngc_client=NGCHTTPSClient(
             _read_ngc_credential(arguments.env_file)
         ),
-        publisher=LustreStagePublisher(arguments.lustre_root),
+        publisher=LustreStagePublisher.from_publication_roots(
+            arguments.lustre_root,
+            physical_lustre_mount=arguments.physical_lustre_mount,
+        ),
         manifest_path=arguments.manifest,
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
