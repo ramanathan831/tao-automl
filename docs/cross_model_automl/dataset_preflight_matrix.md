@@ -1,15 +1,17 @@
 # Cross-model AutoML dataset and execution preregistration
 
-Status: proposed Phase-4 preregistration, frozen before dataset acquisition,
-model preflight, or GPU execution.
+Status: Phase-4 dataset acquisition update. The segmentation datasets below
+were frozen before model execution, passed data-only validation, and were
+staged on Lustre without running models or reserving GPUs.
 
-Audit date: 2026-07-29
+Audit date: 2026-07-29; dataset acquisition update: 2026-07-30
 
-This document is a planning and correctness gate. It is not evidence that any
-dataset is presently staged, any model has passed preflight, or any campaign is
-ready to launch.
+This document remains a planning and correctness gate for model execution.
+The linked machine-readable reports are evidence for dataset acquisition and
+data-only integrity only. They are not evidence that a model has passed
+preflight or that a campaign is ready to launch.
 
-During this audit:
+During the original 2026-07-29 audit:
 
 - no dataset was downloaded;
 - no checkpoint was downloaded;
@@ -18,9 +20,17 @@ During this audit:
 - no experiment artifact or winner was changed;
 - no dataset choice was made after observing cross-model results.
 
-The dataset, split, task metric, and conversion contracts below must be frozen
-and hashed before a model can pass local preflight. A model may proceed to
-SLURM only after its complete local gate is green.
+On 2026-07-30, the complete public labeled PASCAL VOC2012 semantic
+segmentation train/validation release and complete COCO2017
+train/validation image, instance, and panoptic releases were downloaded from
+their authoritative public endpoints. They were validated with data-only
+code and copied to the frozen Lustre roots recorded below. No checkpoint was
+downloaded, no model was imported or executed, and no local or SLURM training,
+evaluation, inference, latency, or smoke job ran as part of dataset staging.
+
+The dataset, split, task metric, and conversion contracts must be frozen and
+hashed before model execution. Dataset readiness alone does not lift any
+model, metric, PTM, container, or campaign gate.
 
 ## Exact TAO model contracts
 
@@ -35,7 +45,7 @@ The implemented model identifiers, not conversational aliases, are:
 | SegFormer | `segformer` | Semantic segmentation | TAO/UNet-style image and mask folders |
 | OneFormer | `oneformer` | Panoptic segmentation | COCO panoptic |
 | Mask2Former | `mask2former` | Instance segmentation | COCO instance plus panoptic assets |
-| Mask Grounding DINO | `mask_grounding_dino` | Referring-expression segmentation | ODVG/VG with masks |
+| Mask Grounding DINO | `mask_grounding_dino` | Category-prompted grounded instance segmentation for the staged path; referring-expression segmentation remains a separate blocked claim | ODVG/VG with masks |
 
 All eight current model-skill records resolve the nominal default image to
 `nvcr.io/nvidia/tao/tao-toolkit:7.0.1-pyt`. That tag must not be assumed to
@@ -43,7 +53,7 @@ contain changes from a local release/7.1.0 branch. Preflight must pin and hash
 an SQSH whose installed wheel or mounted source identity matches the campaign
 source commit.
 
-## Proposed authoritative dataset matrix
+## Authoritative dataset matrix and staging state
 
 The estimated epoch times below are capacity-planning ranges, not
 measurements. They assume one A100, a model-supported batch size and crop, and
@@ -57,10 +67,10 @@ manifests are frozen.
 | `deformable_detr` | Object detection | PASCAL VOC2007 | Same complete corpus and splits | Same canonical COCO archive | COCO bbox AP@[0.50:0.95], with AP50 secondary | Same VOC image-specific terms | 10–30 min | Enables a fair shared detection corpus without forcing a subset |
 | `rtdetr` | Object detection | PASCAL VOC2007 | Same complete corpus and splits | Same canonical COCO archive | COCO bbox AP@[0.50:0.95], with AP50 secondary | Same VOC image-specific terms | 5–20 min | Moderate enough for repeated AutoML while retaining realistic multi-object scenes |
 | `grounding_dino` | Referring-expression box grounding | RefCOCOg, UMD split | 25,799 images, 49,822 referred objects, 95,010 expressions; train 21,899 images/42,226 objects/80,512 expressions, validation 1,300/2,573/4,896, test 2,600/5,023/9,602; image-disjoint UMD splits | RefCOCOg expression and COCO annotation identity converted to VG-style ODVG while preserving expression, bbox, source IDs, and image identity | Percentage of expressions whose predicted box has IoU >= 0.5 (`Pr@0.5`); mean box IoU secondary | RefCOCOg annotations originate from Google RefExp, whose official author release states CC BY 4.0; `refer` API code is Apache-2.0; underlying COCO images retain their source-image licenses | 2–6 h | A complete, task-correct grounding corpus rather than category-prompted detection |
-| `segformer` | Semantic segmentation | Cityscapes fine annotations | 5,000 fine 2048x1024 frames; train 2,975, validation 500, test 1,525; 30 annotated classes and 19 evaluation train IDs; approximately 11 GB images plus fine labels | Official train-ID PNGs packaged as `images/<split>` and `masks/<split>`; ignore ID 255 preserved | mIoU over the 19 evaluation classes | Registration required; custom Cityscapes terms permit scientific, non-commercial use and prohibit redistribution | 20–60 min | Complete high-resolution semantic segmentation benchmark of manageable scale |
-| `oneformer` | Panoptic segmentation | Cityscapes fine annotations | Same complete fine corpus and official splits | Official Cityscapes-to-COCO panoptic conversion, panoptic PNGs, JSON, and label map | Panoptic Quality (PQ); PQ-things and PQ-stuff secondary | Same registered, non-commercial Cityscapes terms | 45–120 min | Task-correct panoptic labels are available from the same authoritative source |
-| `mask2former` | Instance segmentation | Cityscapes fine annotations | Same complete fine corpus; official thing-instance annotations | COCO instance JSON plus the panoptic assets required by the TAO schema | COCO mask AP@[0.50:0.95] | Same registered, non-commercial Cityscapes terms | 45–120 min | Provides complete instance masks without introducing a different visual domain |
-| `mask_grounding_dino` | Referring-expression segmentation | RefCOCOg, UMD split, joined to COCO instance masks | Same complete 25,799-image, 95,010-expression corpus and image-disjoint UMD splits | Each expression retains its RefCOCOg IDs, COCO object ID, bbox, and original polygon/RLE mask in VG-style ODVG | Overall/cumulative IoU (`overall_IoU`); mean IoU and Pr@0.5 secondary | RefCOCOg annotation CC BY 4.0 provenance plus source-image COCO licensing | 4–10 h | Task-correct language-conditioned segmentation with complete source masks |
+| `segformer` | Semantic segmentation | PASCAL VOC2012 segmentation | Complete public labeled train/validation release: 1,464 train and 1,449 validation images, 20 foreground classes plus background, ignore ID 255; 1,999,639,040-byte source archive | Byte-identical JPEG and indexed-PNG hard-link projection as `images/<split>` and `masks/<split>`; no pixel or label conversion | mIoU over 21 IDs including background, with 255 ignored | Public without login; PASCAL database-rights notice and constituent Flickr image terms apply rather than one blanket permissive license | 10–30 min | Complete public labeled release of moderate size; avoids registration-gated Cityscapes while exercising multiclass semantic segmentation |
+| `oneformer` | Panoptic segmentation | COCO2017 instance and panoptic train/validation | Complete official train/validation corpus: 118,287 train and 5,000 validation images; 133 panoptic categories, including 80 things | Native official COCO panoptic JSON and RGB segment-ID PNGs plus the TAO 133-category panoptic label map | Panoptic Quality (PQ); PQ-things and PQ-stuff secondary | Public without login; annotations are CC BY 4.0 and each image retains its source license | 4–12 h | Native, task-correct panoptic data; no custom semantic conversion and shared source imagery with Mask2Former |
+| `mask2former` | Instance segmentation | COCO2017 instance and panoptic train/validation | Same complete official 118,287/5,000 image corpus; 860,001 train and 36,781 validation instance annotations over 80 thing classes | Native official COCO instance JSON with exact polygon/RLE masks and an official TAO 80-category instance label map; panoptic assets are co-staged for the supported alternate mode | COCO mask AP@[0.50:0.95] | Same COCO annotation and image-specific terms | 4–12 h | Native complete instance masks without a conversion; shared native panoptic data remains available without changing this campaign's instance task |
+| `mask_grounding_dino` | Category-prompted grounded instance segmentation | COCO2017 instance train/validation | Same complete official corpus; all 860,001 train masks projected into ODVG and native COCO validation retained | Pinned official TAO Data Services COCO-to-ODVG conversion, contiguous category labels, and byte-for-byte preserved polygon/RLE mask JSON; `data_type: OD` | COCO mask/detection metric supported by the pinned product path; this staging does not establish referring-expression IoU | Same COCO annotation and image-specific terms | 4–12 h | Exercises the supported category-prompted mask path with complete masks; explicitly not a replacement for RefCOCOg phrase-grounding validation |
 
 Every detection metric uses the TAO COCO evaluator after a lossless
 VOC-to-COCO conversion; none is the historical VOC2007 11-point AP. DINO uses
@@ -116,26 +126,90 @@ must resolve an authorized immutable source, prove that it is the intended
 release, and record its SHA256. An unpinned community mirror is not an
 acceptable silent replacement.
 
-### Cityscapes
+### PASCAL VOC2012 segmentation
 
-- Official overview:
-  <https://www.cityscapes-dataset.com/dataset-overview/>
-- Authenticated download portal:
-  <https://www.cityscapes-dataset.com/downloads/>
-- Dataset terms:
-  <https://www.cityscapes-dataset.com/license/>
-- Official conversion and evaluation scripts:
-  <https://github.com/mcordts/cityscapesScripts>
+- Official challenge page, task details, and release statistics:
+  <https://www.robots.ox.ac.uk/~vgg/projects/pascal/VOC/voc2012/>
+- Official database-rights notice:
+  <https://www.robots.ox.ac.uk/~vgg/projects/pascal/VOC/voc2012/dbstats.html>
+- Exact official train/validation archive:
+  <https://thor.robots.ox.ac.uk/pascal/VOC/voc2012/VOCtrainval_11-May-2012.tar>
 
-Required upstream packages are `leftImg8bit_trainvaltest.zip` and
-`gtFine_trainvaltest.zip`. The official scripts report 2,975 training, 500
-validation, and 1,525 test images. Test labels are not public. The repository
-provides the authoritative semantic train-ID, instance-ID, panoptic conversion,
-and semantic, instance, and panoptic evaluation tools.
+The downloaded archive is 1,999,639,040 bytes with SHA256
+`e14f763270cf193d0b5f74b169f44157a4b0c6efa708f4dd0ff78ee691763bcb`.
+Its tar integrity passed before extraction. The official semantic split lists
+contain 1,464 training and 1,449 validation identities and are disjoint. The
+TAO projection uses hard links to the untouched source JPEGs and indexed PNG
+masks; every image/mask dimension and every mask label was checked.
 
-Cityscapes requires registration and permits scientific non-commercial use.
-It prohibits redistribution of the dataset and reconstructable derivatives.
-Dataset staging must remain within the licensed user and cluster boundary.
+PASCAL VOC does not grant one blanket permissive license over its images. Its
+database-rights notice and the terms of the originating image sources,
+including Flickr, must be retained. This is the complete public labeled
+VOC2012 semantic train/validation release, not a claim that private challenge
+test labels are available.
+
+### COCO2017 instance and panoptic
+
+- Official dataset and terms:
+  <https://cocodataset.org/>
+- Exact official image archives:
+  <https://s3.amazonaws.com/images.cocodataset.org/zips/train2017.zip> and
+  <https://s3.amazonaws.com/images.cocodataset.org/zips/val2017.zip>
+- Exact official annotation archives:
+  <https://s3.amazonaws.com/images.cocodataset.org/annotations/annotations_trainval2017.zip>
+  and
+  <https://s3.amazonaws.com/images.cocodataset.org/annotations/panoptic_annotations_trainval2017.zip>
+
+The frozen archive identities are:
+
+| Archive | Bytes | SHA256 |
+| --- | ---: | --- |
+| `train2017.zip` | 19,336,861,798 | `69a8bb58ea5f8f99d24875f21416de2e9ded3178e903f1f7603e283b9e06d929` |
+| `val2017.zip` | 815,585,330 | `4f7e2ccb2866ec5041993c9cf2a952bbed69647b115d0f74da7ce8f4bef82f05` |
+| `annotations_trainval2017.zip` | 252,907,541 | `113a836d90195ee1f884e704da6304dfaaecff1f023f49b6ca93c4aaae470268` |
+| `panoptic_annotations_trainval2017.zip` | 860,725,834 | `c05f76d2129b6b561eb70efe16e7006df62f73fb92889132d373b9d90e31a370` |
+
+All four zip integrity tests and all frozen archive checksums passed. The
+native instance JSON, panoptic JSON, image sets, and panoptic PNG sets were
+checked for exact reference equality. Every image and panoptic-mask dimension
+was checked, and the deep validation additionally checked each RGB panoptic
+segment ID and pixel area against JSON.
+
+COCO annotations are distributed under CC BY 4.0. COCO does not relicense the
+images: each source image retains its own license, recorded in the annotation
+metadata.
+
+### Rejected staged alternative: Cityscapes
+
+Cityscapes remained scientifically appropriate, but its authenticated,
+registration-gated access and non-redistribution terms prevented unattended
+public acquisition. No Cityscapes archive or derivative was downloaded.
+VOC2012 and COCO2017 were selected before any model result: VOC2012 supplies a
+complete public semantic corpus, and native COCO supplies the complete
+instance and panoptic contracts.
+
+## Frozen segmentation staging records
+
+Repository-owned evidence:
+
+- `experiments/cross_model_automl_20260729/segmentation_datasets/dataset_stage_manifest.v1.json`;
+- `experiments/cross_model_automl_20260729/segmentation_datasets/segmentation_dataset_validation.v1.json`;
+- `experiments/cross_model_automl_20260729/segmentation_datasets/VOC2012_DATASET_CARD.md`;
+- `experiments/cross_model_automl_20260729/segmentation_datasets/COCO2017_SEGMENTATION_DATASET_CARD.md`;
+- `experiments/cross_model_automl_20260729/segmentation_datasets/voc2012_segformer_dataset_profile.yaml`;
+- `experiments/cross_model_automl_20260729/segmentation_datasets/coco2017_tao_dataset_bindings.yaml`.
+
+The full per-file manifests are intentionally stored beside the datasets
+rather than adding approximately 20 MB of file hashes to Git:
+
+| Dataset | Immutable Lustre root | File-manifest entries | File-manifest SHA256 |
+| --- | --- | ---: | --- |
+| VOC2012 segmentation | `/lustre/fsw/portfolios/edgeai/users/rarunachalam/data/cross_model_automl_20260729/voc2012_segmentation_v1` | 5,827 | `051ab20215b8e6976763ac82a3db20a68264759edef3d62fd0c8553c501123ff` |
+| COCO2017 instance/panoptic | `/lustre/fsw/portfolios/edgeai/users/rarunachalam/data/cross_model_automl_20260729/coco2017_instance_panoptic_v1` | 246,593 | `10566a60498de9998154f44a34445a488c9f030e09f2a7346d20a4a1c55f804e` |
+
+The committed stage manifest records the corresponding local paths,
+validation report hashes, converter and collateral commits, transfer
+provenance, remote verification result, and read-only audit.
 
 ## Split and final-evaluation policy
 
@@ -144,13 +218,14 @@ Dataset staging must remain within the licensed user and cluster boundary.
   untouched until final frozen-candidate evaluation.
 - RefCOCOg uses the complete, image-disjoint UMD train, validation, and test
   lists unchanged.
-- Cityscapes keeps the official train and validation sets unchanged for the
-  initial correctness preflight. Because public test labels are unavailable,
-  a cross-model campaign that requires an accuracy holdout independent of
-  AutoML validation must preregister an additional group-disjoint split from
-  official training data and reserve the official validation set for terminal
-  evaluation. The exact list, seed, grouping rule, and hash must exist before
-  any recommendation. It may not be created after pilot results.
+- VOC2012 segmentation keeps its official train and validation identity lists
+  unchanged.
+- COCO2017 keeps the complete official train and validation image and
+  annotation populations unchanged.
+- Neither public dataset supplies labeled public challenge-test data in the
+  staged package. If a campaign needs a terminal holdout independent of
+  AutoML validation, its split must be preregistered and hashed before the
+  first recommendation. No post-result split construction is permitted.
 
 No test or terminal-evaluation metric may feed recommendation, feasibility,
 selection, or reselection.
@@ -180,22 +255,31 @@ Reusable implementation exists under
 - writes a label map for detection data;
 - remaps present category IDs to a contiguous ODVG label domain.
 
-The COCO and KITTI data-analytics paths can validate common box failures and
-produce statistics. They should be reused rather than duplicated in the
-AutoML repository.
+The staged Mask Grounding DINO training projection invokes the exact
+`convert_coco_to_odvg` function from that pinned commit with
+`use_all_categories=false`. The installed command-line entry point imported an
+unrelated optional `h5py` dependency through its global command map, so the
+conversion function itself was invoked directly rather than reimplemented.
+Two independent conversions produced byte-identical JSONL and label-map
+outputs. The data-only verifier then compared every projected field against
+every one of the 860,001 source annotations, including exact polygon/RLE mask
+JSON. No custom converter or candidate-specific edit was used.
+
+The official converter omits source images with no instance annotations. The
+verifier records that policy explicitly and proves that no annotated image or
+annotation was lost. Official COCO source annotations with zero bbox height or
+area are also retained and reported, not silently corrected or deleted.
 
 ### Existing capability that is not yet sufficient
 
-The current COCO/ODVG tests principally prove that output files and
-annotations exist. They do not prove:
-
-- source-to-output image and annotation count equality;
-- category-map bijection;
-- bbox round-trip equality;
-- decoded polygon/RLE mask equality;
-- source file and dimension identity;
-- expression, token-span, and source-ID preservation;
-- deterministic output independent of input enumeration.
+The repository-owned data-only verifier added by this staging change proves
+source-to-output image and annotation accounting, category-map bijection,
+converter-equivalent bbox equality, exact polygon/RLE JSON identity, source
+image/panoptic-mask dimension identity, and repeat-conversion determinism for
+the category-prompted path. It does not prove expression or token-span
+preservation because COCO category detection contains no referring
+expressions, and it does not claim decoded-mask equivalence beyond the exact
+source JSON identity plus native panoptic pixel validation.
 
 The `use_all_categories=true` branch in the current COCO-to-ODVG converter
 indexes a category-count array using raw category IDs. That is unsafe for
@@ -209,22 +293,22 @@ than silently modifying source-derived annotations.
 
 ## Required conversion and validation work
 
-The following repository-owned, tested preparation paths are still absent:
+The following repository-owned preparation paths remain absent:
 
 1. VOC XML to canonical COCO detection JSON.
 2. Native RefCOCOg plus COCO annotation IDs to expression-preserving VG ODVG.
-3. Cityscapes train-ID masks to the exact SegFormer folder, label-map, and
-   palette contract.
-4. Cityscapes instance IDs or polygons to COCO instance JSON required by
-   Mask2Former.
-5. Dataset acquisition manifests and dataset cards with authoritative source
-   and archive hashes.
-6. ODVG/VG integrity validation.
-7. Semantic-mask, COCO-instance, and COCO-panoptic integrity validation.
+3. A task-correct RefCOCOg acquisition and expression-preserving preparation
+   path for the requested phrase-grounding claims.
 
-The official Cityscapes scripts must be pinned and wrapped for semantic,
-instance, and panoptic preparation instead of reimplementing their label
-semantics.
+The following segmentation preparation paths are now present:
+
+1. byte-identical VOC2012 indexed masks in the SegFormer folder contract;
+2. native complete COCO2017 instance and panoptic assets plus exact TAO
+   panoptic and instance label maps for OneFormer and Mask2Former;
+3. pinned official COCO-to-ODVG conversion with exact source-mask preservation
+   for category-prompted Mask Grounding DINO;
+4. acquisition records, archive hashes, file manifests, dataset cards, and a
+   machine-readable data-only integrity report.
 
 ### Conversion-specific requirements
 
@@ -250,24 +334,25 @@ semantics.
 - Record empty or invalid source records as structured failures; do not drop
   them silently.
 
-#### Cityscapes
+#### VOC2012 and COCO2017 segmentation
 
-- Preserve all 19 evaluation train IDs and ignore ID 255.
-- Preserve the exact source-to-train-ID and thing/stuff mapping.
-- Verify image-mask dimensions and pixel label domain.
-- Use the official panoptic converter and evaluator.
-- Derive instance JSON deterministically and prove mask area, bbox, category,
-  and crowd semantics against the source instance-ID images.
-- Keep the SegFormer palette and `label_transform` consistent across train,
-  evaluate, inference, export, and reload.
+- SegFormer must use 21 output IDs including background, preserve ignore ID
+  255, and set `label_transform: "None"` for the already-indexed masks.
+- Every VOC image/mask pair remains byte-identical to the official extraction.
+- OneFormer and Mask2Former consume the native COCO2017 instance/panoptic
+  structures; no Cityscapes or semantic-label remap is implied.
+- The official 133-category COCO panoptic identity and thing/stuff mapping are
+  preserved in the pinned TAO label map.
+- Mask Grounding DINO's staged ODVG path is `data_type: OD`, uses contiguous
+  category IDs, and retains the original polygon/RLE masks.
 
 ## Per-model metric and readiness blockers
 
 ### DINO
 
-Dataset design is ready for implementation, but no public dataset or PTM has
-been staged or smoke-tested. The VOC category-ID contract and COCO mAP parsing
-must pass before local epoch execution.
+This segmentation staging change did not stage the proposed VOC2007 detection
+corpus or a DINO PTM. The VOC category-ID contract and COCO mAP parsing must
+pass before execution against that proposed public corpus.
 
 ### Deformable DETR
 
@@ -304,11 +389,16 @@ referring-expression row below or make a `Pr@0.5` claim.
 
 Preflight must verify:
 
-- 19 classes rather than the binary template default;
+- 21 IDs including background rather than the binary template default;
 - ignore ID 255;
 - exact grayscale mask IDs;
-- palette and label transformation;
+- a palette that represents IDs 0 through 20 and ignore ID 255;
+- `label_transform: "None"` across all stages;
 - task-correct mIoU after checkpoint reload.
+
+The full official VOC2012 train/validation data and lossless TAO folder
+projection pass the data-only gate. No model-side condition above has been
+executed.
 
 ### OneFormer
 
@@ -316,14 +406,16 @@ Panoptic inference exists, but inspected validation code reports semantic
 mIoU and pixel accuracy. No training-time PQ path was found. A panoptic
 campaign cannot optimize semantic mIoU and then claim panoptic quality.
 OneFormer remains blocked until PQ is emitted, parsed, and independently
-checked against the official Cityscapes evaluator.
+checked against the official COCO evaluator. The complete native COCO
+panoptic dataset is staged; that does not remove the metric blocker.
 
 ### Mask2Former
 
 The inspected validation path also reports semantic mIoU and pixel accuracy,
 although instance and panoptic inference modes exist. No mask AP validation
 path was found. Mask2Former remains blocked until COCO mask AP is emitted,
-parsed, and checked against the official instance evaluator.
+parsed, and checked against the official COCO instance evaluator. The complete
+native COCO instance and panoptic data are staged.
 
 ### Mask Grounding DINO
 
@@ -339,7 +431,13 @@ returns:
 
 The packaged skill, however, instructs train-stage AutoML to use `val_loss` and
 describes validation as COCO-format. The exact pinned container may therefore
-not match the inspected source. The discrepancy is a hard preflight blocker.
+not match the inspected source. The discrepancy remains a hard preflight
+blocker for a referring-expression campaign.
+
+The staged COCO2017 path is deliberately narrower: category-prompted grounded
+instance segmentation with `data_type: OD`. Its 860,001 masks pass exact
+source-to-ODVG structural comparison. This data readiness must not be reported
+as phrase-grounding or RefCOCOg validation.
 
 The model-specific smoke contract must also keep:
 
@@ -419,9 +517,9 @@ For each model, local single-GPU preflight must prove:
 No model is SLURM-ready merely because its configuration parses or a single
 mini-batch is finite.
 
-## Local readiness matrix at preregistration
+## Local readiness matrix after data staging
 
-`Pending` means the design is identified but no execution has occurred.
+`Pending` means the design is identified but no model execution has occurred.
 `Blocked` means a concrete implementation or access defect must be resolved
 before execution.
 
@@ -431,10 +529,10 @@ before execution.
 | `deformable_detr` | Proposed | Pending | Missing VOC-to-COCO | Pending | Not run | No |
 | `rtdetr` | Proposed | Pending | Missing VOC-to-COCO | Pending | Not run | No |
 | `grounding_dino` | Proposed | Blocked: no phrase-grounding validation metric | Missing RefCOCOg-to-VG ODVG | Blocked pending immutable RefCOCOg access | Not run | No |
-| `segformer` | Proposed | Pending | Missing Cityscapes-to-TAO packaging | Registration pending | Not run | No |
-| `oneformer` | Proposed | Blocked: no verified PQ | Official panoptic conversion reusable; TAO packaging pending | Registration pending | Not run | No |
-| `mask2former` | Proposed | Blocked: no verified mask AP | Missing COCO-instance packaging | Registration pending | Not run | No |
-| `mask_grounding_dino` | Proposed | Blocked: skill/container/source metric mismatch | Missing RefCOCOg-to-VG ODVG | Blocked pending immutable RefCOCOg access | Not run | No |
+| `segformer` | Staged and data-only validated: complete VOC2012 train/val | Pending model execution | Complete byte-identical TAO folder projection | Public source staged locally and on Lustre | Not run by instruction | No |
+| `oneformer` | Staged and data-only validated: complete COCO2017 train/val instance/panoptic | Blocked: no verified PQ | Native COCO panoptic plus pinned TAO label map | Public source staged locally and on Lustre | Not run by instruction | No |
+| `mask2former` | Staged and data-only validated: complete COCO2017 train/val instance/panoptic | Blocked: no verified mask AP | Native COCO instance and panoptic assets | Public source staged locally and on Lustre | Not run by instruction | No |
+| `mask_grounding_dino` | Staged and data-only validated for category-prompted COCO; phrase-grounding dataset not staged | Blocked for phrase grounding: skill/container/source metric mismatch | Official TAO Data Services COCO-to-ODVG conversion verified; RefCOCOg-to-VG path still absent | COCO public source staged; immutable RefCOCOg access remains blocked | Not run by instruction | No |
 
 ## Later SLURM and strict SQSH contract
 
@@ -517,10 +615,12 @@ Submission remains staged:
 ## Preregistration conclusion
 
 The dataset choices are scientifically appropriate and moderate relative to
-the supported tasks, but this matrix does not mark any model ready for SLURM.
-The phrase-grounding evaluator, panoptic PQ, instance mask AP, Mask Grounding
-DINO metric contract, missing conversion paths, immutable dataset access, and
-strict SQSH behavior are concrete gates.
+the supported tasks. The complete VOC2012 semantic and COCO2017
+instance/panoptic roots are staged and data-only validated, but this matrix
+does not mark any model ready for SLURM. The phrase-grounding evaluator,
+panoptic PQ, instance mask AP, Mask Grounding DINO metric contract, remaining
+detection/grounding conversion and access paths, and strict SQSH behavior are
+concrete model or campaign gates.
 
-No download, local model run, latency benchmark, or SLURM submission occurred
-while producing this preregistration.
+Dataset acquisition and validation invoked no model, latency benchmark, or
+SLURM submission.
