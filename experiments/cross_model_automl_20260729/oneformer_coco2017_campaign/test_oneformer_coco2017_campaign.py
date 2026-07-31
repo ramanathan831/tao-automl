@@ -11,6 +11,7 @@ import pytest
 from tao_automl.ptm_registry import canonical_sha256, load_ptm_registry
 
 from . import campaign_contract, manifest_generator, run_campaign
+from . import qualification_gate
 from .qualification_gate import (
     QualificationGateError,
     audit_qualification,
@@ -91,6 +92,14 @@ def runtime() -> dict:
         "skill_dir": str(SKILL_DIR),
         "qualification_evidence_path": "/tmp/qualification.json",
         "ptm_stage_manifest_path": "/tmp/ptm_stage.json",
+        "runtime_overlay_local_archive_path": (
+            str(manifest_generator.DEFAULT_RUNTIME_OVERLAY)
+        ),
+        "runtime_overlay_local_identity": {
+            "archive_sha256": (
+                campaign_contract.FROZEN_RUNTIME_OVERLAY["archive_sha256"]
+            )
+        },
         "partition": "polar3",
         "account": "account",
         "base_results_dir": "/lustre/results",
@@ -153,6 +162,7 @@ def test_profile_uses_native_panoptic_contract_and_correct_label_map():
     assert profile["train"]["num_gpus"] == 8
     assert profile["train"]["num_nodes"] == 1
     assert profile["train"]["precision"] == "32"
+    assert profile["evaluate"]["task"] == "panoptic"
 
 
 def test_campaign_is_three_independent_objective_aware_jobs():
@@ -190,16 +200,24 @@ def test_latency_retention_does_not_leak_into_multi_objective():
     assert multi["multi_objective_min_accuracy"] is None
 
 
-def test_metric_semantics_never_alias_miou_to_pq():
+def test_metric_semantics_use_task_correct_globally_reduced_pq():
     value = contract()
-    assert value["primary_accuracy_metric"] == "mIoU"
+    assert value["primary_accuracy_metric"] == "PQ"
     assert value["metric_semantics"] == {
-        "observed_metric": "semantic_miou_from_panoptic_annotations",
-        "product_panoptic_metric": "PQ",
-        "pq_emitted_by_current_train_evaluate_path": False,
-        "pq_claim_authorized": False,
-        "mislabel_miou_as_pq": False,
+        "observed_metric": "panoptic_quality",
+        "metric_scale": "unit_interval",
+        "source": "native_coco_panoptic_annotations",
+        "pq_emitted_by_overlaid_train_evaluate_path": True,
+        "pq_claim_authorized": True,
+        "semantic_miou_used_as_panoptic_objective": False,
+        "distributed_reduction": (
+            "global_additive_sufficient_statistics_before_metric"
+        ),
     }
+    assert all(
+        item["settings"]["accuracy_metric"] == "PQ"
+        for item in value["modes"]
+    )
 
 
 def test_frozen_pilot_fidelity_and_no_model_smoke_contract():
@@ -236,6 +254,12 @@ def test_contract_integrity_and_agent_flags_are_fail_closed():
     mutated["contract_sha256"] = canonical_sha256(mutated)
     with pytest.raises(campaign_contract.CampaignContractError):
         campaign_contract.validate_contract(mutated)
+    mutated = copy.deepcopy(value)
+    mutated["modes"][2]["settings"]["accuracy_metric"] = "mIoU"
+    mutated.pop("contract_sha256")
+    mutated["contract_sha256"] = canonical_sha256(mutated)
+    with pytest.raises(campaign_contract.CampaignContractError):
+        campaign_contract.validate_contract(mutated)
 
 
 def test_invalid_retention_values_are_rejected():
@@ -261,6 +285,15 @@ def test_manifest_constants_bind_final_coco_stage_and_new_wheel():
     assert (
         campaign_contract.sha256_file(manifest_generator.DEFAULT_WHEEL)
         == manifest_generator.EXPECTED_WHEEL_SHA256
+    )
+    overlay = manifest_generator.runtime_overlay_record(
+        manifest_generator.DEFAULT_RUNTIME_OVERLAY
+    )
+    assert overlay["archive_sha256"] == (
+        campaign_contract.FROZEN_RUNTIME_OVERLAY["archive_sha256"]
+    )
+    assert overlay["source_commit"] == (
+        campaign_contract.FROZEN_RUNTIME_OVERLAY["source_commit"]
     )
 
 
@@ -300,14 +333,20 @@ def test_all_failed_qualification_evidence_is_preserved_and_blocks(tmp_path):
         "campaign_id": "qualification-test",
         "model": "oneformer",
         "task": "panoptic_segmentation",
-        "metric": "mIoU",
+        "metric": "PQ",
         "metric_semantics": (
-            "semantic_miou_from_native_coco_panoptic_annotations"
+            "panoptic_quality_from_native_coco_panoptic_annotations"
         ),
-        "pq_emitted": False,
-        "pq_claim_authorized": False,
+        "pq_emitted": True,
+        "pq_claim_authorized": True,
         "registry_sha256": snapshot["registry_sha256"],
         "sqsh_sha256": campaign_contract.FROZEN_SQSH["sha256"],
+        "runtime_overlay_sha256": (
+            campaign_contract.FROZEN_RUNTIME_OVERLAY["archive_sha256"]
+        ),
+        "runtime_overlay_source_commit": (
+            campaign_contract.FROZEN_RUNTIME_OVERLAY["source_commit"]
+        ),
         "cpu_model_runs": 0,
         "smoke_model_runs": 0,
         "mini_step_runs": 0,
@@ -350,14 +389,20 @@ def test_tampered_failed_workflow_is_blocked_instead_of_excluded(tmp_path):
         "campaign_id": "qualification-tamper-test",
         "model": "oneformer",
         "task": "panoptic_segmentation",
-        "metric": "mIoU",
+        "metric": "PQ",
         "metric_semantics": (
-            "semantic_miou_from_native_coco_panoptic_annotations"
+            "panoptic_quality_from_native_coco_panoptic_annotations"
         ),
-        "pq_emitted": False,
-        "pq_claim_authorized": False,
+        "pq_emitted": True,
+        "pq_claim_authorized": True,
         "registry_sha256": snapshot["registry_sha256"],
         "sqsh_sha256": campaign_contract.FROZEN_SQSH["sha256"],
+        "runtime_overlay_sha256": (
+            campaign_contract.FROZEN_RUNTIME_OVERLAY["archive_sha256"]
+        ),
+        "runtime_overlay_source_commit": (
+            campaign_contract.FROZEN_RUNTIME_OVERLAY["source_commit"]
+        ),
         "cpu_model_runs": 0,
         "smoke_model_runs": 0,
         "mini_step_runs": 0,
@@ -379,27 +424,99 @@ def test_missing_qualification_never_launches_a_model(tmp_path):
         audit_qualification(tmp_path / "missing.json")
 
 
-def test_static_sqsh_findings_keep_oneformer_fail_closed():
-    blockers = run_campaign.static_sqsh_runtime_blockers(contract())
-    assert {
-        item["runtime_code"] for item in blockers
-    } == {
-        "oneformer_full_checkpoint_loader_missing",
-        "oneformer_panoptic_pq_not_emitted",
-        "oneformer_ddp_status_metric_not_globally_reduced",
+def test_qualification_receipt_requires_exact_overlay_and_all_actions():
+    receipt = {
+        "schema_version": 1,
+        "overlay_source_commit": (
+            campaign_contract.FROZEN_RUNTIME_OVERLAY["source_commit"]
+        ),
+        "container_expected_sha256": campaign_contract.FROZEN_SQSH["sha256"],
+        "site_packages": (
+            "/tmp/oneformer-runtime-overlay.abc123/site-packages"
+        ),
+        "dry_run": False,
+        "path": "/lustre/results/job/runtime_overlay/receipt.json",
+        "sha256": "a" * 64,
+        "actions": [
+            {
+                "path": f"nvidia_tao_pytorch/file_{index}.py",
+                "action": "replace_base",
+                "sha256": f"{index:064x}",
+            }
+            for index in range(
+                campaign_contract.FROZEN_RUNTIME_OVERLAY["file_count"]
+            )
+        ],
     }
-    assert all(
-        item["code"] == "static_oneformer_runtime_blocker"
-        for item in blockers
+    assert qualification_gate._validate_overlay_receipt(
+        receipt,
+        checkpoint_id="checkpoint",
+        phase="train",
+    ) == receipt
+    receipt["actions"].pop()
+    with pytest.raises(QualificationGateError):
+        qualification_gate._validate_overlay_receipt(
+            receipt,
+            checkpoint_id="checkpoint",
+            phase="train",
+        )
+
+
+def test_static_sqsh_findings_are_remediated_only_by_exact_overlay():
+    blockers = run_campaign.static_sqsh_runtime_blockers(contract())
+    assert blockers == []
+    mutated = contract()
+    mutated["runtime_overlay"] = copy.deepcopy(
+        mutated["runtime_overlay"]
     )
+    mutated["runtime_overlay"]["source_commit"] = "0" * 40
+    blockers = run_campaign.static_sqsh_runtime_blockers(mutated)
+    assert len(blockers) == 1
+    assert blockers[0]["code"] == "static_oneformer_runtime_blocker"
 
 
-def test_metric_extractor_accepts_only_exact_oneformer_metric():
-    logs = "mIoU: 0.125\nmIoU=0.375\n"
-    assert run_campaign._metric_extractor(logs, "mIoU") == pytest.approx(
+def test_metric_extractor_accepts_only_exact_panoptic_metric():
+    logs = "PQ: 0.125\nPQ=0.375\ntest_PQ=0.625\n"
+    assert run_campaign._metric_extractor(logs, "PQ") == pytest.approx(
         0.375
     )
-    assert run_campaign._metric_extractor(logs, "PQ") is None
+    assert run_campaign._metric_extractor(logs, "mIoU") is None
+
+
+def test_runtime_overlay_prefix_is_applied_to_every_container_job():
+    class DummySDK:
+        def __init__(self):
+            self.calls = []
+
+        def create_job(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return type("Job", (), {"id": "job-1"})()
+
+    raw = DummySDK()
+    wrapped = run_campaign.RuntimeOverlaySDK(raw, contract())
+    job = wrapped.create_job(image="image", command="tao model train")
+    assert job.id == "job-1"
+    command = raw.calls[0][1]["command"]
+    overlay = campaign_contract.FROZEN_RUNTIME_OVERLAY
+    assert command.endswith("&& tao model train")
+    assert overlay["archive_path"] in command
+    assert overlay["archive_sha256"] in command
+    assert "install_overlay.py" in command
+    assert "runtime_overlay/receipt.json" in command
+    command_evidence = wrapped.command_evidence(job.id)
+    assert command_evidence["runtime_overlay_applied"] is True
+    assert command_evidence["command_sha256"] == run_campaign.text_sha256(
+        command
+    )
+
+
+def test_evaluation_spec_forces_panoptic_task():
+    specification = run_campaign.evaluation_spec(
+        contract(),
+        {},
+        "/lustre/checkpoint.pth",
+    )
+    assert specification["evaluate"]["task"] == "panoptic"
 
 
 def test_runner_source_preserves_objective_aware_and_automatic_gates():
@@ -412,6 +529,8 @@ def test_runner_source_preserves_objective_aware_and_automatic_gates():
     assert "num_nodes=1" in source
     assert "TAO_AUTOML_ONEFORMER_LATENCY_COMPLETE" in source
     assert "model_epoch_000_step_" in source
+    assert "sdk = RuntimeOverlaySDK(" in source
+    assert 'names=(\"test_PQ\", \"PQ\")' in source
 
 
 def test_custom_ranges_equal_frozen_search_space():

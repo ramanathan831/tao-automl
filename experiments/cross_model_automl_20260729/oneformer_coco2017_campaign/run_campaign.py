@@ -77,6 +77,122 @@ _local_lustre_path = workflow_support._local_lustre_path
 _merge_spec = workflow_support._merge_spec
 
 
+def runtime_overlay_install_command(
+    contract: Mapping[str, Any],
+) -> str:
+    """Return the fail-closed prefix applied to every OneFormer model job."""
+    overlay = contract["runtime_overlay"]
+    archive = shlex.quote(str(overlay["archive_path"]))
+    digest = shlex.quote(str(overlay["archive_sha256"]))
+    installer = shlex.quote(
+        f"{overlay['archive_root']}/install_overlay.py"
+    )
+    base_site_packages = shlex.quote(
+        str(overlay["base_site_packages"])
+    )
+    return " ".join(
+        [
+            "overlay_tmp=$(mktemp -d",
+            "/tmp/oneformer-runtime-overlay.XXXXXX)",
+            "&& test \"$(sha256sum",
+            archive,
+            "| awk '{print $1}')\" =",
+            digest,
+            "&& tar --extract --file",
+            archive,
+            "--directory \"$overlay_tmp\"",
+            "&& overlay_site=\"$overlay_tmp/site-packages\"",
+            "&& mkdir -p \"$overlay_site/nvidia_tao_pytorch\"",
+            "&& cp -as",
+            f"{base_site_packages}/nvidia_tao_pytorch/.",
+            "\"$overlay_site/nvidia_tao_pytorch/\"",
+            f"&& python \"$overlay_tmp\"/{installer}",
+            "--site-packages",
+            "\"$overlay_site\"",
+            "--receipt "
+            "\"${TAO_RESULTS_ROOT:?}/${TAO_JOB_ID:?}/"
+            "runtime_overlay/receipt.json\"",
+            "&& export PYTHONPATH="
+            "\"$overlay_site${PYTHONPATH:+:$PYTHONPATH}\"",
+        ]
+    )
+
+
+class RuntimeOverlaySDK:
+    """Delegate to an SDK while prefixing every container command once."""
+
+    def __init__(
+        self,
+        sdk: Any,
+        contract: Mapping[str, Any],
+        *,
+        ledger_path: Path | None = None,
+    ):
+        self._delegate = sdk
+        self._prefix = runtime_overlay_install_command(contract)
+        self._commands: dict[str, dict[str, Any]] = {}
+        self._ledger_path = ledger_path
+        if ledger_path is not None and ledger_path.is_file():
+            document = json.loads(ledger_path.read_text(encoding="utf-8"))
+            commands = document.get("commands")
+            if (
+                document.get("schema_version") != 1
+                or not isinstance(commands, Mapping)
+            ):
+                raise CampaignExecutionError(
+                    "runtime-overlay command ledger is invalid"
+                )
+            self._commands = copy.deepcopy(dict(commands))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+    def create_job(self, *args: Any, **kwargs: Any) -> Any:
+        arguments = list(args)
+        if "command" in kwargs:
+            command = kwargs["command"]
+            kwargs["command"] = f"{self._prefix} && {command}"
+        elif len(arguments) >= 2:
+            command = arguments[1]
+            arguments[1] = f"{self._prefix} && {command}"
+        else:
+            raise CampaignExecutionError(
+                "runtime-overlay SDK received a container job without a command"
+            )
+        if not isinstance(command, str) or not command.strip():
+            raise CampaignExecutionError(
+                "runtime-overlay SDK received an invalid container command"
+            )
+        effective_command = (
+            kwargs["command"]
+            if "command" in kwargs
+            else arguments[1]
+        )
+        job = self._delegate.create_job(*arguments, **kwargs)
+        self._commands[job.id] = {
+            "command_sha256": text_sha256(effective_command),
+            "overlay_prefix_sha256": text_sha256(self._prefix),
+            "runtime_overlay_applied": True,
+        }
+        if self._ledger_path is not None:
+            atomic_json(
+                self._ledger_path,
+                {
+                    "schema_version": 1,
+                    "commands": self._commands,
+                },
+            )
+        return job
+
+    def command_evidence(self, job_id: str) -> dict[str, Any]:
+        try:
+            return copy.deepcopy(self._commands[job_id])
+        except KeyError as exc:
+            raise CampaignExecutionError(
+                f"runtime-overlay command evidence is unavailable for {job_id}"
+            ) from exc
+
+
 def _git(repository: Path, *arguments: str) -> str:
     return subprocess.run(
         ["git", "-C", str(repository), *arguments],
@@ -306,6 +422,10 @@ def verify_local_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
             STATIC_SQSH_AUDIT,
             contract["launcher_integrity"]["static_sqsh_audit_sha256"],
         ),
+        "runtime_overlay_archive": (
+            runtime["runtime_overlay_local_archive_path"],
+            contract["runtime_overlay"]["archive_sha256"],
+        ),
     }
     evidence = {}
     for name, (path_value, expected_sha) in identities.items():
@@ -332,7 +452,7 @@ def verify_local_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
 def static_sqsh_runtime_blockers(
     contract: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
-    """Return immutable blockers found without executing a model."""
+    """Reconcile the immutable base-SQSH findings with the sealed overlay."""
     document = json.loads(STATIC_SQSH_AUDIT.read_text(encoding="utf-8"))
     execution = document.get("execution", {})
     if (
@@ -368,14 +488,43 @@ def static_sqsh_runtime_blockers(
         raise CampaignExecutionError(
             "OneFormer static SQSH audit findings are invalid"
         )
-    return [
-        {
-            "code": "static_oneformer_runtime_blocker",
-            "runtime_code": str(item["code"]),
-            "reason": str(item["reason"]),
-        }
-        for item in findings
-    ]
+    finding_codes = sorted(str(item["code"]) for item in findings)
+    overlay = contract.get("runtime_overlay")
+    if (
+        overlay != campaign_contract.FROZEN_RUNTIME_OVERLAY
+        or sorted(overlay.get("remediates_static_findings", ()))
+        != finding_codes
+        or overlay.get("archive_sha256")
+        != campaign_contract.FROZEN_RUNTIME_OVERLAY["archive_sha256"]
+        or overlay.get("source_commit")
+        != campaign_contract.FROZEN_RUNTIME_OVERLAY["source_commit"]
+    ):
+        return [
+            {
+                "code": "static_oneformer_runtime_blocker",
+                "runtime_codes": finding_codes,
+                "reason": (
+                    "The immutable base-SQSH findings are not bound to the "
+                    "reviewed OneFormer runtime overlay."
+                ),
+            }
+        ]
+    return []
+
+
+def _verify_runtime_overlay_remote(
+    contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    overlay = contract["runtime_overlay"]
+    identity = _remote_file_identity(str(overlay["archive_path"]))
+    if (
+        identity["sha256"] != overlay["archive_sha256"]
+        or identity["size_bytes"] != overlay["archive_size_bytes"]
+    ):
+        raise CampaignExecutionError(
+            "pinned OneFormer runtime-overlay identity changed"
+        )
+    return identity
 
 
 def launch_readiness(
@@ -410,6 +559,12 @@ def launch_readiness(
     except Exception as exc:
         blockers.append(
             {"code": "static_sqsh_audit_invalid", "reason": str(exc)}
+        )
+    try:
+        _verify_runtime_overlay_remote(contract)
+    except Exception as exc:
+        blockers.append(
+            {"code": "runtime_overlay_not_ready", "reason": str(exc)}
         )
     try:
         decision = audit_qualification(
@@ -683,6 +838,64 @@ def _status_metric(
     return values[-1] if values else None
 
 
+def _runtime_overlay_receipt(
+    sdk: Any,
+    contract: Mapping[str, Any],
+    job_id: str,
+) -> dict[str, Any]:
+    """Read and validate the persisted installer receipt for one model job."""
+    root = _local_lustre_path(sdk.get_job_results_dir(job_id))
+    receipt_path = f"{root}/runtime_overlay/receipt.json"
+    try:
+        document = json.loads(
+            remote_output(f"cat {shlex.quote(receipt_path)}")
+        )
+        identity = _remote_file_identity(receipt_path)
+    except Exception as exc:
+        raise CampaignExecutionError(
+            f"runtime-overlay receipt is unavailable for job {job_id}"
+        ) from exc
+    overlay = contract["runtime_overlay"]
+    actions = document.get("actions")
+    if (
+        document.get("schema_version") != 1
+        or document.get("overlay_source_commit") != overlay["source_commit"]
+        or document.get("container_expected_sha256")
+        != contract["sqsh"]["sha256"]
+        or not isinstance(document.get("site_packages"), str)
+        or not document["site_packages"].startswith(
+            "/tmp/oneformer-runtime-overlay."
+        )
+        or not document["site_packages"].endswith(
+            overlay["runtime_site_packages_suffix"]
+        )
+        or document.get("dry_run") is not False
+        or not isinstance(actions, list)
+        or len(actions) != overlay["file_count"]
+        or any(
+            not isinstance(item, Mapping)
+            or item.get("action")
+            not in {"replace_base", "already_installed", "install_new"}
+            or not isinstance(item.get("path"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256")))
+            is None
+            for item in actions
+        )
+        or len({item["path"] for item in actions}) != len(actions)
+    ):
+        raise CampaignExecutionError(
+            f"runtime-overlay receipt is invalid for job {job_id}"
+        )
+    return {
+        **copy.deepcopy(document),
+        "path": receipt_path,
+        "sha256": identity["sha256"],
+        "size_bytes": identity["size_bytes"],
+        "archive_sha256": overlay["archive_sha256"],
+        "manifest_sha256": overlay["manifest_sha256"],
+    }
+
+
 def evaluation_spec(
     contract: Mapping[str, Any],
     recommendation_specs: Mapping[str, Any],
@@ -713,6 +926,7 @@ def evaluation_spec(
             "trt_engine": "",
             "results_dir": "",
             "batch_size": 1,
+            "task": "panoptic",
         }
     )
     return spec
@@ -758,7 +972,7 @@ def _launch_evaluation(
         "status": "submitted",
         "submitted_at_utc": utc_timestamp(),
         "spec_sha256": canonical_sha256(spec),
-        "command_sha256": text_sha256(entrypoint["command"]),
+        **sdk.command_evidence(job.id),
     }
     status = _wait_for_job(
         sdk,
@@ -774,20 +988,23 @@ def _launch_evaluation(
         raise CampaignExecutionError(
             f"evaluation job {job.id} ended as {status}: {logs[-3000:]}"
         )
+    evidence["runtime_overlay_receipt"] = _runtime_overlay_receipt(
+        sdk, contract, job.id
+    )
     metric = _status_metric(
         sdk,
         job.id,
         action="evaluate",
-        names=("test_mIoU", "mIoU"),
+        names=("test_PQ", "PQ"),
     )
     if metric is None or not 0.0 <= metric <= 1.0:
         raise CampaignExecutionError(
-            f"evaluation job {job.id} emitted no valid test_mIoU"
+            f"evaluation job {job.id} emitted no valid test_PQ"
         )
     evidence["result_root"] = _local_lustre_path(
         sdk.get_job_results_dir(job.id)
     )
-    evidence["test_mIoU"] = metric
+    evidence["test_PQ"] = metric
     return metric, evidence
 
 
@@ -996,7 +1213,7 @@ def _launch_latency(
         "status": "submitted",
         "submitted_at_utc": utc_timestamp(),
         "spec_sha256": canonical_sha256(benchmark_spec),
-        "command_sha256": text_sha256(entrypoint["command"]),
+        **sdk.command_evidence(job.id),
         "candidate_fingerprint": fingerprint,
         "input_descriptor": descriptor,
         "input_sha256": canonical_sha256(descriptor),
@@ -1021,6 +1238,9 @@ def _launch_latency(
         raise CampaignExecutionError(
             f"latency job {job.id} ended as {status}: {logs[-3000:]}"
         )
+    evidence["runtime_overlay_receipt"] = _runtime_overlay_receipt(
+        sdk, contract, job.id
+    )
     root = _local_lustre_path(sdk.get_job_results_dir(job.id))
     reader = (
         "import glob,json,sys;"
@@ -1095,12 +1315,12 @@ def _launch_latency(
 
 
 def _metric_extractor(logs: str, metric_name: str) -> float | None:
-    if metric_name != "mIoU":
+    if metric_name != "PQ":
         return None
     values = [
         float(value)
         for value in re.findall(
-            r"\bmIoU\b[^0-9+\-]*"
+            r"\bPQ\b[^0-9+\-]*"
             r"([0-9]*\.?[0-9]+(?:[eE][-+]?\d+)?)",
             logs,
         )
@@ -1255,9 +1475,14 @@ def _run_mode(
         mode=mode,
         cache_root=root / "verified_ptm_cache",
     )
-    sdk = SlurmSDK(
+    raw_sdk = SlurmSDK(
         poll_interval=10,
         state_file=mode_dir / "slurm_state.json",
+    )
+    sdk = RuntimeOverlaySDK(
+        raw_sdk,
+        contract,
+        ledger_path=mode_dir / "runtime_overlay_commands.json",
     )
     runner = AutoMLRunner(
         sdk=sdk,
@@ -1298,6 +1523,9 @@ def _run_mode(
                 str(name): float(value)
                 for name, value in cached.items()
             }
+        training_overlay_receipt = _runtime_overlay_receipt(
+            sdk, contract, train_job_id
+        )
         terminal_checkpoint = _terminal_checkpoint(sdk, train_job_id)
         checkpoint = terminal_checkpoint["path"]
         specification = evaluation_spec(
@@ -1309,11 +1537,17 @@ def _run_mode(
             {
                 "status": "evaluating",
                 "train_job_id": train_job_id,
+                "training_runtime_command": sdk.command_evidence(
+                    train_job_id
+                ),
+                "training_runtime_overlay_receipt": (
+                    training_overlay_receipt
+                ),
                 "terminal_checkpoint": terminal_checkpoint,
             }
         )
         persist()
-        validation_miou, accuracy_job = _launch_evaluation(
+        validation_pq, accuracy_job = _launch_evaluation(
             sdk,
             contract,
             specification,
@@ -1331,7 +1565,7 @@ def _run_mode(
             mode=mode,
             candidate_id=candidate_id,
         )
-        objectives = {"mIoU": validation_miou, **latency}
+        objectives = {"PQ": validation_pq, **latency}
         record.update(
             {
                 "status": "success",
@@ -1369,15 +1603,15 @@ def _run_mode(
         passed = (
             str(status).lower() in SUCCESS_RECOMMENDATION_STATUSES
             and isinstance(objectives, Mapping)
-            and "mIoU" in objectives
+            and "PQ" in objectives
             and all(
                 isinstance(value, (int, float))
                 and not isinstance(value, bool)
                 and math.isfinite(float(value))
                 for value in objectives.values()
             )
-            and float(objectives["mIoU"])
-            >= campaign_contract.FROZEN_VALIDATION_SANITY_MIN_MIOU
+            and float(objectives["PQ"])
+            >= campaign_contract.FROZEN_VALIDATION_SANITY_MIN_PQ
             and record.get("standalone_validation", {}).get("status")
             == "Complete"
             and record.get("selection_time_latency", {}).get(
@@ -1616,8 +1850,10 @@ def launch_plan(
         "contract_sha256": contract["contract_sha256"],
         "model": "oneformer",
         "dataset": contract["dataset"]["root"],
-        "metric": "mIoU",
-        "pq_claim_authorized": False,
+        "metric": "PQ",
+        "pq_claim_authorized": True,
+        "evaluation_task": "panoptic",
+        "runtime_overlay": copy.deepcopy(contract["runtime_overlay"]),
         "launch_authorized": ready,
         "blockers": copy.deepcopy(blockers),
         "automatic_trigger": True,

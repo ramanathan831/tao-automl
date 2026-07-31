@@ -2,10 +2,10 @@
 
 """Frozen OneFormer/full-COCO2017 objective-aware campaign policy.
 
-The campaign uses OneFormer's exact currently emitted semantic ``mIoU`` metric
-while consuming native COCO panoptic annotations.  It deliberately does not
-rename that metric to PQ.  A task-correct panoptic-PQ product claim therefore
-remains blocked until TAO emits and validates PQ independently.
+The campaign explicitly selects OneFormer's panoptic evaluation task and uses
+the task-correct, globally reduced ``PQ`` metric emitted by the pinned TAO
+PyTorch source overlay.  The base SQSH remains immutable; every model command
+must install the sealed overlay before importing TAO PyTorch.
 """
 
 from __future__ import annotations
@@ -90,7 +90,7 @@ FROZEN_CALIBRATION_POINTS_PER_ARM = 2
 FROZEN_INVALID_RECOVERY_ISSUES_PER_ARM = 1
 FROZEN_LATENCY_RETENTION = 0.90
 FROZEN_LATENCY_TOLERANCE_MS = 0.73553775
-FROZEN_VALIDATION_SANITY_MIN_MIOU = 0.01
+FROZEN_VALIDATION_SANITY_MIN_PQ = 0.01
 FROZEN_SLURM_RETRY_CAP = 10
 FROZEN_BATCH_SIZE_PER_REPLICA = 1
 FROZEN_HARDWARE = {
@@ -111,6 +111,42 @@ FROZEN_SQSH = {
         "nvcr.io/nvstaging/tao/tao-toolkit-pyt:"
         "7.1.0-rc-245-multiarch"
     ),
+}
+FROZEN_RUNTIME_OVERLAY = {
+    "artifact_type": "tao_pytorch_source_overlay",
+    "scope": "oneformer_runtime_product_fixes",
+    "archive_path": (
+        "/lustre/fsw/portfolios/edgeai/users/rarunachalam/artifacts/"
+        "oneformer-runtime-product-fixes-c25a20e0/"
+        "oneformer-runtime-overlay.tar"
+    ),
+    "archive_sha256": (
+        "6b976090fb264b319ba23e7092445f261fd1b445964400d3f879c2746247a4f3"
+    ),
+    "archive_size_bytes": 153600,
+    "archive_root": "oneformer-runtime-overlay",
+    "manifest_sha256": (
+        "1ed2721226677e023d8a688f629fa85c997f1ce7f9889b00cda01fc5db899760"
+    ),
+    "installer_sha256": (
+        "c0db61d777cbedc33ffeab795825f30924c7b56faa6996504181684096dfc030"
+    ),
+    "source_repository": "tao-pytorch",
+    "source_commit": "c25a20e0d6e2cf98ccb80c16eb0d4d30bb40f600",
+    "product_fix_commit": "e3ebf59a47d0aea365c855919a1de196f8a0432e",
+    "base_commit": "99741bc8229617d0d3dd52e30540111d55efd1af",
+    "base_site_packages": "/usr/local/lib/python3.12/dist-packages",
+    "runtime_site_packages_strategy": "writable_tmp_symlink_tree",
+    "runtime_site_packages_suffix": "/site-packages",
+    "file_count": 19,
+    "remediates_static_findings": [
+        "oneformer_full_checkpoint_loader_missing",
+        "oneformer_panoptic_pq_not_emitted",
+        "oneformer_ddp_status_metric_not_globally_reduced",
+    ],
+    "evaluation_task": "panoptic",
+    "primary_accuracy_metric": "PQ",
+    "receipt_required_for_every_model_job": True,
 }
 LATENCY_PROTOCOL = {
     "warmup_iterations": 50,
@@ -274,7 +310,7 @@ def validate_packaged_train_schema(skill_dir: str | Path) -> dict[str, Any]:
 
 def mode_objective(mode: str) -> dict[str, Any]:
     objectives = [
-        {"metric": "mIoU", "direction": "maximize", "role": "accuracy"},
+        {"metric": "PQ", "direction": "maximize", "role": "accuracy"},
         {"metric": "latency_ms", "direction": "minimize", "role": "latency"},
     ]
     if mode == "accuracy":
@@ -327,7 +363,7 @@ def mode_settings(campaign_id: str, mode: str) -> dict[str, Any]:
             for item in objective["objectives"]
         ],
         "selection_mode": mode,
-        "accuracy_metric": "mIoU",
+        "accuracy_metric": "PQ",
         "latency_metric": "latency_ms",
         "objective_acquisition": {
             "calibration_points": FROZEN_CALIBRATION_POINTS_PER_ARM,
@@ -441,6 +477,7 @@ def profile_overrides(dataset_root: str) -> dict[str, Any]:
             "checkpoint": "",
             "batch_size": 1,
             "iou_per_class": True,
+            "task": "panoptic",
         },
         "inference": {"mode": "panoptic"},
     }
@@ -519,17 +556,22 @@ def build_preregistered_contract(
         "model": "oneformer",
         "network_arch": "oneformer",
         "task": "panoptic_segmentation",
-        "primary_accuracy_metric": "mIoU",
+        "primary_accuracy_metric": "PQ",
         "metric_semantics": {
-            "observed_metric": "semantic_miou_from_panoptic_annotations",
-            "product_panoptic_metric": "PQ",
-            "pq_emitted_by_current_train_evaluate_path": False,
-            "pq_claim_authorized": False,
-            "mislabel_miou_as_pq": False,
+            "observed_metric": "panoptic_quality",
+            "metric_scale": "unit_interval",
+            "source": "native_coco_panoptic_annotations",
+            "pq_emitted_by_overlaid_train_evaluate_path": True,
+            "pq_claim_authorized": True,
+            "semantic_miou_used_as_panoptic_objective": False,
+            "distributed_reduction": (
+                "global_additive_sufficient_statistics_before_metric"
+            ),
         },
         "dataset": dataset_record,
         "runtime": copy.deepcopy(dict(runtime)),
         "sqsh": copy.deepcopy(FROZEN_SQSH),
+        "runtime_overlay": copy.deepcopy(FROZEN_RUNTIME_OVERLAY),
         "schema": schema,
         "ptm_inventory": ptm_inventory,
         "qualification_policy": {
@@ -586,12 +628,12 @@ def build_preregistered_contract(
             },
         },
         "validation_sanity_gate": {
-            "metric": "mIoU",
-            "minimum": FROZEN_VALIDATION_SANITY_MIN_MIOU,
+            "metric": "PQ",
+            "minimum": FROZEN_VALIDATION_SANITY_MIN_PQ,
             "role": "experiment_correctness_gate_not_product_selection",
             "rationale": (
                 "On native 133-category COCO panoptic annotations, a finite "
-                "semantic mIoU below 0.01 requires data, label, transfer-load, "
+                "PQ below 0.01 requires data, label, transfer-load, "
                 "optimization, fidelity, and metric root-cause analysis."
             ),
             "low_finite_metric_automatically_accepted": False,
@@ -632,12 +674,29 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
     observed = value.pop("contract_sha256", None)
     if observed != canonical_sha256(value):
         raise CampaignContractError("campaign contract integrity failed")
+    expected_modes = [
+        {
+            "mode": mode,
+            "observation_namespace": (
+                f"{value.get('campaign_id')}-{mode}-observations"
+            ),
+            "observation_sharing": False,
+            "initial_observation_ids": [],
+            "objective": mode_objective(mode),
+            "settings": mode_settings(str(value.get("campaign_id")), mode),
+        }
+        for mode in MODES
+    ]
     if (
         value.get("model") != "oneformer"
         or value.get("network_arch") != "oneformer"
         or value.get("task") != "panoptic_segmentation"
-        or value.get("primary_accuracy_metric") != "mIoU"
+        or value.get("primary_accuracy_metric") != "PQ"
         or value.get("metric_semantics", {}).get("pq_claim_authorized")
+        is not True
+        or value.get("metric_semantics", {}).get(
+            "semantic_miou_used_as_panoptic_objective"
+        )
         is not False
         or value.get("execution", {}).get("cpu_runs") != 0
         or value.get("execution", {}).get("smoke_runs") != 0
@@ -645,13 +704,17 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
         or value.get("execution", {}).get("container_mode")
         != "pinned_sqsh"
         or value.get("search", {}).get("space") != SEARCH_SPACE
-        or tuple(item.get("mode") for item in value.get("modes", ()))
-        != MODES
+        or value.get("modes") != expected_modes
+        or value.get("validation_sanity_gate", {}).get("metric") != "PQ"
+        or value.get("validation_sanity_gate", {}).get("minimum")
+        != FROZEN_VALIDATION_SANITY_MIN_PQ
     ):
         raise CampaignContractError("campaign execution policy changed")
     validate_dataset_record(value["dataset"])
     if value.get("sqsh") != FROZEN_SQSH:
         raise CampaignContractError("pinned SQSH identity changed")
+    if value.get("runtime_overlay") != FROZEN_RUNTIME_OVERLAY:
+        raise CampaignContractError("pinned OneFormer runtime overlay changed")
     if any(value["agent_intervention_flags"].values()):
         raise CampaignContractError("agent intervention flags must remain false")
     if any(value["selection_isolation_flags"].values()):
@@ -669,11 +732,12 @@ __all__ = [
     "FROZEN_HARDWARE",
     "FROZEN_LATENCY_RETENTION",
     "FROZEN_LATENCY_TOLERANCE_MS",
+    "FROZEN_RUNTIME_OVERLAY",
     "FROZEN_SEARCH_SEED",
     "FROZEN_SLURM_RETRY_CAP",
     "FROZEN_SQSH",
     "FROZEN_TRAINING_EPOCHS",
-    "FROZEN_VALIDATION_SANITY_MIN_MIOU",
+    "FROZEN_VALIDATION_SANITY_MIN_PQ",
     "LATENCY_PROTOCOL",
     "MODES",
     "SEARCH_PARAMETERS",

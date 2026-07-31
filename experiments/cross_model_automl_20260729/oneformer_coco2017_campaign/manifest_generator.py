@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import subprocess
+import tarfile
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +51,11 @@ DEFAULT_PTM_STAGE_MANIFEST = Path(
     "cross_model_automl_20260729/"
     "oneformer_coco2017_ptm_qualification_v1/ptm_stage_manifest.json"
 )
+DEFAULT_RUNTIME_OVERLAY = Path(
+    "/localhome/local-rarunachalam/.tao/artifacts/"
+    "oneformer-runtime-product-fixes-c25a20e0/"
+    "oneformer-runtime-overlay.tar"
+)
 EXPECTED_DATASET_FILE_MANIFEST_SHA256 = (
     "10566a60498de9998154f44a34445a488c9f030e09f2a7346d20a4a1c55f804e"
 )
@@ -70,6 +77,69 @@ EXPECTED_SKILLS_COMMIT = "2e9c1b25f3c7cb1ae444c75652e36c47eace8229"
 
 class ManifestGenerationError(RuntimeError):
     """The campaign cannot be sealed from the supplied artifacts."""
+
+
+def runtime_overlay_record(path: str | Path) -> dict[str, Any]:
+    """Validate the reviewed TAO PyTorch overlay without installing it."""
+    archive = Path(path).resolve()
+    frozen = campaign_contract.FROZEN_RUNTIME_OVERLAY
+    if (
+        not archive.is_file()
+        or archive.stat().st_size != frozen["archive_size_bytes"]
+        or campaign_contract.sha256_file(archive) != frozen["archive_sha256"]
+    ):
+        raise ManifestGenerationError(
+            "reviewed OneFormer runtime-overlay archive is unavailable or changed"
+        )
+    manifest_member = (
+        f"{frozen['archive_root']}/MANIFEST.json"
+    )
+    installer_member = (
+        f"{frozen['archive_root']}/install_overlay.py"
+    )
+    try:
+        with tarfile.open(archive, "r") as bundle:
+            members = {member.name: member for member in bundle.getmembers()}
+            manifest_bytes = bundle.extractfile(members[manifest_member]).read()
+            installer_bytes = bundle.extractfile(members[installer_member]).read()
+            manifest = json.loads(manifest_bytes)
+    except (KeyError, OSError, tarfile.TarError, ValueError) as exc:
+        raise ManifestGenerationError(
+            "reviewed OneFormer runtime-overlay archive is invalid"
+        ) from exc
+    if (
+        hashlib.sha256(manifest_bytes).hexdigest()
+        != frozen["manifest_sha256"]
+        or hashlib.sha256(installer_bytes).hexdigest()
+        != frozen["installer_sha256"]
+        or manifest.get("artifact_type") != frozen["artifact_type"]
+        or manifest.get("scope") != frozen["scope"]
+        or manifest.get("source", {}).get("commit")
+        != frozen["source_commit"]
+        or manifest.get("source", {}).get("base_commit")
+        != frozen["base_commit"]
+        or manifest.get("container", {}).get("sha256")
+        != campaign_contract.FROZEN_SQSH["sha256"]
+        or manifest.get("container", {}).get("site_packages")
+        != frozen["base_site_packages"]
+        or manifest.get("runtime_contract", {}).get(
+            "panoptic_primary_metric"
+        )
+        != "PQ"
+        or len(manifest.get("files", ())) != frozen["file_count"]
+    ):
+        raise ManifestGenerationError(
+            "reviewed OneFormer runtime-overlay manifest changed"
+        )
+    return {
+        "local_archive_path": str(archive),
+        "archive_sha256": frozen["archive_sha256"],
+        "archive_size_bytes": frozen["archive_size_bytes"],
+        "manifest_sha256": frozen["manifest_sha256"],
+        "installer_sha256": frozen["installer_sha256"],
+        "source_commit": frozen["source_commit"],
+        "file_count": frozen["file_count"],
+    }
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -212,6 +282,7 @@ def _runtime(
     skills: Path,
     qualification: Path,
     ptm_stage_manifest: Path,
+    runtime_overlay: Path,
 ) -> dict[str, Any]:
     if (
         not wheel.is_file()
@@ -236,6 +307,7 @@ def _runtime(
         raise ManifestGenerationError(
             "campaign source does not match the wheel's OneFormer registry"
         )
+    overlay = runtime_overlay_record(runtime_overlay)
     return {
         "repository": str(repository.resolve()),
         "source_commit": head,
@@ -255,6 +327,10 @@ def _runtime(
         ),
         "qualification_evidence_path": str(qualification.resolve()),
         "ptm_stage_manifest_path": str(ptm_stage_manifest.resolve()),
+        "runtime_overlay_local_archive_path": overlay[
+            "local_archive_path"
+        ],
+        "runtime_overlay_local_identity": overlay,
         "partition": "polar3",
         "account": "edgeai_tao-ptm_image-foundation-model-clip",
         "base_results_dir": (
@@ -278,6 +354,7 @@ def build_contract(
     stage_manifest: str | Path = DEFAULT_STAGE_MANIFEST,
     qualification: str | Path = DEFAULT_QUALIFICATION,
     ptm_stage_manifest: str | Path = DEFAULT_PTM_STAGE_MANIFEST,
+    runtime_overlay: str | Path = DEFAULT_RUNTIME_OVERLAY,
 ) -> dict[str, Any]:
     repository_path = Path(repository).resolve()
     value = campaign_contract.build_preregistered_contract(
@@ -294,6 +371,7 @@ def build_contract(
             skills=Path(skills).resolve(),
             qualification=Path(qualification),
             ptm_stage_manifest=Path(ptm_stage_manifest),
+            runtime_overlay=Path(runtime_overlay),
         ),
     )
     value.pop("contract_sha256")
@@ -341,6 +419,11 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=DEFAULT_PTM_STAGE_MANIFEST,
     )
+    parser.add_argument(
+        "--runtime-overlay",
+        type=Path,
+        default=DEFAULT_RUNTIME_OVERLAY,
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     contract = build_contract(
@@ -352,6 +435,7 @@ def main(argv: list[str] | None = None) -> int:
         stage_manifest=args.stage_manifest,
         qualification=args.qualification,
         ptm_stage_manifest=args.ptm_stage_manifest,
+        runtime_overlay=args.runtime_overlay,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
@@ -365,10 +449,10 @@ def main(argv: list[str] | None = None) -> int:
                 "contract_sha256": contract["contract_sha256"],
                 "launch_authorized": False,
                 "reason": (
-                    "the pinned SQSH has immutable static runtime blockers; "
-                    "after those are fixed, the automatic trigger also waits "
-                    "for direct full-run PTM qualification and supported "
-                    "registry status"
+                    "the sealed overlay remediates the immutable base-SQSH "
+                    "findings; the automatic trigger waits for the exact "
+                    "overlay on Lustre plus direct full-run PTM qualification "
+                    "and supported registry status"
                 ),
             },
             indent=2,

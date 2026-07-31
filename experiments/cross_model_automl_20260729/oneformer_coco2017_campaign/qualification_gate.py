@@ -14,6 +14,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,9 +28,10 @@ from tao_automl.ptm_registry import canonical_sha256, load_ptm_registry
 
 from .campaign_contract import (
     AGENT_FLAGS,
+    FROZEN_RUNTIME_OVERLAY,
     FROZEN_SQSH,
     FROZEN_TRAINING_EPOCHS,
-    FROZEN_VALIDATION_SANITY_MIN_MIOU,
+    FROZEN_VALIDATION_SANITY_MIN_PQ,
     oneformer_registry_snapshot,
     sha256_file,
 )
@@ -72,8 +74,8 @@ class QualifiedPTM:
     terminal_checkpoint_path: str
     terminal_checkpoint_sha256: str
     terminal_checkpoint_size_bytes: int
-    val_miou: float
-    test_miou: float
+    val_pq: float
+    test_pq: float
     workflow_sha256: str
 
     def to_dict(self) -> dict[str, Any]:
@@ -85,8 +87,8 @@ class QualifiedPTM:
             "terminal_checkpoint_path": self.terminal_checkpoint_path,
             "terminal_checkpoint_sha256": self.terminal_checkpoint_sha256,
             "terminal_checkpoint_size_bytes": self.terminal_checkpoint_size_bytes,
-            "val_miou": self.val_miou,
-            "test_miou": self.test_miou,
+            "val_pq": self.val_pq,
+            "test_pq": self.test_pq,
             "workflow_sha256": self.workflow_sha256,
         }
 
@@ -190,6 +192,58 @@ def _validate_workflow_audit(
     return expected
 
 
+def _validate_overlay_receipt(
+    value: Any,
+    *,
+    checkpoint_id: str,
+    phase: str,
+) -> dict[str, Any]:
+    """Validate the immutable receipt captured by one overlaid model job."""
+    if not isinstance(value, Mapping):
+        raise QualificationGateError(
+            f"{checkpoint_id} {phase} runtime-overlay receipt is unavailable"
+        )
+    receipt = copy.deepcopy(dict(value))
+    path = receipt.get("path")
+    digest = receipt.get("sha256")
+    actions = receipt.get("actions")
+    if (
+        receipt.get("schema_version") != 1
+        or receipt.get("overlay_source_commit")
+        != FROZEN_RUNTIME_OVERLAY["source_commit"]
+        or receipt.get("container_expected_sha256") != FROZEN_SQSH["sha256"]
+        or receipt.get("dry_run") is not False
+        or not isinstance(receipt.get("site_packages"), str)
+        or not receipt["site_packages"].startswith(
+            "/tmp/oneformer-runtime-overlay."
+        )
+        or not receipt["site_packages"].endswith(
+            FROZEN_RUNTIME_OVERLAY["runtime_site_packages_suffix"]
+        )
+        or not isinstance(path, str)
+        or not path.startswith("/lustre/")
+        or not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+        or not isinstance(actions, list)
+        or len(actions) != FROZEN_RUNTIME_OVERLAY["file_count"]
+        or any(
+            not isinstance(item, Mapping)
+            or item.get("action")
+            not in {"replace_base", "already_installed", "install_new"}
+            or not isinstance(item.get("path"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256")))
+            is None
+            for item in actions
+        )
+        or len({item["path"] for item in actions}) != len(actions)
+    ):
+        raise QualificationGateError(
+            f"{checkpoint_id} {phase} runtime-overlay receipt is invalid"
+        )
+    return receipt
+
+
 def _successful_workflow(
     workflow: Mapping[str, Any],
     *,
@@ -234,21 +288,31 @@ def _successful_workflow(
         raise QualificationGateError(
             f"{checkpoint_id} full train/evaluation contract is incomplete"
         )
+    _validate_overlay_receipt(
+        train.get("runtime_overlay_receipt"),
+        checkpoint_id=checkpoint_id,
+        phase="train",
+    )
+    _validate_overlay_receipt(
+        evaluation.get("runtime_overlay_receipt"),
+        checkpoint_id=checkpoint_id,
+        phase="evaluation",
+    )
     checkpoint_path, checkpoint_sha, checkpoint_size = _artifact(
         train.get("terminal_checkpoint"),
         name=f"{checkpoint_id}.terminal_checkpoint",
     )
-    val_miou = _metric(train.get("mIoU"), f"{checkpoint_id}.mIoU")
-    test_miou = _metric(
-        evaluation.get("test_mIoU"),
-        f"{checkpoint_id}.test_mIoU",
+    val_pq = _metric(train.get("PQ"), f"{checkpoint_id}.PQ")
+    test_pq = _metric(
+        evaluation.get("test_PQ"),
+        f"{checkpoint_id}.test_PQ",
     )
     if (
-        val_miou < FROZEN_VALIDATION_SANITY_MIN_MIOU
-        or test_miou < FROZEN_VALIDATION_SANITY_MIN_MIOU
+        val_pq < FROZEN_VALIDATION_SANITY_MIN_PQ
+        or test_pq < FROZEN_VALIDATION_SANITY_MIN_PQ
     ):
         raise QualificationGateError(
-            f"{checkpoint_id} is below the preregistered 0.01 mIoU "
+            f"{checkpoint_id} is below the preregistered 0.01 PQ "
             "experiment sanity gate"
         )
     return QualifiedPTM(
@@ -259,8 +323,8 @@ def _successful_workflow(
         terminal_checkpoint_path=checkpoint_path,
         terminal_checkpoint_sha256=checkpoint_sha,
         terminal_checkpoint_size_bytes=checkpoint_size,
-        val_miou=val_miou,
-        test_miou=test_miou,
+        val_pq=val_pq,
+        test_pq=test_pq,
         workflow_sha256=workflow_sha256,
     )
 
@@ -282,13 +346,17 @@ def audit_qualification(path: str | Path) -> QualificationDecision:
         document.get("schema_version") != 1
         or document.get("model") != "oneformer"
         or document.get("task") != "panoptic_segmentation"
-        or document.get("metric") != "mIoU"
+        or document.get("metric") != "PQ"
         or document.get("metric_semantics")
-        != "semantic_miou_from_native_coco_panoptic_annotations"
-        or document.get("pq_emitted") is not False
-        or document.get("pq_claim_authorized") is not False
+        != "panoptic_quality_from_native_coco_panoptic_annotations"
+        or document.get("pq_emitted") is not True
+        or document.get("pq_claim_authorized") is not True
         or document.get("registry_sha256") != snapshot["registry_sha256"]
         or document.get("sqsh_sha256") != FROZEN_SQSH["sha256"]
+        or document.get("runtime_overlay_sha256")
+        != FROZEN_RUNTIME_OVERLAY["archive_sha256"]
+        or document.get("runtime_overlay_source_commit")
+        != FROZEN_RUNTIME_OVERLAY["source_commit"]
         or document.get("cpu_model_runs") != 0
         or document.get("smoke_model_runs") != 0
         or document.get("mini_step_runs") != 0
@@ -478,8 +546,8 @@ class QualificationLoadEvidence:
                     self._decision.evidence_sha256
                 ),
                 "workflow_sha256": record.workflow_sha256,
-                "qualified_val_miou": record.val_miou,
-                "qualified_test_miou": record.test_miou,
+                "qualified_val_pq": record.val_pq,
+                "qualified_test_pq": record.test_pq,
             },
         )
 

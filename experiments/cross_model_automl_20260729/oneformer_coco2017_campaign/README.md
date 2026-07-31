@@ -7,9 +7,9 @@ no CPU model run, model smoke, mini-step, GPU model run, or SLURM submission.
 
 | Mode | Recommendation target | Final policy |
 | --- | --- | --- |
-| Accuracy | Expected improvement on `mIoU` | Highest valid accuracy |
+| Accuracy | Expected improvement on `PQ` | Highest valid accuracy |
 | Latency | Constrained expected improvement | Raw-minimum-anchored equivalent-fastest cohort at 90% retained accuracy |
-| Multi-objective | ParEGO expected improvement on mIoU and latency | Independent rank-zero augmented-Chebyshev compromise |
+| Multi-objective | ParEGO expected improvement on PQ and latency | Independent rank-zero augmented-Chebyshev compromise |
 
 PTM identity is a hierarchical nonordinal arm. The four official NGC
 checkpoints remain `unverified`; none is manually selected. Each arm must
@@ -18,13 +18,16 @@ A100s, and its exact registry record must then be independently promoted to
 `supported`. Terminal failures remain preserved exclusions. The automatic
 trigger waits until at least one arm satisfies both gates.
 
-The read-only [static SQSH audit](static_sqsh_audit.v1.json) found blockers
-before any model execution: the packaged train entrypoint calls an undefined
-full-checkpoint loader, the implementation does not emit PQ, and the status
-KPI consumed by the campaign is not based on a globally reduced distributed
-confusion statistic. Consequently the four PTMs remain `unverified`, the
-automatic trigger remains closed, and submitting qualification or AutoML jobs
-with this pinned image would be invalid.
+The read-only [static SQSH audit](static_sqsh_audit.v1.json) records three
+defects in the immutable base image: no full-checkpoint loader, no panoptic PQ
+endpoint, and no globally reduced status metric. Those findings are preserved
+unchanged. The campaign remediates them with the reviewed TAO PyTorch source
+overlay at commit `c25a20e0d6e2cf98ccb80c16eb0d4d30bb40f600`, archive SHA-256
+`6b976090fb264b319ba23e7092445f261fd1b445964400d3f879c2746247a4f3`.
+Every training, standalone-evaluation, and latency command verifies and
+installs that overlay before importing TAO PyTorch, and persists an installer
+receipt. A missing, changed, or inapplicable overlay leaves the automatic
+trigger closed.
 
 All campaign children use the pinned TAO 7.1 SQSH, one node/eight A100s, and
 the native 133-category panoptic label map. Candidate zero runs independently
@@ -32,17 +35,15 @@ in all three modes. Only after all three first candidates pass training,
 standalone validation, stabilized latency, recommendation-audit, and provenance
 gates does the controller automatically release the remaining budget.
 
-## Metric boundary
+## Metric contract
 
-The current OneFormer train/evaluate implementation emits semantic `mIoU` from
-native panoptic annotations. It does not emit Panoptic Quality (PQ). This
-campaign records that exact metric and never relabels it as PQ. Consequently:
-
-- it can validate objective-aware search and latency tradeoffs for the emitted
-  OneFormer semantic-quality endpoint;
-- it cannot establish the product claim that OneFormer panoptic PQ is
-  optimized;
-- a task-correct PQ path remains a separate implementation blocker.
+The campaign sets `evaluate.task: panoptic` in both training and standalone
+evaluation specs. Its canonical objective is unit-scale `PQ`; standalone
+evaluation accepts `test_PQ` (or the unprefixed `PQ` status key) and records it
+as `PQ` for AutoML. It never substitutes semantic mIoU. The overlay computes
+COCO-style PQ from native panoptic IDs and globally sums additive sufficient
+statistics before deriving PQ/SQ/RQ, so every rank observes the same metric
+and only global rank zero writes status.
 
 ## Frozen data and runtime
 
@@ -65,12 +66,13 @@ part of the measured inference graph input contract.
 
 ## Seal and launch later
 
-After the static SQSH blockers are fixed, direct full-run qualification
-evidence exists, and registry support is reviewed:
+After the exact overlay is staged at its preregistered Lustre path, direct
+full-run PQ qualification evidence exists, and registry support is reviewed:
 
 ```bash
 cd /localhome/local-rarunachalam/tao-automl
 python -m experiments.cross_model_automl_20260729.oneformer_coco2017_campaign.manifest_generator \
+  --runtime-overlay /localhome/local-rarunachalam/.tao/artifacts/oneformer-runtime-product-fixes-c25a20e0/oneformer-runtime-overlay.tar \
   --output /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/oneformer_coco2017_three_mode/campaign.v1.json
 
 python -m experiments.cross_model_automl_20260729.oneformer_coco2017_campaign.run_campaign \
@@ -81,4 +83,5 @@ python -m experiments.cross_model_automl_20260729.oneformer_coco2017_campaign.ru
 ```
 
 No post-gate confirmation is required. The automatic trigger itself performs
-the transition once immutable prerequisites pass.
+the transition once immutable prerequisites pass. This preparation path does
+not run a CPU model, model smoke, mini-step, GPU model, or SLURM job.
