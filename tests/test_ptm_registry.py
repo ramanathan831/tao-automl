@@ -992,7 +992,7 @@ def test_cross_model_repository_sidecars_match_registered_path_free_overrides():
         for record in config["checkpoints"]
         if "checkpoint_spec_file" in record
     ]
-    assert len(records) == 13
+    assert len(records) == 17
     for record in records:
         sidecar = record["checkpoint_spec_file"]
         verification = verify_packaged_resource_sha256(
