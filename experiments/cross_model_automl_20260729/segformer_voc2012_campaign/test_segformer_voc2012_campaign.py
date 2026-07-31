@@ -2,15 +2,23 @@ from __future__ import annotations
 
 import ast
 import copy
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from tao_automl.ptm_registry import canonical_sha256, load_ptm_registry
 
-from . import campaign_contract, manifest_generator, run_campaign
+from . import (
+    campaign_contract,
+    manifest_generator,
+    qualification_campaign,
+    qualification_gate,
+    run_campaign,
+)
 from .qualification_gate import (
     QualificationGateError,
     QualificationLoadEvidence,
@@ -59,12 +67,12 @@ def _runtime(tmp_path: Path) -> dict:
             tmp_path / "qualification.json"
         ),
         "ptm_stage_manifest_path": str(tmp_path / "ptms.json"),
-        "partition": "polar3",
+        "partition": campaign_contract.FROZEN_SLURM_PARTITION,
         "account": "edgeai_tao-ptm_image-foundation-model-clip",
         "base_results_dir": "/lustre/fsw/portfolios/edgeai/users/rarunachalam",
         "container_mounts": "/lustre",
-        "time_hours": 8.0,
-        "timeout_hours": 7.8,
+        "time_hours": campaign_contract.FROZEN_SLURM_TIME_HOURS,
+        "timeout_hours": campaign_contract.FROZEN_SLURM_TIMEOUT_HOURS,
         "max_job_retries": 10,
         "hardware_contract": copy.deepcopy(
             campaign_contract.FROZEN_HARDWARE
@@ -87,6 +95,9 @@ def contract(tmp_path: Path) -> dict:
         ),
         "qualification_gate_sha256": campaign_contract.sha256_file(
             HERE / "qualification_gate.py"
+        ),
+        "qualification_campaign_sha256": campaign_contract.sha256_file(
+            HERE / "qualification_campaign.py"
         ),
         "run_campaign_sha256": campaign_contract.sha256_file(
             HERE / "run_campaign.py"
@@ -181,6 +192,171 @@ def _qualification_document(success_id: str | None = None) -> dict:
         "workflows": workflows,
     }
     value["evidence_sha256"] = canonical_sha256(value)
+    return value
+
+
+def _fake_qualification_stage(contract: dict) -> dict:
+    rows = []
+    registry = load_ptm_registry()
+    for record_summary in campaign_contract.segformer_registry_snapshot()[
+        "records"
+    ]:
+        record = registry.checkpoint(record_summary["id"])
+        checkpoint_path = (
+            "/lustre/segformer-qualification/ptms/"
+            f"{record['id']}/{record['source']['member']}"
+        )
+        specifications = qualification_campaign.qualification_specs(
+            contract,
+            record,
+            checkpoint_path,
+        )
+        specs = {}
+        for action, document in specifications.items():
+            content = yaml.safe_dump(document, sort_keys=True).encode()
+            digest = hashlib.sha256(content).hexdigest()
+            specs[action] = {
+                "action": action,
+                "document": document,
+                "document_sha256": canonical_sha256(document),
+                "raw_yaml_sha256": digest,
+                "size_bytes": len(content),
+                "base_template": {
+                    "path": str(
+                        SKILL_DIR
+                        / "references"
+                        / f"spec_template_{action}.yaml"
+                    ),
+                    "sha256": campaign_contract.sha256_file(
+                        SKILL_DIR
+                        / "references"
+                        / f"spec_template_{action}.yaml"
+                    ),
+                },
+                "local_path": f"/tmp/{record['id']}-{action}.yaml",
+                "lustre": {
+                    "path": (
+                        "/lustre/segformer-qualification/specs/"
+                        f"{record['id']}/{action}.yaml"
+                    ),
+                    "size_bytes": len(content),
+                    "sha256": digest,
+                    "mode": "444",
+                    "cache_hit": False,
+                },
+            }
+        observed_sha = hashlib.sha256(record["id"].encode()).hexdigest()
+        rows.append(
+            {
+                "checkpoint_id": record["id"],
+                "workflow_id": qualification_campaign._workflow_id(
+                    record["id"]
+                ),
+                "registry_status_at_stage": record["status"],
+                "registry_record_sha256": canonical_sha256(record),
+                "registry_core_identity": (
+                    qualification_campaign.registry_core_identity(record)
+                ),
+                "registry_core_identity_sha256": canonical_sha256(
+                    qualification_campaign.registry_core_identity(record)
+                ),
+                "source": copy.deepcopy(record["source"]),
+                "checkpoint_target": record["checkpoint_target"],
+                "backbone": record["backbone"],
+                "expected_size_bytes": record["expected_size_bytes"],
+                "registered_sha256": record.get("sha256"),
+                "observed_sha256": observed_sha,
+                "verification_mode": (
+                    "immutable_identity_observed_sha256"
+                ),
+                "source_identity_sha256": canonical_sha256(
+                    record["source"]
+                ),
+                "access_probe": {
+                    "ok": True,
+                    "code": "accessible",
+                    "remote_size_bytes": record[
+                        "expected_size_bytes"
+                    ],
+                },
+                "checkpoint_specific_source_spec": {
+                    "available": False,
+                    "registry_field_present": (
+                        "checkpoint_spec_file" in record
+                    ),
+                    "reason": (
+                        "The official SegFormer registry record publishes no "
+                        "checkpoint-specific YAML; the staged specs are "
+                        "generated from the sealed TAO templates, frozen VOC "
+                        "profile, and exact registry checkpoint target."
+                    ),
+                },
+                "checkpoint": {
+                    "path": checkpoint_path,
+                    "size_bytes": record["expected_size_bytes"],
+                    "sha256": observed_sha,
+                    "mode": "444",
+                    "cache_hit": False,
+                },
+                "specs": specs,
+            }
+        )
+    value = {
+        "schema_version": 1,
+        "campaign_id": qualification_campaign.QUALIFICATION_CAMPAIGN_ID,
+        "automl_contract_sha256": contract["contract_sha256"],
+        "created_at_utc": "2026-07-31T00:00:00Z",
+        "model": "segformer",
+        "task": "semantic_segmentation",
+        "registry_sha256": contract["ptm_inventory"]["registry_sha256"],
+        "registry_version": contract["ptm_inventory"]["registry_version"],
+        "source_policy": (
+            "all_13_official_registry_arms_without_manual_exclusion"
+        ),
+        "dataset": {
+            "prepared_root": contract["dataset"]["prepared_root"],
+            "content_sha256": contract["dataset"]["content_sha256"],
+            "stage_manifest_sha256": contract["dataset"][
+                "stage_manifest_sha256"
+            ],
+            "train_pairs": 1464,
+            "validation_pairs": 1449,
+        },
+        "runtime": {
+            "sqsh_path": contract["sqsh"]["path"],
+            "sqsh_sha256": contract["sqsh"]["sha256"],
+            "sdk_commit": contract["runtime"]["sdk_commit"],
+            "skills_commit": contract["runtime"]["skills_commit"],
+            "source_commit": contract["runtime"]["source_commit"],
+            "partition": contract["runtime"]["partition"],
+            "time_hours": contract["runtime"]["time_hours"],
+            "timeout_hours": contract["runtime"]["timeout_hours"],
+            "nodes_per_workflow": 1,
+            "gpus_per_workflow": 8,
+            "required_gpu": copy.deepcopy(
+                campaign_contract.FROZEN_HARDWARE
+            ),
+        },
+        "ptms": rows,
+        "execution": {
+            "operation": (
+                "data_only_download_checksum_spec_generation_and_"
+                "lustre_publication"
+            ),
+            "cpu_model_runs": 0,
+            "gpu_model_runs": 0,
+            "smoke_model_runs": 0,
+            "mini_step_runs": 0,
+            "checkpoint_loads": 0,
+            "scheduler_jobs_submitted": 0,
+            "fallback_ptms_used": 0,
+            "manually_excluded_ptms": 0,
+        },
+        "agent_intervention_flags": {
+            name: False for name in campaign_contract.AGENT_FLAGS
+        },
+    }
+    value["stage_manifest_sha256"] = canonical_sha256(value)
     return value
 
 
@@ -567,3 +743,403 @@ def test_contract_integrity_rejects_mutation(contract):
     changed["execution"]["gpus_per_child"] = 1
     with pytest.raises(campaign_contract.CampaignContractError):
         campaign_contract.validate_contract(changed)
+
+
+def test_qualification_plan_contains_every_official_arm_without_fallback(
+    contract,
+):
+    plan = qualification_campaign.qualification_plan(contract)
+    assert plan["workflow_count"] == 13
+    assert plan["checkpoint_ids"] == [
+        item["id"]
+        for item in campaign_contract.segformer_registry_snapshot()[
+            "records"
+        ]
+    ]
+    assert plan["all_workflows_independent"] is True
+    assert plan[
+        "all_workflows_submitted_without_result_driven_exclusion"
+    ] is True
+    assert plan["terminal_failures_preserved"] is True
+    assert plan["replacement_workflows_submitted"] is False
+    assert plan["resources_per_job"] == {
+        "nodes": 1,
+        "gpus": 8,
+        "gpu": "NVIDIA A100-SXM4-80GB",
+        "partition": "polar3",
+        "time_hours": 4.0,
+        "container": campaign_contract.FROZEN_SQSH["path"],
+    }
+    assert plan["cpu_model_runs"] == 0
+    assert plan["smoke_model_runs"] == 0
+    assert plan["mini_step_runs"] == 0
+
+
+def test_qualification_specs_bind_only_the_registered_checkpoint_target(
+    contract,
+):
+    stage = qualification_campaign.validate_stage_manifest(
+        _fake_qualification_stage(contract),
+        contract=contract,
+    )
+    target_counts = {
+        "train.pretrained_model_path": 0,
+        "model.backbone.pretrained_backbone_path": 0,
+    }
+    for row in stage["ptms"]:
+        target_counts[row["checkpoint_target"]] += 1
+        checkpoint = row["checkpoint"]["path"]
+        train = row["specs"]["train"]["document"]
+        train_ptm = train["train"]["pretrained_model_path"]
+        backbone_ptm = train["model"]["backbone"][
+            "pretrained_backbone_path"
+        ]
+        if row["checkpoint_target"] == "train.pretrained_model_path":
+            assert train_ptm == checkpoint
+            assert backbone_ptm == ""
+        else:
+            assert train_ptm == ""
+            assert backbone_ptm == checkpoint
+        assert train["train"]["num_epochs"] == 10
+        assert train["train"]["validation_interval"] == 1
+        assert train["train"]["num_gpus"] == 8
+        assert train["dataset"]["segment"]["root_dir"] == (
+            contract["dataset"]["prepared_root"]
+        )
+        assert row["specs"]["evaluate"]["document"]["evaluate"][
+            "checkpoint"
+        ] == qualification_campaign.EVALUATION_CHECKPOINT_SENTINEL
+    assert target_counts == {
+        "train.pretrained_model_path": 4,
+        "model.backbone.pretrained_backbone_path": 9,
+    }
+
+
+def test_ptm_stage_manifest_rejects_missing_or_writable_inputs(contract):
+    stage = _fake_qualification_stage(contract)
+    qualification_campaign.validate_stage_manifest(stage, contract=contract)
+
+    missing = copy.deepcopy(stage)
+    missing["ptms"].pop()
+    missing["stage_manifest_sha256"] = canonical_sha256(
+        {
+            key: value
+            for key, value in missing.items()
+            if key != "stage_manifest_sha256"
+        }
+    )
+    with pytest.raises(
+        qualification_campaign.CampaignExecutionError,
+        match="campaign contract changed",
+    ):
+        qualification_campaign.validate_stage_manifest(
+            missing,
+            contract=contract,
+        )
+
+    writable = copy.deepcopy(stage)
+    writable["ptms"][0]["checkpoint"]["mode"] = "644"
+    writable["stage_manifest_sha256"] = canonical_sha256(
+        {
+            key: value
+            for key, value in writable.items()
+            if key != "stage_manifest_sha256"
+        }
+    )
+    with pytest.raises(
+        qualification_campaign.CampaignExecutionError,
+        match="checkpoint identity differs",
+    ):
+        qualification_campaign.validate_stage_manifest(
+            writable,
+            contract=contract,
+        )
+
+
+def test_completion_exactly_round_trips_through_qualification_gate(
+    contract,
+    tmp_path: Path,
+):
+    stage = _fake_qualification_stage(contract)
+    Path(
+        contract["qualification_policy"]["ptm_stage_manifest_path"]
+    ).write_text(json.dumps(stage), encoding="utf-8")
+    success_id = stage["ptms"][0]["checkpoint_id"]
+    for row in stage["ptms"]:
+        path = (
+            tmp_path
+            / "workflows"
+            / row["workflow_id"]
+            / "workflow_completion.json"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        workflow = _workflow(
+            row["checkpoint_id"],
+            success=row["checkpoint_id"] == success_id,
+        )
+        workflow["source_checkpoint"] = copy.deepcopy(
+            row["checkpoint"]
+        )
+        workflow["workflow_sha256"] = canonical_sha256(
+            {
+                key: value
+                for key, value in workflow.items()
+                if key != "workflow_sha256"
+            }
+        )
+        path.write_text(json.dumps(workflow), encoding="utf-8")
+    completion = qualification_campaign.build_completion(
+        contract=contract,
+        stage=stage,
+        runtime_root=tmp_path,
+        exit_codes={
+            row["checkpoint_id"]: 0 for row in stage["ptms"]
+        },
+    )
+    output = tmp_path / "qualification.json"
+    output.write_text(json.dumps(completion), encoding="utf-8")
+    decision = audit_qualification(output)
+    assert completion["all_official_arms_attempted"] is True
+    assert len(completion["workflows"]) == 13
+    assert all(
+        item["terminal"] is True for item in completion["workflows"]
+    )
+    assert not any(
+        item["code"] == "invalid_success_evidence"
+        for item in decision.blockers
+    )
+    if load_ptm_registry().checkpoint(success_id)["status"] == "unverified":
+        assert any(
+            item["checkpoint_id"] == success_id
+            and item["code"] == "registry_not_supported"
+            for item in decision.blockers
+        )
+    assert len(decision.exclusions) == 12
+
+
+def test_qualification_handoff_is_automatic_but_never_promotes_registry(
+    contract,
+    tmp_path: Path,
+):
+    stage = _fake_qualification_stage(contract)
+    Path(
+        contract["qualification_policy"]["ptm_stage_manifest_path"]
+    ).write_text(json.dumps(stage), encoding="utf-8")
+    for row in stage["ptms"]:
+        path = (
+            tmp_path
+            / "workflows"
+            / row["workflow_id"]
+            / "workflow_completion.json"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        workflow = _workflow(row["checkpoint_id"], success=False)
+        workflow["source_checkpoint"] = copy.deepcopy(
+            row["checkpoint"]
+        )
+        workflow["workflow_sha256"] = canonical_sha256(
+            {
+                key: value
+                for key, value in workflow.items()
+                if key != "workflow_sha256"
+            }
+        )
+        path.write_text(json.dumps(workflow), encoding="utf-8")
+    completion = qualification_campaign.build_completion(
+        contract=contract,
+        stage=stage,
+        runtime_root=tmp_path,
+        exit_codes={
+            row["checkpoint_id"]: 1 for row in stage["ptms"]
+        },
+    )
+    qualification_path = tmp_path / "qualification.json"
+    qualification_path.write_text(
+        json.dumps(completion),
+        encoding="utf-8",
+    )
+    handoff = qualification_campaign.build_handoff(
+        contract=contract,
+        completion=completion,
+        qualification_path=qualification_path,
+    )
+    assert handoff["automatic"] is True
+    assert handoff["manual_confirmation_required"] is False
+    assert handoff["registry_mutated"] is False
+    assert handoff["registry_bypass_allowed"] is False
+    assert handoff["fallback_ptm_selected"] is False
+    assert handoff["failed_workflow_replaced"] is False
+    assert handoff["status"] == "terminal_no_successful_ptm"
+
+
+def test_independent_status_promotion_preserves_pre_promotion_evidence(
+    contract,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    stage = _fake_qualification_stage(contract)
+    Path(
+        contract["qualification_policy"]["ptm_stage_manifest_path"]
+    ).write_text(json.dumps(stage), encoding="utf-8")
+    success_id = stage["ptms"][0]["checkpoint_id"]
+    for row in stage["ptms"]:
+        path = (
+            tmp_path
+            / "workflows"
+            / row["workflow_id"]
+            / "workflow_completion.json"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        workflow = _workflow(
+            row["checkpoint_id"],
+            success=row["checkpoint_id"] == success_id,
+        )
+        workflow["source_checkpoint"] = copy.deepcopy(
+            row["checkpoint"]
+        )
+        workflow["workflow_sha256"] = canonical_sha256(
+            {
+                key: value
+                for key, value in workflow.items()
+                if key != "workflow_sha256"
+            }
+        )
+        path.write_text(json.dumps(workflow), encoding="utf-8")
+    completion = qualification_campaign.build_completion(
+        contract=contract,
+        stage=stage,
+        runtime_root=tmp_path,
+        exit_codes={
+            row["checkpoint_id"]: 0 for row in stage["ptms"]
+        },
+    )
+    output = tmp_path / "qualification.json"
+    output.write_text(json.dumps(completion), encoding="utf-8")
+
+    promoted_document = load_ptm_registry().to_dict()
+    for record in promoted_document["models"]["segformer"][
+        "checkpoints"
+    ]:
+        if record["id"] == success_id:
+            record["status"] = "supported"
+            record["status_reason"] = "independent full-run review passed"
+            record["sha256"] = stage["ptms"][0]["checkpoint"]["sha256"]
+            record["compatible_tao_versions"] = ["==7.1.0"]
+            record["validation"] = {
+                "status": "validated",
+                "tao_version": "7.1.0-rc-245",
+                "evidence": str(output),
+            }
+
+    class PromotedRegistry:
+        registry_version = "test-promoted"
+        document_sha256 = canonical_sha256(promoted_document)
+
+        def to_dict(self):
+            return copy.deepcopy(promoted_document)
+
+        def checkpoint(self, checkpoint_id):
+            for model in promoted_document["models"].values():
+                for record in model["checkpoints"]:
+                    if record["id"] == checkpoint_id:
+                        return copy.deepcopy(record)
+            raise KeyError(checkpoint_id)
+
+    promoted = PromotedRegistry()
+    monkeypatch.setattr(
+        qualification_gate,
+        "load_ptm_registry",
+        lambda: promoted,
+    )
+    monkeypatch.setattr(
+        campaign_contract,
+        "load_ptm_registry",
+        lambda: promoted,
+    )
+    decision = qualification_gate.audit_qualification(output)
+    assert decision.checkpoint_ids == (success_id,)
+    assert decision.blockers == ()
+    assert len(decision.exclusions) == 12
+
+
+def test_direct_qualification_submission_is_pinned_one_node_eight_gpu(
+    contract,
+):
+    calls = []
+
+    class FakeSDK:
+        def create_job(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(id="job")
+
+    qualification_campaign._submit_job(FakeSDK(), contract, "command")
+    assert calls == [
+        {
+            "image": campaign_contract.FROZEN_SQSH["path"],
+            "command": "command",
+            "gpu_count": 8,
+            "num_nodes": 1,
+            "partition": "polar3",
+            "account": "edgeai_tao-ptm_image-foundation-model-clip",
+        }
+    ]
+    guard = qualification_campaign._gpu_guard(
+        "segformer train -e {config_path}"
+    )
+    assert "NVIDIA A100-SXM4-80GB" in guard
+    assert "wc -l)\" -eq 8" in guard
+    assert "segformer train -e {config_path}" in guard
+
+
+def test_qualification_slurm_preflight_is_read_only_and_job_free(
+    contract,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    configured = []
+    commands = []
+    monkeypatch.setattr(
+        run_campaign,
+        "configure_slurm_runtime",
+        lambda value: configured.append(value["contract_sha256"]),
+    )
+
+    def fake_remote_output(command, **_kwargs):
+        commands.append(command)
+        return "READY\n"
+
+    monkeypatch.setattr(
+        qualification_campaign,
+        "remote_output",
+        fake_remote_output,
+    )
+    evidence = qualification_campaign.verify_slurm_preflight(contract)
+    assert configured == [contract["contract_sha256"]]
+    assert len(commands) == 1
+    assert "sbatch squeue sacct srun" in commands[0]
+    assert "MaxTime=04:00:00" in commands[0]
+    assert campaign_contract.FROZEN_SQSH["path"] in commands[0]
+    assert evidence["status"] == "ready"
+    assert evidence["partition"] == "polar3"
+    assert evidence["scheduler_jobs_submitted"] == 0
+    assert evidence["sdk_source"].startswith(
+        contract["runtime"]["sdk_dir"]
+    )
+
+
+def test_qualification_controller_has_no_local_model_or_smoke_path():
+    source = (HERE / "qualification_campaign.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+    imported = {
+        alias.name
+        for node in tree.body
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    assert "torch" not in imported
+    assert "nvidia_tao_pytorch" not in imported
+    assert "torch.load" not in source
+    assert "load_smoke" not in source
+    assert "mini_step" in source
+    assert "scheduler_jobs_submitted\": 0" in source

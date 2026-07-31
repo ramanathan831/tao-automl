@@ -34,6 +34,31 @@ failures remain exclusions. The runtime never mutates or bypasses the registry.
 Consequently, the automatic trigger waits rather than launching an unsupported
 PTM. This is the current intentional blocker, not an agent-selected PTM.
 
+`qualification_campaign.py` implements that missing qualification step. Its
+data-only stage resolves all 13 exact NGC members, verifies their immutable
+identities and registered sizes, generates the checkpoint-target-specific train
+and evaluation YAMLs from the packaged SegFormer templates, checksums them, and
+publishes every checkpoint and spec read-only on Lustre. It does not import a
+model framework, load a checkpoint, or construct a scheduler job.
+
+The launch phase re-hashes the complete stage and submits exactly 13 independent
+workflows. Each workflow runs full VOC2012 training for ten epochs with
+validation every epoch, resolves its exact terminal checkpoint, and then runs
+standalone evaluation over the complete validation split. Each train and
+evaluation job uses one node, eight `NVIDIA A100-SXM4-80GB` GPUs, and the pinned
+SQSH. `polar3` is capped at four hours, so the controller freezes the
+skill-compliant `4.0`-hour scheduler limit and `3.8`-hour SDK timeout.
+
+All arms are attempted. A failed arm is retained as a terminal structured
+failure; it is never replaced with a fallback checkpoint. Completion
+automatically writes both the exact `qualification_gate.py` input and an
+independent-registry-review handoff. The controller does not promote registry
+records itself. The gate binds the pre-promotion stage to immutable PTM source,
+size, architecture, backbone, task, target field, and observed checkpoint
+checksum, while reading eligibility from the independently promoted current
+registry. Thus a status/validation promotion cannot invalidate genuine
+qualification evidence or silently change the qualified checkpoint bytes.
+
 ## Frozen data
 
 The prepared root is:
@@ -52,14 +77,44 @@ files.
 
 ## Reproduction
 
-After the dataset is read-only, direct-full-run PTM qualification is complete,
-and supported registry changes have been independently reviewed:
+First seal the clean integrated source into an external campaign contract:
 
 ```bash
 cd /localhome/local-rarunachalam/tao-automl
+PYTHONPATH="$PWD/src" \
 python -m experiments.cross_model_automl_20260729.segformer_voc2012_campaign.manifest_generator \
   --output /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/segformer_voc2012_three_mode/campaign.v1.json
+```
 
+Stage and independently verify all PTM/spec inputs without reserving GPUs:
+
+```bash
+PYTHONPATH="$PWD/src" \
+python -m experiments.cross_model_automl_20260729.segformer_voc2012_campaign.qualification_campaign \
+  --stage
+
+PYTHONPATH="$PWD/src" \
+python -m experiments.cross_model_automl_20260729.segformer_voc2012_campaign.qualification_campaign \
+  --check-stage
+```
+
+The following explicit command is the only qualification path that submits
+jobs. It starts all 13 independent direct-full-run workflows; no smoke or
+mini-step precedes them:
+
+```bash
+PYTHONPATH="$PWD/src" \
+python -m experiments.cross_model_automl_20260729.segformer_voc2012_campaign.qualification_campaign \
+  --launch
+```
+
+After successful records have been independently reviewed and promoted in the
+repository registry, rebuild the production wheel and reseal the campaign
+contract against that clean commit. Then start the automatic three-mode
+trigger:
+
+```bash
+PYTHONPATH="$PWD/src" \
 python -m experiments.cross_model_automl_20260729.segformer_voc2012_campaign.run_campaign \
   --contract /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/segformer_voc2012_three_mode/campaign.v1.json \
   --automatic-trigger \

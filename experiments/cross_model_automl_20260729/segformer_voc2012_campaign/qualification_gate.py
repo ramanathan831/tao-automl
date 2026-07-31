@@ -63,6 +63,153 @@ def _metric(value: Any, name: str) -> float:
     return number
 
 
+def _registry_core_identity(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    keys = (
+        "id",
+        "source",
+        "expected_size_bytes",
+        "model_family",
+        "architecture",
+        "backbone",
+        "checkpoint_target",
+        "input_contract",
+        "task_compatibility",
+    )
+    try:
+        return {
+            key: copy.deepcopy(record[key])
+            for key in keys
+        }
+    except KeyError as exc:
+        raise QualificationGateError(
+            "current SegFormer registry lacks immutable PTM identity"
+        ) from exc
+
+
+def _stage_evidence(
+    document: Mapping[str, Any],
+    *,
+    current_registry: Any,
+    current_registry_sha256: str,
+) -> dict[str, Mapping[str, Any]]:
+    """Bind pre-promotion evidence to post-promotion immutable identity."""
+    stage_path_value = document.get("ptm_stage_manifest_path")
+    stage_sha = document.get("ptm_stage_manifest_sha256")
+    if stage_path_value is None and stage_sha is None:
+        # Compatibility for pre-controller synthetic evidence. Production
+        # controller evidence always takes the stronger cross-promotion path.
+        if document.get("registry_sha256") != current_registry_sha256:
+            raise QualificationGateError(
+                "qualification registry identity changed"
+            )
+        return {}
+    if (
+        not isinstance(stage_path_value, str)
+        or not Path(stage_path_value).is_absolute()
+        or not isinstance(stage_sha, str)
+    ):
+        raise QualificationGateError(
+            "qualification PTM stage identity is incomplete"
+        )
+    _sha(stage_sha, "ptm_stage_manifest_sha256")
+    stage_path = Path(stage_path_value).resolve()
+    if not stage_path.is_file():
+        raise QualificationGateError(
+            "qualification PTM stage manifest is unavailable"
+        )
+    try:
+        stage = json.loads(stage_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise QualificationGateError(
+            "qualification PTM stage manifest is invalid"
+        ) from exc
+    payload = copy.deepcopy(stage)
+    supplied = payload.pop("stage_manifest_sha256", None)
+    if supplied != stage_sha or supplied != canonical_sha256(payload):
+        raise QualificationGateError(
+            "qualification PTM stage manifest integrity failed"
+        )
+    rows = stage.get("ptms")
+    if (
+        stage.get("model") != "segformer"
+        or stage.get("task") != "semantic_segmentation"
+        or stage.get("registry_sha256")
+        != document.get("registry_sha256")
+        or not isinstance(rows, list)
+    ):
+        raise QualificationGateError(
+            "qualification PTM stage contract changed"
+        )
+    by_id = {
+        item.get("checkpoint_id"): item
+        for item in rows
+        if isinstance(item, Mapping)
+    }
+    current_ids = tuple(
+        item["id"] for item in segformer_registry_snapshot()["records"]
+    )
+    if set(by_id) != set(current_ids) or len(rows) != len(current_ids):
+        raise QualificationGateError(
+            "qualification PTM stage must contain every official arm"
+        )
+    for checkpoint_id in current_ids:
+        row = by_id[checkpoint_id]
+        current = current_registry.checkpoint(checkpoint_id)
+        core = row.get("registry_core_identity")
+        if (
+            core != _registry_core_identity(current)
+            or row.get("registry_core_identity_sha256")
+            != canonical_sha256(core)
+        ):
+            raise QualificationGateError(
+                f"{checkpoint_id} immutable registry identity changed "
+                "during independent promotion"
+            )
+        checkpoint = row.get("checkpoint")
+        if (
+            not isinstance(checkpoint, Mapping)
+            or checkpoint.get("size_bytes")
+            != current["expected_size_bytes"]
+            or _sha(
+                checkpoint.get("sha256"),
+                f"{checkpoint_id}.staged_checkpoint.sha256",
+            )
+            != checkpoint.get("sha256")
+            or not isinstance(checkpoint.get("path"), str)
+            or not checkpoint["path"].startswith("/lustre/")
+        ):
+            raise QualificationGateError(
+                f"{checkpoint_id} staged checkpoint identity is invalid"
+            )
+        registered_sha = current.get("sha256")
+        if (
+            registered_sha is not None
+            and registered_sha.lower() != checkpoint["sha256"]
+        ):
+            raise QualificationGateError(
+                f"{checkpoint_id} promoted checksum differs from "
+                "qualification bytes"
+            )
+    return by_id
+
+
+def _workflow_integrity(
+    workflow: Mapping[str, Any],
+    *,
+    checkpoint_id: str,
+) -> str:
+    payload = copy.deepcopy(dict(workflow))
+    supplied = payload.pop("workflow_sha256", None)
+    expected = canonical_sha256(payload)
+    if supplied != expected:
+        raise QualificationGateError(
+            f"{checkpoint_id} workflow integrity failed"
+        )
+    return expected
+
+
 @dataclass(frozen=True)
 class QualifiedPTM:
     checkpoint_id: str
@@ -195,6 +342,15 @@ def _successful_workflow(
         name=f"{checkpoint_id}.source_checkpoint",
         expected_size=int(registry_record["expected_size_bytes"]),
     )
+    registered_sha = registry_record.get("sha256")
+    if (
+        registered_sha is not None
+        and source_sha != str(registered_sha).lower()
+    ):
+        raise QualificationGateError(
+            f"{checkpoint_id} source checkpoint differs from the "
+            "promoted registry checksum"
+        )
     train = workflow.get("train")
     evaluation = workflow.get("evaluation")
     if (
@@ -232,13 +388,10 @@ def _successful_workflow(
             f"{checkpoint_id} is below the preregistered 0.10 mIoU "
             "experiment sanity gate"
         )
-    payload = copy.deepcopy(dict(workflow))
-    supplied = payload.pop("workflow_sha256", None)
-    expected = canonical_sha256(payload)
-    if supplied != expected:
-        raise QualificationGateError(
-            f"{checkpoint_id} workflow integrity failed"
-        )
+    expected = _workflow_integrity(
+        workflow,
+        checkpoint_id=checkpoint_id,
+    )
     return QualifiedPTM(
         checkpoint_id=checkpoint_id,
         source_checkpoint_path=source_path,
@@ -266,11 +419,11 @@ def audit_qualification(path: str | Path) -> QualificationDecision:
     if supplied_sha != canonical_sha256(payload):
         raise QualificationGateError("qualification evidence integrity failed")
     snapshot = segformer_registry_snapshot()
+    registry = load_ptm_registry()
     if (
         document.get("schema_version") != 1
         or document.get("model") != "segformer"
         or document.get("task") != "semantic_segmentation"
-        or document.get("registry_sha256") != snapshot["registry_sha256"]
         or document.get("sqsh_sha256") != FROZEN_SQSH["sha256"]
         or document.get("cpu_model_runs") != 0
         or document.get("smoke_model_runs") != 0
@@ -279,6 +432,12 @@ def audit_qualification(path: str | Path) -> QualificationDecision:
         raise QualificationGateError(
             "qualification campaign identity or execution policy changed"
         )
+    _sha(document.get("registry_sha256"), "registry_sha256")
+    stage_by_id = _stage_evidence(
+        document,
+        current_registry=registry,
+        current_registry_sha256=snapshot["registry_sha256"],
+    )
     workflows = document.get("workflows")
     if not isinstance(workflows, list):
         raise QualificationGateError("qualification workflows are unavailable")
@@ -295,7 +454,6 @@ def audit_qualification(path: str | Path) -> QualificationDecision:
             "qualification must preserve exactly one workflow per official PTM"
         )
 
-    registry = load_ptm_registry()
     qualified: list[QualifiedPTM] = []
     exclusions: list[dict[str, Any]] = []
     blockers: list[dict[str, Any]] = []
@@ -303,6 +461,36 @@ def audit_qualification(path: str | Path) -> QualificationDecision:
         workflow = by_id[checkpoint_id]
         record = registry.checkpoint(checkpoint_id)
         status = workflow.get("status")
+        try:
+            workflow_sha = _workflow_integrity(
+                workflow,
+                checkpoint_id=checkpoint_id,
+            )
+            if stage_by_id:
+                staged = stage_by_id[checkpoint_id]["checkpoint"]
+                path, digest, size = _artifact(
+                    workflow.get("source_checkpoint"),
+                    name=f"{checkpoint_id}.source_checkpoint",
+                    expected_size=int(record["expected_size_bytes"]),
+                )
+                if (
+                    path != staged["path"]
+                    or digest != staged["sha256"]
+                    or size != staged["size_bytes"]
+                ):
+                    raise QualificationGateError(
+                        f"{checkpoint_id} workflow source differs from "
+                        "the sealed PTM stage"
+                    )
+        except QualificationGateError as exc:
+            blockers.append(
+                {
+                    "checkpoint_id": checkpoint_id,
+                    "code": "invalid_workflow_evidence",
+                    "reason": str(exc),
+                }
+            )
+            continue
         if status == "success":
             try:
                 item = _successful_workflow(
@@ -355,7 +543,7 @@ def audit_qualification(path: str | Path) -> QualificationDecision:
             "checkpoint_id": checkpoint_id,
             "code": workflow.get("failure_code", "direct_full_run_failed"),
             "reason": workflow["failure_reason"],
-            "workflow_sha256": workflow.get("workflow_sha256"),
+            "workflow_sha256": workflow_sha,
         }
         if record.get("status") == "supported":
             blockers.append(

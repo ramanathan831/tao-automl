@@ -254,12 +254,18 @@ def verify_local_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
     if (
         _git(Path(runtime["sdk_dir"]), "rev-parse", "HEAD")
         != runtime["sdk_commit"]
+        or _git(Path(runtime["sdk_dir"]), "status", "--porcelain")
         or _git(
             Path(runtime["skills_repository"]), "rev-parse", "HEAD"
         )
         != runtime["skills_commit"]
+        or _git(
+            Path(runtime["skills_repository"]), "status", "--porcelain"
+        )
     ):
-        raise CampaignExecutionError("sealed SDK or skills commit changed")
+        raise CampaignExecutionError(
+            "sealed SDK or skills commit/clean state changed"
+        )
     identities = {
         "wheel": (
             runtime["wheel_path"],
@@ -283,6 +289,12 @@ def verify_local_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
             HERE / "qualification_gate.py",
             contract["launcher_integrity"][
                 "qualification_gate_sha256"
+            ],
+        ),
+        "qualification_campaign": (
+            HERE / "qualification_campaign.py",
+            contract["launcher_integrity"][
+                "qualification_campaign_sha256"
             ],
         ),
         "run_campaign": (

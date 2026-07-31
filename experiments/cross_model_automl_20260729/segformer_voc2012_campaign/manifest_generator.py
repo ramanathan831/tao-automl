@@ -241,14 +241,14 @@ def _runtime(
         ),
         "qualification_evidence_path": str(qualification.resolve()),
         "ptm_stage_manifest_path": str(ptm_stage_manifest.resolve()),
-        "partition": "polar3",
+        "partition": campaign_contract.FROZEN_SLURM_PARTITION,
         "account": "edgeai_tao-ptm_image-foundation-model-clip",
         "base_results_dir": (
             "/lustre/fsw/portfolios/edgeai/users/rarunachalam"
         ),
         "container_mounts": "/lustre",
-        "time_hours": 8.0,
-        "timeout_hours": 7.8,
+        "time_hours": campaign_contract.FROZEN_SLURM_TIME_HOURS,
+        "timeout_hours": campaign_contract.FROZEN_SLURM_TIMEOUT_HOURS,
         "max_job_retries": campaign_contract.FROZEN_SLURM_RETRY_CAP,
         "hardware_contract": copy.deepcopy(
             campaign_contract.FROZEN_HARDWARE
@@ -293,6 +293,9 @@ def build_contract(
         ),
         "qualification_gate_sha256": campaign_contract.sha256_file(
             HERE / "qualification_gate.py"
+        ),
+        "qualification_campaign_sha256": campaign_contract.sha256_file(
+            HERE / "qualification_campaign.py"
         ),
         "run_campaign_sha256": campaign_contract.sha256_file(
             HERE / "run_campaign.py"

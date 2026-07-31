@@ -72,6 +72,9 @@ FROZEN_LATENCY_RETENTION = 0.90
 FROZEN_LATENCY_TOLERANCE_MS = 0.73553775
 FROZEN_VALIDATION_SANITY_MIN_MIOU = 0.10
 FROZEN_SLURM_RETRY_CAP = 10
+FROZEN_SLURM_PARTITION = "polar3"
+FROZEN_SLURM_TIME_HOURS = 4.0
+FROZEN_SLURM_TIMEOUT_HOURS = 3.8
 FROZEN_IMAGE_SIZE = 512
 FROZEN_BATCH_SIZE_PER_REPLICA = 4
 FROZEN_HARDWARE = {
@@ -604,6 +607,12 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
         or value.get("execution", {}).get("gpus_per_child") != 8
         or value.get("execution", {}).get("container_mode")
         != "pinned_sqsh"
+        or value.get("runtime", {}).get("partition")
+        != FROZEN_SLURM_PARTITION
+        or value.get("runtime", {}).get("time_hours")
+        != FROZEN_SLURM_TIME_HOURS
+        or value.get("runtime", {}).get("timeout_hours")
+        != FROZEN_SLURM_TIMEOUT_HOURS
         or value.get("search", {}).get("space") != SEARCH_SPACE
         or tuple(item.get("mode") for item in value.get("modes", ()))
         != MODES
@@ -632,6 +641,9 @@ __all__ = [
     "FROZEN_LATENCY_TOLERANCE_MS",
     "FROZEN_SEARCH_SEED",
     "FROZEN_SLURM_RETRY_CAP",
+    "FROZEN_SLURM_PARTITION",
+    "FROZEN_SLURM_TIME_HOURS",
+    "FROZEN_SLURM_TIMEOUT_HOURS",
     "FROZEN_SQSH",
     "FROZEN_TRAINING_EPOCHS",
     "FROZEN_VALIDATION_SANITY_MIN_MIOU",
