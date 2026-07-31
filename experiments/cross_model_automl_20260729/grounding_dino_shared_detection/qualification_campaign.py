@@ -82,6 +82,7 @@ def _remote_file(
     expected_size: int,
     expected_sha256: str,
     timeout: int = 1800,
+    require_nonwritable: bool = True,
 ) -> dict[str, Any]:
     lines = workflow_support.remote_output(
         " ".join(
@@ -103,7 +104,7 @@ def _remote_file(
     if (
         int(size_text) != expected_size
         or digest != expected_sha256
-        or int(mode, 8) & 0o222
+        or (require_nonwritable and int(mode, 8) & 0o222)
     ):
         raise CampaignExecutionError(f"remote identity changed: {path}")
     return {
@@ -171,6 +172,10 @@ def verify_launch_contract(
             expected_size=runtime["sqsh_size_bytes"],
             expected_sha256=runtime["sqsh_sha256"],
             timeout=7200,
+            # This long-lived user-owned SQSH predates the campaign and is
+            # mode 0644. Its immutable content identity, not an invented mode
+            # requirement, is the runtime contract used by DINO/DDETR/RT.
+            require_nonwritable=False,
         )
     }
     stage = read_json(contract["runtime_inputs"]["stage_record_path"])

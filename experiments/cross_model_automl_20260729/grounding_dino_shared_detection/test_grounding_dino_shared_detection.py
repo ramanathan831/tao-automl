@@ -28,7 +28,12 @@ from .future_contract import (
     build_future_contract,
     validate_future_contract,
 )
-from .qualification_campaign import _gpu_guard
+from .qualification_campaign import (
+    CampaignExecutionError,
+    _gpu_guard,
+    _remote_file,
+)
+from . import qualification_campaign
 from .runtime_input_stage import (
     HF_REQUIRED_FILES,
     validate_runtime_input_stage,
@@ -458,3 +463,27 @@ def test_gpu_qualification_guard_requires_eight_a100_or_h100_devices():
     assert "HF_HUB_OFFLINE=1" in command
     assert "TRANSFORMERS_OFFLINE=1" in command
     assert "grounding_dino train -e {config_path}" in command
+
+
+def test_sqsh_content_identity_does_not_invent_a_read_only_mode(monkeypatch):
+    digest = "a" * 64
+    monkeypatch.setattr(
+        qualification_campaign.workflow_support,
+        "remote_output",
+        lambda *_args, **_kwargs: f"123 644\n{digest}  /runtime.sqsh\n",
+    )
+
+    observed = _remote_file(
+        "/runtime.sqsh",
+        expected_size=123,
+        expected_sha256=digest,
+        require_nonwritable=False,
+    )
+    assert observed["mode"] == "644"
+    with pytest.raises(CampaignExecutionError, match="identity changed"):
+        _remote_file(
+            "/staged-checkpoint.pth",
+            expected_size=123,
+            expected_sha256=digest,
+            require_nonwritable=True,
+        )

@@ -24,7 +24,7 @@
     "predecessor_waits_for_full_budget": false
   },
   "campaign_id": "grounding-dino-synthetic-detection-objective-aware-20260730-v3",
-  "contract_sha256": "aa4b50be1afd0037f82cc1dec425ceea67e0d10429d76e5aaa488f8411122e36",
+  "contract_sha256": "bfaa72f99a60c83b844af729f6cbf793a241ce348e8e79ff5abdede3790dc4e9",
   "dataset": {
     "conversion_manifest_path": "/localhome/local-rarunachalam/.tao/worktrees/tao-automl-grounding-dino/experiments/cross_model_automl_20260729/grounding_dino_shared_detection/dataset_conversion.v1.json",
     "conversion_manifest_sha256": "25cf4bcc903d442be6fe3391778f693352a7dd7cac8ee077d4d6dcf1084e3dc4",
@@ -61,11 +61,11 @@
     "automatic_trigger_path": "/localhome/local-rarunachalam/.tao/worktrees/tao-automl-grounding-dino/experiments/cross_model_automl_20260729/grounding_dino_shared_detection/automatic_trigger.py",
     "automatic_trigger_sha256": "166d455e5628cbfcf8c83078c1203b92b55d61a3afdc8ce7c43636de25475ad5",
     "future_contract_generator_path": "/localhome/local-rarunachalam/.tao/worktrees/tao-automl-grounding-dino/experiments/cross_model_automl_20260729/grounding_dino_shared_detection/future_contract.py",
-    "future_contract_generator_sha256": "c093889cfd8ab066539b400c429c2e3fac4c288120a06ed8f0dad3a69d027cde",
+    "future_contract_generator_sha256": "11c451f576693c8ac2cf13ba6422142a410b98501904e952382ad8e869133e96",
     "inputs_path": "/localhome/local-rarunachalam/.tao/worktrees/tao-automl-grounding-dino/experiments/cross_model_automl_20260729/grounding_dino_shared_detection/campaign.inputs.v3.json",
-    "inputs_sha256": "2ffff6849db78615b49166c0185463bb2e20ed06bdb578341b502ca1169d2242",
+    "inputs_sha256": "2fcf1bb04e11f4690022acdc0c57d0f52cdcf7a66060e291b745e99de88a808e",
     "qualification_launcher_path": "/localhome/local-rarunachalam/.tao/worktrees/tao-automl-grounding-dino/experiments/cross_model_automl_20260729/grounding_dino_shared_detection/qualification_campaign.py",
-    "qualification_launcher_sha256": "4bc65a56eb64763e9d342839704c3d32fd7cbb395dba9d08b02cb71fb77b9782",
+    "qualification_launcher_sha256": "ab30c403b840e7a459fce2026deecca9b120122dec1868aa410cbaf705334d19",
     "runtime_input_stage_path": "/localhome/local-rarunachalam/.tao/worktrees/tao-automl-grounding-dino/experiments/cross_model_automl_20260729/grounding_dino_shared_detection/runtime_input_stage.py",
     "runtime_input_stage_sha256": "9ed212f69e0fdb7fc2d76c5aed8b34bc8fa62f9f4615896a7484cc270969e324",
     "runtime_stage_path": "/localhome/local-rarunachalam/.tao/worktrees/tao-automl-grounding-dino/experiments/cross_model_automl_20260729/grounding_dino_shared_detection/runtime_inputs.stage.v1.json",

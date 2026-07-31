@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -176,7 +177,9 @@ def build_future_contract(
         },
         "source": {
             "repository": inputs["source"]["repository"],
-            "minimum_ancestor_commit": "f3120ce7fdfbf6ad49bf79885fa81206c92a6408",
+            "minimum_ancestor_commit": inputs["source"][
+                "minimum_ancestor_commit"
+            ],
         },
         "predecessor_release": {
             "deformable_detr": {
@@ -318,6 +321,17 @@ def validate_future_contract(document: Mapping[str, Any]) -> None:
         raise PreparationError("future contract schema differs")
     if document.get("model", {}).get("id") != MODEL_ID:
         raise PreparationError("future contract model differs")
+    source = document.get("source", {})
+    if (
+        not isinstance(source.get("repository"), str)
+        or not Path(source["repository"]).is_absolute()
+        or re.fullmatch(
+            r"[0-9a-f]{40}",
+            str(source.get("minimum_ancestor_commit", "")),
+        )
+        is None
+    ):
+        raise PreparationError("future contract source identity is invalid")
     dependency = document.get("predecessor_release", {}).get(
         "deformable_detr", {}
     )
