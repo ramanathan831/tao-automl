@@ -115,11 +115,12 @@ exactly the schema consumed by `ptm_stage_record()` and `load_ptm_stage()`.
 
 Qualification is deliberately stronger than a smoke test. Each staged arm must
 complete one real three-epoch full-dataset train and standalone full-validation
-workflow on one node/eight A100s. In-epoch and standalone mask AP must be finite
-and pass the preregistered experiment sanity gate of `0.05`. Failures are
-terminal preserved exclusions. Successful evidence does not mutate or bypass
-the registry: the exact record must then be independently reviewed and promoted
-to `supported`.
+workflow on one node/eight A100s. The four arms launch concurrently with an
+independent durable SDK state store per workflow. In-epoch and standalone mask
+AP must be finite and pass the preregistered experiment sanity gate of `0.05`.
+Failures are terminal preserved exclusions. Successful evidence does not
+mutate or bypass the registry: the exact record must then be independently
+reviewed and promoted to `supported`.
 
 ## Frozen objective-aware search
 

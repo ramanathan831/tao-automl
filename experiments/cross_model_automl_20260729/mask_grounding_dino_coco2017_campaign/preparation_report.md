@@ -59,7 +59,8 @@ repository-owned path-free sidecars:
 
 Their status intentionally remains `unverified`. The qualification controller
 requires one real three-epoch full-COCO train plus standalone validation on one
-node/eight A100s per arm. Every unsuccessful arm is preserved as a terminal
+node/eight A100s per arm. All four workflows run concurrently with independent
+durable SDK state stores. Every unsuccessful arm is preserved as a terminal
 exclusion. Success is still blocked until the exact registry record is
 independently promoted to `supported`; evidence never bypasses registry policy.
 
@@ -133,9 +134,9 @@ The final static verification completed with:
 
 ```text
 PTM-stage focused suite: 13 passed
-campaign-specific suite: 39 passed
+campaign-specific suite: 41 passed
 full production suite: 969 passed, 1 skipped
-complete cross-model experiment suite: 357 passed
+complete cross-model experiment suite: 359 passed
 python compilation: passed
 git diff --check: passed
 ```

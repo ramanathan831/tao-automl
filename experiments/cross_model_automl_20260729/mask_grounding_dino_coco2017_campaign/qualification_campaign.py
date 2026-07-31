@@ -13,6 +13,7 @@ COCO mask AP50-95 is retained as a terminal failure, never replaced by the VG
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import copy
 import json
 import math
@@ -20,7 +21,7 @@ import re
 import shlex
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
@@ -71,6 +72,8 @@ def qualification_plan(contract: Mapping[str, Any]) -> dict[str, Any]:
             record["id"] for record in inventory["records"]
         ],
         "workflow_count": inventory["record_count"],
+        "concurrent_workflow_count": inventory["record_count"],
+        "independent_sdk_state_per_workflow": True,
         "full_dataset": True,
         "training_epochs": campaign_contract.FROZEN_TRAINING_EPOCHS,
         "standalone_full_validation": True,
@@ -566,6 +569,65 @@ def build_completion(
     return value
 
 
+def _run_qualifications_concurrently(
+    contract: Mapping[str, Any],
+    staged: Mapping[str, Mapping[str, Any]],
+    runtime_root: Path,
+    sdk_factory: Callable[[str, Path], Any],
+) -> list[dict[str, Any]]:
+    """Run every frozen PTM workflow concurrently with isolated SDK state."""
+    checkpoint_ids = sorted(staged)
+    if not checkpoint_ids:
+        raise CampaignExecutionError(
+            "no staged Mask Grounding DINO checkpoints are available"
+        )
+
+    def invoke(checkpoint_id: str) -> dict[str, Any]:
+        workflow_dir = runtime_root / checkpoint_id.replace("/", "_")
+        workflow_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            sdk = sdk_factory(
+                checkpoint_id,
+                workflow_dir / "slurm_state.json",
+            )
+            return _run_one(
+                contract,
+                sdk,
+                checkpoint_id,
+                staged[checkpoint_id],
+                runtime_root,
+            )
+        except BaseException as exc:
+            return _failure_workflow(
+                checkpoint_id,
+                f"{type(exc).__name__}: {exc}",
+                code="direct_full_workflow_exception",
+                diagnostics={
+                    "sdk_state_path": str(
+                        workflow_dir / "slurm_state.json"
+                    ),
+                    "agent_intervention_flags": {
+                        name: False
+                        for name in campaign_contract.AGENT_FLAGS
+                    },
+                },
+            )
+
+    by_id: dict[str, dict[str, Any]] = {}
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(checkpoint_ids),
+        thread_name_prefix="mask-grounding-dino-qualification",
+    ) as pool:
+        futures = {
+            pool.submit(invoke, checkpoint_id): checkpoint_id
+            for checkpoint_id in checkpoint_ids
+        }
+        for future in concurrent.futures.as_completed(futures):
+            checkpoint_id = futures[future]
+            by_id[checkpoint_id] = future.result()
+    return [by_id[checkpoint_id] for checkpoint_id in checkpoint_ids]
+
+
 def launch(
     *,
     contract_path: Path,
@@ -603,6 +665,8 @@ def launch(
             "ptm_stage_sha256": campaign_contract.sha256_file(
                 contract["qualification_policy"]["ptm_stage_manifest_path"]
             ),
+            "concurrent_workflow_count": len(staged),
+            "independent_sdk_state_per_workflow": True,
             "nodes_per_job": 1,
             "gpus_per_job": 8,
             "cpu_model_runs": 0,
@@ -623,14 +687,16 @@ def launch(
         raise CampaignExecutionError(
             f"tao_sdk imported from unsealed source: {sdk_source}"
         )
-    sdk = SlurmSDK(
-        poll_interval=10,
-        state_file=runtime_root / "slurm_state.json",
+    def sdk_factory(checkpoint_id: str, state_file: Path) -> Any:
+        del checkpoint_id
+        return SlurmSDK(poll_interval=10, state_file=state_file)
+
+    workflows = _run_qualifications_concurrently(
+        contract,
+        staged,
+        runtime_root,
+        sdk_factory,
     )
-    workflows = [
-        _run_one(contract, sdk, checkpoint_id, source, runtime_root)
-        for checkpoint_id, source in sorted(staged.items())
-    ]
     completion = build_completion(contract, workflows)
     evidence_path = Path(
         contract["qualification_policy"]["qualification_evidence_path"]

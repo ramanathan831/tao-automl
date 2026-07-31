@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import copy
 import json
+import threading
 from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
@@ -606,6 +607,8 @@ def test_direct_full_qualification_plan_is_plan_only(contract):
         item["id"] for item in contract["ptm_inventory"]["records"]
     ]
     assert plan["workflow_count"] == 4
+    assert plan["concurrent_workflow_count"] == 4
+    assert plan["independent_sdk_state_per_workflow"] is True
     assert plan["training_epochs"] == 3
     assert plan["nodes_per_job"] == 1
     assert plan["gpus_per_job"] == 8
@@ -615,6 +618,101 @@ def test_direct_full_qualification_plan_is_plan_only(contract):
     assert plan["smoke_model_runs"] == 0
     assert plan["mini_step_runs"] == 0
     assert plan["replacement_workflows_allowed"] is False
+
+
+def test_direct_full_qualifications_run_all_four_arms_concurrently(
+    contract,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    checkpoint_ids = sorted(
+        record["id"] for record in contract["ptm_inventory"]["records"]
+    )
+    staged = {
+        checkpoint_id: {
+            "path": f"/lustre/ptms/{checkpoint_id}.pth",
+            "size_bytes": 1,
+            "sha256": "a" * 64,
+        }
+        for checkpoint_id in checkpoint_ids
+    }
+    barrier = threading.Barrier(len(checkpoint_ids))
+    lock = threading.Lock()
+    state_paths: dict[str, Path] = {}
+
+    def sdk_factory(checkpoint_id: str, state_file: Path):
+        with lock:
+            state_paths[checkpoint_id] = state_file
+        return object()
+
+    def fake_run_one(
+        supplied_contract,
+        sdk,
+        checkpoint_id,
+        source,
+        runtime_root,
+    ):
+        assert supplied_contract is contract
+        assert sdk is not None
+        assert source is staged[checkpoint_id]
+        assert runtime_root == tmp_path
+        barrier.wait(timeout=5)
+        return {
+            "checkpoint_id": checkpoint_id,
+            "status": "success",
+        }
+
+    monkeypatch.setattr(
+        qualification_campaign,
+        "_run_one",
+        fake_run_one,
+    )
+    workflows = qualification_campaign._run_qualifications_concurrently(
+        contract,
+        staged,
+        tmp_path,
+        sdk_factory,
+    )
+    assert [item["checkpoint_id"] for item in workflows] == checkpoint_ids
+    assert set(state_paths) == set(checkpoint_ids)
+    assert len(set(state_paths.values())) == len(checkpoint_ids)
+    assert all(
+        path.name == "slurm_state.json"
+        and path.parent.name == checkpoint_id.replace("/", "_")
+        for checkpoint_id, path in state_paths.items()
+    )
+
+
+def test_concurrent_qualification_sdk_failure_is_terminal(
+    contract,
+    tmp_path: Path,
+):
+    checkpoint_id = contract["ptm_inventory"]["records"][0]["id"]
+
+    def fail_sdk(checkpoint_id: str, state_file: Path):
+        del checkpoint_id, state_file
+        raise RuntimeError("frozen SDK construction failure")
+
+    workflows = qualification_campaign._run_qualifications_concurrently(
+        contract,
+        {
+            checkpoint_id: {
+                "path": f"/lustre/ptms/{checkpoint_id}.pth",
+                "size_bytes": 1,
+                "sha256": "a" * 64,
+            }
+        },
+        tmp_path,
+        fail_sdk,
+    )
+    assert len(workflows) == 1
+    failure = workflows[0]
+    assert failure["checkpoint_id"] == checkpoint_id
+    assert failure["status"] == "failure"
+    assert failure["terminal"] is True
+    assert failure["failure_preserved"] is True
+    assert failure["replacement_submitted"] is False
+    assert failure["failure_code"] == "direct_full_workflow_exception"
 
 
 def test_direct_qualification_spec_precedence_preserves_coco_profile(
