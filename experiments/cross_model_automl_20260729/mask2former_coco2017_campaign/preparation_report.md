@@ -2,16 +2,19 @@
 
 ## Verdict
 
-The production campaign is prepared but intentionally not launch-ready.
+The production campaign and task-correct runtime fix are prepared, but the
+campaign is intentionally not launch-ready until direct GPU qualification.
 
 No CPU/model smoke, mini-step, local model execution, GPU model execution, or
-SLURM submission was performed while preparing it. The launch gate fails
-closed on two unresolved prerequisites:
+SLURM submission was performed while preparing it. TAO PyTorch commit
+`c2e86fe1646ebe89fc280083797dcc544ce88322` now emits `segm_val_mAP` during
+validation and the split-correct `segm_test_mAP` during standalone evaluation.
+The deterministic source overlay is staged on Lustre with SHA-256
+`c395474592d557e0179066c1f99d5cb8f352e10e501621d57043782440dea8c2`.
 
-1. the current TAO Mask2Former validation and test path does not emit
-   task-correct COCO mask AP;
-2. the one official Mask2Former PTM is still `unverified` and has not completed
-   the direct full-run qualification/promotion sequence.
+The launch gate still fails closed because the exact runtime has not completed
+the direct full-GPU qualification and the one official Mask2Former PTM remains
+`unverified` pending that qualification and independent registry promotion.
 
 ## Frozen scientific scope
 
@@ -35,19 +38,18 @@ The data gate verifies all 118,287 training images, 5,000 validation images,
 annotations, the instance JSON and label-map hashes, the 246,593-entry file
 set, the byte-identical Lustre stage record, and zero remote writable entries.
 
-## Root-cause evidence for the metric blocker
+## Metric-routing resolution
 
-The inspected implementation at
-`nvidia_tao_pytorch/cv/mask2former/model/pl_model.py` routes validation and
-test through semantic inference. `val_epoch_end()` computes and publishes
-`mIoU` and `ACC_all`; it does not run a COCO instance evaluator or publish
-mask AP. `model.mode: instance` controls inference postprocessing but does not
-change that validation metric path.
+The prior root cause was task-blind validation/test routing in
+`nvidia_tao_pytorch/cv/mask2former/model/pl_model.py`. The runtime fix uses the
+distributed COCO segmentation evaluator for `model.mode: instance`, preserves
+semantic mIoU only for semantic mode, and labels panoptic semantic output as a
+diagnostic rather than mask AP or PQ.
 
-The repository-owned policy in `src/tao_automl/metric_sanity.py` already
-records `mask2former` / `instance_segmentation` / `segm_val_mAP` as blocked for
-this reason. The campaign preserves that decision. It does not reinterpret
-the observed mIoU as mask AP.
+Training validation emits `segm_val_mAP` and `segm_val_mAP50`. Standalone
+evaluation emits `segm_test_mAP` and `segm_test_mAP50`. The campaign preserves
+those raw names and records an explicit `segm_test_mAP` to canonical
+`segm_val_mAP` objective binding. It never reinterprets semantic mIoU.
 
 ## Objective-aware jobs
 
@@ -90,8 +92,8 @@ audit, and provenance checks.
 
 ## Required next sequence
 
-1. Add and review a task-correct COCO instance mask-AP evaluator in the TAO
-   Mask2Former validation and standalone evaluation path.
+1. Review the task-correct TAO PyTorch commit and apply its checksum-pinned
+   source overlay to the pinned SQSH launch path.
 2. Stage the exact official NGC PTM on Lustre using the repository preflight
    downloader; freeze its observed digest, size, immutable source identity,
    and read-only stage manifest.

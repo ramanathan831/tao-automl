@@ -44,6 +44,10 @@ CampaignExecutionError = run_campaign.CampaignExecutionError
 atomic_json = run_campaign.atomic_json
 utc_timestamp = run_campaign.utc_timestamp
 
+VALIDATION_MASK_AP_METRIC = "segm_val_mAP"
+STANDALONE_MASK_AP_METRIC = "segm_test_mAP"
+STANDALONE_MASK_AP50_METRIC = "segm_test_mAP50"
+
 
 def _lower_sha(value: Any, name: str) -> str:
     if (
@@ -65,7 +69,12 @@ def qualification_plan(contract: Mapping[str, Any]) -> dict[str, Any]:
         "contract_sha256": contract["contract_sha256"],
         "model": "mask2former",
         "task": "instance_segmentation",
-        "primary_metric": "segm_val_mAP",
+        "primary_metric": VALIDATION_MASK_AP_METRIC,
+        "standalone_reported_metric": STANDALONE_MASK_AP_METRIC,
+        "standalone_objective_binding": {
+            "reported_metric": STANDALONE_MASK_AP_METRIC,
+            "canonical_metric": VALIDATION_MASK_AP_METRIC,
+        },
         "semantic_miou_accepted_as_mask_ap": False,
         "official_checkpoint_ids": [
             record["id"] for record in inventory["records"]
@@ -412,7 +421,7 @@ def _run_one(
             sdk,
             train_job.id,
             action="train",
-            names=("segm_val_mAP", "mask_AP", "coco_mask_ap"),
+            names=(VALIDATION_MASK_AP_METRIC,),
         )
         diagnostics["train_job"]["mask_ap_values"] = mask_values
         diagnostics["train_job"]["semantic_miou_diagnostic_values"] = (
@@ -461,10 +470,25 @@ def _run_one(
             sdk,
             evaluation_job.id,
             action="evaluate",
-            names=("segm_val_mAP", "mask_AP", "coco_mask_ap"),
+            names=(STANDALONE_MASK_AP_METRIC,),
+        )
+        standalone_mask50_values = _status_values(
+            sdk,
+            evaluation_job.id,
+            action="evaluate",
+            names=(STANDALONE_MASK_AP50_METRIC,),
         )
         diagnostics["evaluation_job"]["mask_ap_values"] = (
             standalone_mask_values
+        )
+        diagnostics["evaluation_job"]["mask_ap50_values"] = (
+            standalone_mask50_values
+        )
+        diagnostics["evaluation_job"]["reported_metric"] = (
+            STANDALONE_MASK_AP_METRIC
+        )
+        diagnostics["evaluation_job"]["canonical_objective_metric"] = (
+            VALIDATION_MASK_AP_METRIC
         )
         diagnostics["evaluation_job"][
             "semantic_miou_diagnostic_values"
@@ -482,8 +506,8 @@ def _run_one(
             return _failure_workflow(
                 checkpoint_id,
                 "task-correct segm_val_mAP was not emitted by every "
-                "in-epoch validation and standalone evaluation; semantic "
-                "mIoU diagnostics are not accepted",
+                "in-epoch validation or standalone evaluation did not emit "
+                "segm_test_mAP; semantic mIoU diagnostics are not accepted",
                 code="task_correct_metric_missing",
                 diagnostics=diagnostics,
             )
@@ -512,7 +536,17 @@ def _run_one(
                 "full_validation_split": True,
                 "nodes": 1,
                 "gpus": 8,
-                "segm_val_mAP": standalone_mask_values[-1],
+                STANDALONE_MASK_AP_METRIC: standalone_mask_values[-1],
+                STANDALONE_MASK_AP50_METRIC: (
+                    standalone_mask50_values[-1]
+                    if standalone_mask50_values
+                    else None
+                ),
+                "objective_binding": {
+                    "reported_metric": STANDALONE_MASK_AP_METRIC,
+                    "canonical_metric": VALIDATION_MASK_AP_METRIC,
+                    "value": standalone_mask_values[-1],
+                },
                 "tao_job_id": evaluation_job.id,
             },
             "diagnostics": diagnostics,
@@ -542,7 +576,12 @@ def build_completion(
         ),
         "model": "mask2former",
         "task": "instance_segmentation",
-        "primary_metric": "segm_val_mAP",
+        "primary_metric": VALIDATION_MASK_AP_METRIC,
+        "standalone_reported_metric": STANDALONE_MASK_AP_METRIC,
+        "standalone_objective_binding": {
+            "reported_metric": STANDALONE_MASK_AP_METRIC,
+            "canonical_metric": VALIDATION_MASK_AP_METRIC,
+        },
         "semantic_miou_accepted_as_mask_ap": False,
         "qualification_contract_sha256": contract["contract_sha256"],
         "qualification_campaign_sha256": contract[

@@ -144,7 +144,15 @@ def _workflow(
         else {"mIoU": metric}
     )
     eval_metric = (
-        {"segm_val_mAP": metric}
+        {
+            "segm_test_mAP": metric,
+            "segm_test_mAP50": metric,
+            "objective_binding": {
+                "reported_metric": "segm_test_mAP",
+                "canonical_metric": "segm_val_mAP",
+                "value": metric,
+            },
+        }
         if include_mask_ap
         else {"mIoU": metric}
     )
@@ -214,6 +222,11 @@ def _qualification_document(
         "model": "mask2former",
         "task": "instance_segmentation",
         "primary_metric": "segm_val_mAP",
+        "standalone_reported_metric": "segm_test_mAP",
+        "standalone_objective_binding": {
+            "reported_metric": "segm_test_mAP",
+            "canonical_metric": "segm_val_mAP",
+        },
         "semantic_miou_accepted_as_mask_ap": False,
         "qualification_contract_sha256": "c" * 64,
         "qualification_campaign_sha256": (
@@ -256,6 +269,42 @@ def test_exact_tao_identifier_actions_and_task_correct_metric():
         )
         == pytest.approx(0.321)
     )
+
+
+def test_standalone_metric_is_bound_without_mislabeling(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    status = "\n".join([
+        json.dumps({
+            "kpi": {
+                "segm_test_mAP": "0.42",
+                "segm_test_mAP50": "0.61",
+                "segm_val_mAP": "0.99",
+            }
+        }),
+    ])
+    monkeypatch.setattr(run_campaign, "remote_output", lambda _: status)
+    sdk = SimpleNamespace(
+        get_job_results_dir=lambda _: "lustre:///lustre/results/job"
+    )
+    assert run_campaign._status_metric(
+        sdk,
+        "job",
+        action="evaluate",
+        names=("segm_test_mAP",),
+    ) == pytest.approx(0.42)
+    assert qualification_campaign._status_values(
+        sdk,
+        "job",
+        action="evaluate",
+        names=("segm_test_mAP50",),
+    ) == [pytest.approx(0.61)]
+    assert qualification_campaign._status_values(
+        sdk,
+        "job",
+        action="evaluate",
+        names=("segm_val_mAP",),
+    ) == [pytest.approx(0.99)]
 
 
 def test_search_parameters_are_packaged_train_parameters():
@@ -334,9 +383,13 @@ def test_mask_ap_sanity_is_separate_from_product_selection(contract):
     assert contract["task"] == "instance_segmentation"
     metric = contract["metric_contract"]
     assert metric["required"] == "segm_val_mAP"
+    assert metric["validation_reported_metric"] == "segm_val_mAP"
+    assert metric["standalone_reported_metric"] == "segm_test_mAP"
+    assert metric["standalone_reported_metric50"] == "segm_test_mAP50"
+    assert metric["standalone_canonical_objective"] == "segm_val_mAP"
     assert metric["semantic_miou_is_not_an_alias"] is True
     assert metric["known_repository_state"] == (
-        "blocked_pending_runtime_implementation"
+        "runtime_fix_available_pending_gpu_qualification"
     )
     gate = contract["validation_sanity_gate"]
     assert gate["metric"] == "segm_val_mAP"
@@ -486,6 +539,35 @@ def test_semantic_miou_cannot_qualify_instance_segmentation(tmp_path: Path):
     )
 
 
+def test_mislabeled_standalone_val_metric_cannot_qualify(tmp_path: Path):
+    checkpoint_id = campaign_contract.mask2former_registry_snapshot()[
+        "records"
+    ][0]["id"]
+    document = _qualification_document(checkpoint_id)
+    evaluation = document["workflows"][0]["evaluation"]
+    evaluation.pop("segm_test_mAP")
+    evaluation["segm_val_mAP"] = 0.20
+    document["workflows"][0]["workflow_sha256"] = canonical_sha256({
+        key: value
+        for key, value in document["workflows"][0].items()
+        if key != "workflow_sha256"
+    })
+    document["evidence_sha256"] = canonical_sha256({
+        key: value
+        for key, value in document.items()
+        if key != "evidence_sha256"
+    })
+    path = tmp_path / "qualification.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    decision = audit_qualification(path)
+    assert any(
+        item["checkpoint_id"] == checkpoint_id
+        and item["code"] == "invalid_success_evidence"
+        and "segm_test_mAP" in item["reason"]
+        for item in decision.blockers
+    )
+
+
 def test_low_finite_mask_ap_does_not_pass_qualification(tmp_path: Path):
     checkpoint_id = campaign_contract.mask2former_registry_snapshot()[
         "records"
@@ -557,6 +639,12 @@ def test_direct_full_qualification_plan_is_plan_only(contract):
         "mask2former.coco.swin_tiny.trainable.v1.0"
     ]
     assert plan["workflow_count"] == 1
+    assert plan["primary_metric"] == "segm_val_mAP"
+    assert plan["standalone_reported_metric"] == "segm_test_mAP"
+    assert plan["standalone_objective_binding"] == {
+        "reported_metric": "segm_test_mAP",
+        "canonical_metric": "segm_val_mAP",
+    }
     assert plan["training_epochs"] == 3
     assert plan["nodes_per_job"] == 1
     assert plan["gpus_per_job"] == 8
@@ -827,6 +915,15 @@ def test_contract_integrity_rejects_policy_mutation(contract):
 
     changed = copy.deepcopy(contract)
     changed["metric_contract"]["semantic_miou_is_not_an_alias"] = False
+    with pytest.raises(campaign_contract.CampaignContractError):
+        campaign_contract.validate_contract(changed)
+
+    changed = copy.deepcopy(contract)
+    changed["qualification_policy"]["standalone_objective_binding"][
+        "reported_metric"
+    ] = "segm_val_mAP"
+    changed.pop("contract_sha256")
+    changed["contract_sha256"] = canonical_sha256(changed)
     with pytest.raises(campaign_contract.CampaignContractError):
         campaign_contract.validate_contract(changed)
 

@@ -224,9 +224,28 @@ def _successful_workflow(
         f"{checkpoint_id}.segm_val_mAP",
     )
     standalone_mask_ap = _metric(
-        evaluation.get("segm_val_mAP"),
-        f"{checkpoint_id}.standalone.segm_val_mAP",
+        evaluation.get("segm_test_mAP"),
+        f"{checkpoint_id}.standalone.segm_test_mAP",
     )
+    objective_binding = evaluation.get("objective_binding")
+    if (
+        not isinstance(objective_binding, Mapping)
+        or objective_binding.get("reported_metric") != "segm_test_mAP"
+        or objective_binding.get("canonical_metric") != "segm_val_mAP"
+        or _metric(
+            objective_binding.get("value"),
+            f"{checkpoint_id}.standalone.objective_binding.value",
+        )
+        != standalone_mask_ap
+    ):
+        raise QualificationGateError(
+            f"{checkpoint_id} standalone mask AP objective binding is invalid"
+        )
+    if evaluation.get("segm_test_mAP50") is not None:
+        _metric(
+            evaluation["segm_test_mAP50"],
+            f"{checkpoint_id}.standalone.segm_test_mAP50",
+        )
     if (
         val_mask_ap < FROZEN_VALIDATION_SANITY_MIN_MASK_AP
         or standalone_mask_ap < FROZEN_VALIDATION_SANITY_MIN_MASK_AP
@@ -331,6 +350,12 @@ def audit_qualification(
         or document.get("model") != "mask2former"
         or document.get("task") != "instance_segmentation"
         or document.get("primary_metric") != "segm_val_mAP"
+        or document.get("standalone_reported_metric") != "segm_test_mAP"
+        or document.get("standalone_objective_binding")
+        != {
+            "reported_metric": "segm_test_mAP",
+            "canonical_metric": "segm_val_mAP",
+        }
         or document.get("semantic_miou_accepted_as_mask_ap") is not False
         or not isinstance(evidence_registry_sha, str)
         or len(evidence_registry_sha) != 64

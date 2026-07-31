@@ -64,6 +64,9 @@ DEFAULT_RUNTIME_ROOT = Path(
 )
 TERMINAL_JOB_STATUSES = frozenset({"Complete", "Error", "Canceled"})
 SUCCESS_RECOMMENDATION_STATUSES = frozenset({"success", "done"})
+VALIDATION_MASK_AP_METRIC = "segm_val_mAP"
+STANDALONE_MASK_AP_METRIC = "segm_test_mAP"
+STANDALONE_MASK_AP50_METRIC = "segm_test_mAP50"
 
 CampaignExecutionError = workflow_support.CampaignExecutionError
 atomic_json = workflow_support.atomic_json
@@ -748,16 +751,34 @@ def _launch_evaluation(
         sdk,
         job.id,
         action="evaluate",
-        names=("segm_val_mAP", "mask_AP", "coco_mask_ap"),
+        names=(STANDALONE_MASK_AP_METRIC,),
     )
     if metric is None or not 0.0 <= metric <= 1.0:
         raise CampaignExecutionError(
-            f"evaluation job {job.id} emitted no valid segm_val_mAP"
+            f"evaluation job {job.id} emitted no valid "
+            f"{STANDALONE_MASK_AP_METRIC}"
+        )
+    metric50 = _status_metric(
+        sdk,
+        job.id,
+        action="evaluate",
+        names=(STANDALONE_MASK_AP50_METRIC,),
+    )
+    if metric50 is not None and not 0.0 <= metric50 <= 1.0:
+        raise CampaignExecutionError(
+            f"evaluation job {job.id} emitted invalid "
+            f"{STANDALONE_MASK_AP50_METRIC}"
         )
     evidence["result_root"] = _local_lustre_path(
         sdk.get_job_results_dir(job.id)
     )
-    evidence["segm_val_mAP"] = metric
+    evidence[STANDALONE_MASK_AP_METRIC] = metric
+    evidence[STANDALONE_MASK_AP50_METRIC] = metric50
+    evidence["objective_binding"] = {
+        "reported_metric": STANDALONE_MASK_AP_METRIC,
+        "canonical_metric": VALIDATION_MASK_AP_METRIC,
+        "value": metric,
+    }
     return metric, evidence
 
 

@@ -8,22 +8,32 @@ It contains no CPU model execution, model smoke test, mini-step, synthetic
 input benchmark, or SLURM submission. Every eventual model job uses the pinned
 TAO 7.1 SQSH on one node with eight A100 GPUs.
 
-## Scientific contract and current blocker
+## Scientific metric contract and qualification status
 
 The task is COCO instance segmentation and the primary accuracy objective is
 `segm_val_mAP` (COCO mask AP). Semantic `mIoU` is not an alias for mask AP and
 is never accepted as one.
 
-The inspected TAO Mask2Former validation path currently reports semantic
-`mIoU` and `ACC_all`, including when `model.mode: instance`. It does not
-produce the task-correct COCO mask AP required by this campaign. The
-repository-owned metric policy therefore marks this model/task contract
-blocked, and this campaign deliberately fails closed unless a direct full-run
-qualification emits valid `segm_val_mAP`.
+TAO PyTorch commit
+`c2e86fe1646ebe89fc280083797dcc544ce88322` adds task-aware routing:
+in-epoch validation reports `segm_val_mAP` and `segm_val_mAP50`, while
+standalone evaluation reports the split-correct `segm_test_mAP` and
+`segm_test_mAP50`. The campaign records the standalone names unchanged and
+explicitly binds `segm_test_mAP` to its canonical `segm_val_mAP` accuracy
+objective. It does not relabel TAO output or accept semantic mIoU.
 
-That is a concrete implementation/qualification blocker. It is not resolved
-by relabeling semantic mIoU, choosing a convenient candidate, or weakening the
-metric contract.
+The deterministic source overlay has SHA-256
+`c395474592d557e0179066c1f99d5cb8f352e10e501621d57043782440dea8c2`
+and is staged at:
+
+```text
+/lustre/fsw/portfolios/edgeai/users/rarunachalam/tao-pytorch-overlays/mask2former-instance-ap/c2e86fe1646ebe89fc280083797dcc544ce88322
+```
+
+The implementation blocker is fixed in source, but the model remains
+fail-closed until that exact runtime is applied to the pinned SQSH, the direct
+full-GPU qualification succeeds, and the PTM registry record is independently
+promoted to `supported`.
 
 ## Frozen dataset
 
@@ -61,9 +71,10 @@ mask2former.coco.swin_tiny.trainable.v1.0
 
 It remains `unverified`; runtime does not mutate or bypass that status. Direct
 full-dataset, three-epoch training and standalone evaluation must succeed on
-one node/eight GPUs, produce mask AP above the frozen experiment sanity gate,
-and then the exact registry record must be independently reviewed and marked
-`supported`. Terminal failures are retained as exclusions.
+one node/eight GPUs, emit `segm_val_mAP` and `segm_test_mAP` respectively,
+produce mask AP above the frozen experiment sanity gate, and then the exact
+registry record must be independently reviewed and marked `supported`.
+Terminal failures are retained as exclusions.
 
 Qualification is expected to precede the reviewed registry promotion. The
 gate therefore permits the evidence envelope to name the earlier registry
@@ -135,9 +146,9 @@ full train, standalone evaluation, and stabilized latency workflow. The
 remaining 19 recommendations per mode are released automatically only after
 all three candidate-zero workflows pass.
 
-The automatic trigger currently remains blocked by the task-correct mask-AP
-and PTM-support requirements described above. No model or scheduler job was
-launched while preparing this directory.
+The automatic trigger currently remains blocked by the unexecuted full-GPU
+runtime qualification and PTM-support requirements described above. No model
+or scheduler job was launched while preparing this directory.
 
 ## Reproduction after prerequisites are reviewed
 
@@ -168,4 +179,5 @@ python -m \
 ```
 
 The command above is intentionally not runnable past the gate while the
-repository registry remains unverified or the runtime omits `segm_val_mAP`.
+repository registry remains unverified or the exact runtime fails to emit
+`segm_val_mAP` for validation and `segm_test_mAP` for standalone evaluation.

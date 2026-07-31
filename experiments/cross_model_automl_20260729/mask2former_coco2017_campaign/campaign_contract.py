@@ -527,11 +527,17 @@ def build_preregistered_contract(
         "ptm_inventory": ptm_inventory,
         "metric_contract": {
             "required": "segm_val_mAP",
+            "validation_reported_metric": "segm_val_mAP",
+            "standalone_reported_metric": "segm_test_mAP",
+            "standalone_reported_metric50": "segm_test_mAP50",
+            "standalone_canonical_objective": "segm_val_mAP",
             "direction": "maximize",
             "scale": "fraction",
             "task_correct": True,
             "semantic_miou_is_not_an_alias": True,
-            "known_repository_state": "blocked_pending_runtime_implementation",
+            "known_repository_state": (
+                "runtime_fix_available_pending_gpu_qualification"
+            ),
             "failure_policy": "fail_closed_without_coco_mask_ap",
         },
         "qualification_policy": {
@@ -545,6 +551,11 @@ def build_preregistered_contract(
             "training_epochs": FROZEN_TRAINING_EPOCHS,
             "standalone_evaluation": True,
             "required_metric": "segm_val_mAP",
+            "standalone_reported_metric": "segm_test_mAP",
+            "standalone_objective_binding": {
+                "reported_metric": "segm_test_mAP",
+                "canonical_metric": "segm_val_mAP",
+            },
             "registry_bypass_allowed": False,
             "qualification_evidence_path": runtime[
                 "qualification_evidence_path"
@@ -665,6 +676,33 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
             "semantic_miou_is_not_an_alias"
         )
         is not True
+        or value.get("metric_contract", {}).get(
+            "validation_reported_metric"
+        )
+        != "segm_val_mAP"
+        or value.get("metric_contract", {}).get(
+            "standalone_reported_metric"
+        )
+        != "segm_test_mAP"
+        or value.get("metric_contract", {}).get(
+            "standalone_reported_metric50"
+        )
+        != "segm_test_mAP50"
+        or value.get("metric_contract", {}).get(
+            "standalone_canonical_objective"
+        )
+        != "segm_val_mAP"
+        or value.get("metric_contract", {}).get(
+            "known_repository_state"
+        )
+        != "runtime_fix_available_pending_gpu_qualification"
+        or value.get("qualification_policy", {}).get(
+            "standalone_objective_binding"
+        )
+        != {
+            "reported_metric": "segm_test_mAP",
+            "canonical_metric": "segm_val_mAP",
+        }
         or value.get("qualification_policy", {}).get(
             "ptm_stage_manifest_path"
         )
