@@ -321,7 +321,7 @@ def validate_future_contract(document: Mapping[str, Any]) -> None:
     dependency = document.get("predecessor_release", {}).get(
         "deformable_detr", {}
     )
-    if dependency.get("manifest_sha256") != (
+    if dependency.get("static_campaign_manifest_sha256") != (
         "d70063f3fc6c4ed7c44d8c7d979e2dc3ffc27f576ddd13cf000648a2c2a26e83"
     ):
         raise PreparationError("future contract references a superseded DDETR")
@@ -332,7 +332,22 @@ def validate_future_contract(document: Mapping[str, Any]) -> None:
         "first_candidate_gate/automatic_release.json"
     ):
         raise PreparationError("future contract DDETR release path differs")
-    if dependency.get("source_head") != "8386f52":
+    if dependency.get("runtime_launch_manifest_path") != (
+        "/localhome/local-rarunachalam/.tao/artifacts/"
+        "cross_model_automl_20260729/"
+        "deformable_detr_automl_synthetic_structured_config_fix_v1/"
+        "launch_manifest.json"
+    ):
+        raise PreparationError("future contract DDETR runtime manifest path differs")
+    if dependency.get("static_campaign_manifest_path") != (
+        "/localhome/local-rarunachalam/tao-automl/experiments/"
+        "cross_model_automl_20260729/deformable_detr_automl_synthetic/"
+        "campaign.v1.json"
+    ):
+        raise PreparationError("future contract DDETR static manifest path differs")
+    if dependency.get("source_head") != (
+        "8386f524502b1ae7e1a021a37ed8128e7a2fb719"
+    ):
         raise PreparationError("future contract DDETR source head differs")
     if "candidates 1-19" not in dependency.get("release_scope", ""):
         raise PreparationError("future contract DDETR release scope is ambiguous")
@@ -414,9 +429,9 @@ def main() -> int:
             {
                 "armed": document["automatic_trigger"]["armed"],
                 "contract_sha256": document["contract_sha256"],
-                "ddetr_manifest_sha256": document["predecessor_release"][
+                "ddetr_static_manifest_sha256": document["predecessor_release"][
                     "deformable_detr"
-                ]["manifest_sha256"],
+                ]["static_campaign_manifest_sha256"],
                 "jobs_submitted": 0,
             },
             sort_keys=True,

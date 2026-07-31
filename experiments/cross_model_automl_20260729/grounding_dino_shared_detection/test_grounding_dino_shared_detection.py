@@ -392,10 +392,12 @@ def test_future_contract_binds_only_fresh_ddetr_candidate_zero_gate():
         "deformable_detr_automl_synthetic_structured_config_fix_v1/"
         "first_candidate_gate/automatic_release.json"
     )
-    assert dependency["manifest_sha256"] == (
+    assert dependency["static_campaign_manifest_sha256"] == (
         "d70063f3fc6c4ed7c44d8c7d979e2dc3ffc27f576ddd13cf000648a2c2a26e83"
     )
-    assert dependency["source_head"] == "8386f52"
+    assert dependency["source_head"] == (
+        "8386f524502b1ae7e1a021a37ed8128e7a2fb719"
+    )
     assert "candidates 1-19" in dependency["release_scope"]
     assert (
         document["automatic_trigger"]["predecessor_waits_for_full_budget"]
@@ -427,11 +429,13 @@ def test_missing_fresh_ddetr_release_is_the_only_trigger_blocker(monkeypatch):
     inputs = read_json(HERE / "campaign.inputs.v3.json")
     monkeypatch.setattr(
         automatic_trigger,
-        "_evaluate_ddetr_gate",
+        "evaluate_fresh_ddetr_gate",
         lambda configuration: {
             "model": "deformable_detr",
             "artifact_path": configuration["artifact_path"],
-            "expected_manifest_sha256": configuration["manifest_sha256"],
+            "expected_static_campaign_manifest_sha256": configuration[
+                "static_campaign_manifest_sha256"
+            ],
             "passed": False,
             "blockers": ["required automatic release artifact is absent"],
         },

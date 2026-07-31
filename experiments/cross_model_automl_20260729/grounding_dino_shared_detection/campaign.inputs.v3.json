@@ -10,7 +10,6 @@
   "predecessor_gates": {
     "deformable_detr": {
       "artifact_path": "/localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/deformable_detr_automl_synthetic_structured_config_fix_v1/first_candidate_gate/automatic_release.json",
-      "manifest_sha256": "d70063f3fc6c4ed7c44d8c7d979e2dc3ffc27f576ddd13cf000648a2c2a26e83",
       "required_candidate_id_template": "{mode}_rec_0",
       "required_reason": "all frozen candidate gates passed",
       "required_release_fields": {
@@ -24,7 +23,10 @@
         "remaining_candidates_per_mode": 19,
         "schema_version": 1
       },
-      "source_head": "8386f52",
+      "runtime_launch_manifest_path": "/localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/deformable_detr_automl_synthetic_structured_config_fix_v1/launch_manifest.json",
+      "source_head": "8386f524502b1ae7e1a021a37ed8128e7a2fb719",
+      "static_campaign_manifest_path": "/localhome/local-rarunachalam/tao-automl/experiments/cross_model_automl_20260729/deformable_detr_automl_synthetic/campaign.v1.json",
+      "static_campaign_manifest_sha256": "d70063f3fc6c4ed7c44d8c7d979e2dc3ffc27f576ddd13cf000648a2c2a26e83",
       "status": "fresh_runtime_bound_release_pending"
     },
     "rtdetr": {

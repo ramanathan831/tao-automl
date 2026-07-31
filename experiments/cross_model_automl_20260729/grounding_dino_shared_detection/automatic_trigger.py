@@ -18,15 +18,15 @@ from typing import Any
 from tao_automl.ptm_registry import canonical_sha256
 
 try:
-    from .contract import PreparationError, read_json, sha256_file
+    from .contract import MODES, PreparationError, read_json, sha256_file
     from .future_contract import DEFAULT_OUTPUT, validate_future_contract
     from .runtime_input_stage import validate_runtime_input_stage
-    from .successor_contract import _evaluate_ddetr_gate, _evaluate_rtdetr_gate
+    from .successor_contract import _evaluate_rtdetr_gate
 except ImportError:  # pragma: no cover - direct script execution
-    from contract import PreparationError, read_json, sha256_file
+    from contract import MODES, PreparationError, read_json, sha256_file
     from future_contract import DEFAULT_OUTPUT, validate_future_contract
     from runtime_input_stage import validate_runtime_input_stage
-    from successor_contract import _evaluate_ddetr_gate, _evaluate_rtdetr_gate
+    from successor_contract import _evaluate_rtdetr_gate
 
 
 HERE = Path(__file__).resolve().parent
@@ -53,6 +53,100 @@ def _utc_timestamp() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def evaluate_fresh_ddetr_gate(
+    configuration: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind the static campaign and its derived runtime release separately."""
+    release_path = Path(configuration["artifact_path"])
+    static_path = Path(configuration["static_campaign_manifest_path"])
+    runtime_path = Path(configuration["runtime_launch_manifest_path"])
+    result: dict[str, Any] = {
+        "model": "deformable_detr",
+        "artifact_path": str(release_path),
+        "static_campaign_manifest_path": str(static_path),
+        "expected_static_campaign_manifest_sha256": configuration[
+            "static_campaign_manifest_sha256"
+        ],
+        "runtime_launch_manifest_path": str(runtime_path),
+        "expected_source_head": configuration["source_head"],
+        "passed": False,
+        "blockers": [],
+    }
+    for label, path in (
+        ("static campaign manifest", static_path),
+        ("runtime launch manifest", runtime_path),
+        ("automatic release", release_path),
+    ):
+        if not path.is_file():
+            result["blockers"].append(f"{label} is absent")
+    if result["blockers"]:
+        return result
+
+    static = read_json(static_path)
+    static_payload = copy.deepcopy(static)
+    static_sha = static_payload.pop("manifest_sha256", None)
+    if (
+        static_sha != configuration["static_campaign_manifest_sha256"]
+        or static_sha != canonical_sha256(static_payload)
+    ):
+        result["blockers"].append("static campaign manifest identity differs")
+
+    runtime = read_json(runtime_path)
+    runtime_payload = copy.deepcopy(runtime)
+    runtime_sha = runtime_payload.pop("manifest_sha256", None)
+    if not isinstance(runtime_sha, str) or runtime_sha != canonical_sha256(
+        runtime_payload
+    ):
+        result["blockers"].append("runtime launch manifest identity is invalid")
+    if runtime.get("source", {}).get("commit") != configuration["source_head"]:
+        result["blockers"].append("runtime launch source head differs")
+
+    release = read_json(release_path)
+    for field, expected in configuration["required_release_fields"].items():
+        if release.get(field) != expected:
+            result["blockers"].append(f"release field {field} differs")
+    if release.get("manifest_sha256") != runtime_sha:
+        result["blockers"].append("release runtime manifest identity differs")
+
+    root = release_path.parents[1]
+    records = {}
+    for mode in MODES:
+        path = root / "first_candidate_gate" / f"{mode}.json"
+        if not path.is_file():
+            result["blockers"].append(f"{mode} gate record is absent")
+            continue
+        gate = read_json(path)
+        records[mode] = gate
+        if gate.get("manifest_sha256") != runtime_sha:
+            result["blockers"].append(f"{mode} gate runtime manifest differs")
+        if gate.get("candidate_index") != 0:
+            result["blockers"].append(f"{mode} candidate index differs")
+        if gate.get("candidate_id") != configuration[
+            "required_candidate_id_template"
+        ].format(mode=mode):
+            result["blockers"].append(f"{mode} candidate ID differs")
+        if gate.get("passed") is not True:
+            result["blockers"].append(f"{mode} candidate gate did not pass")
+        if gate.get("reason") != configuration["required_reason"]:
+            result["blockers"].append(f"{mode} gate reason differs")
+    if (
+        set(records) == set(MODES)
+        and release.get("gate_record_sha256") != canonical_sha256(records)
+    ):
+        result["blockers"].append("release gate-record identity differs")
+    result.update(
+        {
+            "static_campaign_manifest_sha256": static_sha,
+            "runtime_manifest_sha256": runtime_sha,
+            "static_campaign_file_sha256": sha256_file(static_path),
+            "runtime_launch_manifest_file_sha256": sha256_file(runtime_path),
+            "artifact_sha256": sha256_file(release_path),
+            "passed": not result["blockers"],
+        }
+    )
+    return result
+
+
 def readiness(
     *,
     contract: Mapping[str, Any],
@@ -64,7 +158,7 @@ def readiness(
     stage = read_json(stage_path)
     validate_runtime_input_stage(stage, inputs=inputs)
     blockers = []
-    ddetr = _evaluate_ddetr_gate(
+    ddetr = evaluate_fresh_ddetr_gate(
         contract["predecessor_release"]["deformable_detr"]
     )
     rtdetr = _evaluate_rtdetr_gate(
