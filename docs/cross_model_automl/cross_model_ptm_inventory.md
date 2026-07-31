@@ -8,8 +8,8 @@ support qualification planning only:
 - every model has `default_ptm: null`;
 - every checkpoint has `status: unverified`;
 - none can enter production runtime resolution or AutoML categorical search;
-- no TAO compatibility range is claimed before checkpoint load and mini-step
-  validation;
+- compatibility metadata records the intended TAO release only; it does not
+  qualify a checkpoint for runtime use;
 - an NGC `sha256_base64` value is decoded to lowercase 64-hex SHA-256 when the
   API exposes it, and the checksum is omitted when NGC does not publish one.
 
@@ -24,7 +24,7 @@ or SLURM job was launched while constructing this inventory.
 | `rtdetr` | `trafficcamnet_transformer_lite`, `rtdetr_2d_warehouse` | 4 | 4 | 4 | TAO load/mini-step |
 | `grounding_dino` | `grounding_dino` | 2 | 1 | 2 | TAO load/mini-step; v1.0 checkpoint checksum absent |
 | `segformer` | `pretrained_segformer_cityscapes`, `pretrained_segformer_imagenet` | 13 | 0 | 0 | Exact checkpoint/YAML merge; checksum absence; ImageNet card license inconsistency |
-| `oneformer` | `oneformer`, `oneformer_its_pretrained_commercial` | 4 | 4 | 0 | Exact task/backbone YAML, especially DiNAT-Large; TAO load/mini-step |
+| `oneformer` | `oneformer`, `oneformer_its_pretrained_commercial` | 4 | 4 | 4 | Direct full-COCO train/eval qualification; all records remain unverified |
 | `mask2former` | `mask2former` | 1 | 0 | 1 | TAO load/mini-step; checkpoint checksum absent |
 | `mask_grounding_dino` | `mask_grounding_dino`, `pretrained_mask_grounding_dino_v2` | 4 | 3 | 0 | Exact checkpoint YAML and TAO load/mini-step |
 
@@ -72,13 +72,16 @@ source ambiguity is resolved.
 
 ## Sidecar policy
 
-Nine deterministic repository sidecars were added only where an official NGC
+Thirteen deterministic repository sidecars were added only where an official NGC
 `experiment.yaml` or a model-card transfer-learning template supplied
 checkpoint-specific architecture values:
 
 - Deformable DETR ResNet50 and GCViT-Tiny;
 - all four RT-DETR records;
 - both Grounding DINO records;
+- all four OneFormer records, projected from the corresponding official TAO
+  `spec_ade.yaml`, `spec_coco.yaml`, `spec_its_dinat.yaml`, and
+  `spec_its_swin.yaml` architecture sections;
 - Mask2Former Swin-Tiny.
 
 Official YAMLs containing private dataset, checkpoint, results, or Lustre
@@ -87,10 +90,26 @@ bind their provenance to the official YAML SHA-256, and are tested to contain
 none of those path prefixes. Their parsed YAML must equal
 `default_spec_overrides` exactly.
 
-SegFormer, OneFormer, and Mask Grounding DINO remain partial when the official
+SegFormer and Mask Grounding DINO remain partial when the official
 resource exposes no checkpoint-specific YAML or the repository cannot yet
 represent the checkpoint's exact conditional configuration. Their structured
 reasons preserve that distinction and prevent accidental qualification.
+
+The OneFormer projections resolve architecture representation only. They do
+not establish checkpoint load compatibility or metric correctness. In the
+current no-smoke execution profile, promotion requires a stronger direct
+full-dataset one-node/eight-GPU training plus standalone-evaluation workflow;
+no CPU model smoke or mini-step can qualify an arm.
+
+Static inspection of the pinned TAO 7.1 SQSH found a direct runtime blocker:
+the OneFormer training entrypoint calls
+`OneformerPlModule.load_pretrained_weights` for a full checkpoint, while that
+method is absent from the packaged `OneformerPlModule`. The same packaged
+evaluation path reports semantic `mIoU`, not Panoptic Quality, and writes its
+status KPI from per-process aggregates. OneFormer records therefore remain
+`unverified`; no campaign launch is authorized until the full-checkpoint load
+path and task-correct distributed metric path are resolved and directly
+qualified.
 
 ## Qualification boundary
 
