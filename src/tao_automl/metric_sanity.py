@@ -922,6 +922,40 @@ def _default_policies() -> tuple[MetricSanityPolicy, ...]:
             ),
         ),
         MetricSanityPolicy(
+            policy_id="mask_grounding_dino.coco_mask_ap50_95",
+            model="mask_grounding_dino",
+            model_aliases=("mask-grounding-dino",),
+            task="category_prompted_grounded_instance_segmentation",
+            metric="segm_val_mAP50_95",
+            metric_aliases=(
+                "[segm] val_mAP@50-95",
+                "coco_mask_ap",
+                "mask_AP",
+                "segm_val_mAP",
+            ),
+            direction="maximize",
+            scale="fraction",
+            valid_minimum=0.0,
+            valid_maximum=1.0,
+            availability="supported",
+            availability_reason=(
+                "The OD evaluation path runs the COCO evaluator for both bbox "
+                "and segm IoU types and reports the unscaled COCO AP50-95 "
+                "statistic for segmentation"
+            ),
+            evidence_policy=_DEFAULT_EVIDENCE,
+            source_evidence=(
+                "tao-pytorch:nvidia_tao_pytorch/cv/mask_grounding_dino/"
+                "model/pl_gdino_model.py: OD validation constructs "
+                "OD_Evaluator with iou_types=['bbox', 'segm']",
+                "tao-pytorch:nvidia_tao_pytorch/cv/mask_grounding_dino/"
+                "model/pl_gdino_model.py: OD status keys include "
+                "[segm] val_mAP@50-95",
+                "tao-pytorch:nvidia_tao_pytorch/cv/grounding_dino/utils/"
+                "coco_eval.py: mAP@50-95 is the unscaled COCO summary value",
+            ),
+        ),
+        MetricSanityPolicy(
             policy_id="mask_grounding_dino.overall_iou",
             model="mask_grounding_dino",
             model_aliases=("mask-grounding-dino",),

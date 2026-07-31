@@ -3176,7 +3176,7 @@
         {
           "id": "mask_grounding_dino.commercial.swin_tiny.trainable.v2.1",
           "status": "unverified",
-          "status_reason": "Official NGC checkpoint identity, SHA-256, size, model-card architecture, multimodal input contract, and license are recorded. No checkpoint-specific YAML member is exposed; TAO compatibility and checkpoint load, training, validation, and inference mini-steps remain unverified.",
+          "status_reason": "Official NGC checkpoint identity, SHA-256, size, model-card architecture, multimodal input contract, license, and repository-owned transfer defaults are recorded. Full TAO 7.1.0 checkpoint load, training, validation, standalone evaluation, and inference qualification remains required before runtime support.",
           "source": {
             "provider": "ngc",
             "registry": "nvidia/tao",
@@ -3192,6 +3192,9 @@
           "architecture": "mask_grounding_dino",
           "backbone": "swin_tiny_224_1k",
           "checkpoint_target": "train.pretrained_model_path",
+          "compatible_tao_versions": [
+            "==7.1.0"
+          ],
           "input_contract": {
             "channels": 3,
             "height": 544,
@@ -3201,6 +3204,44 @@
               "layout": "nchw",
               "text_encoder": "bert_base",
               "max_text_length": 256
+            }
+          },
+          "default_spec_overrides": {
+            "model": {
+              "backbone": "swin_tiny_224_1k",
+              "num_feature_levels": 4,
+              "return_interm_indices": [
+                1,
+                2,
+                3,
+                4
+              ],
+              "enc_layers": 6,
+              "dec_layers": 6,
+              "num_queries": 900,
+              "num_select": 300,
+              "hidden_dim": 256,
+              "dim_feedforward": 2048,
+              "has_mask": true,
+              "num_region_queries": 100,
+              "loss_types": [
+                "labels",
+                "boxes",
+                "masks"
+              ]
+            },
+            "dataset": {
+              "has_mask": true,
+              "max_labels": 80
+            }
+          },
+          "checkpoint_spec_file": {
+            "source": "repository",
+            "path": "data/ptm_specs/mask_grounding_dino/mask_grounding_dino.commercial.swin_tiny.trainable.v2.1.yaml",
+            "sha256": "45cb80e9a424721ae74388db4825189e15e00211875f448b9d28a39d284f53b9",
+            "provenance": {
+              "source": "Official NGC Mask Grounding DINO model-card architecture and packaged TAO 7.1 Mask Grounding DINO schema defaults",
+              "evidence": "experiments/cross_model_automl_20260729/mask_grounding_dino_coco2017_campaign/preparation_report.md"
             }
           },
           "task_compatibility": [
@@ -3221,7 +3262,7 @@
         {
           "id": "mask_grounding_dino.commercial.swin_tiny.trainable.v2.0",
           "status": "unverified",
-          "status_reason": "Official NGC checkpoint identity, SHA-256, size, model-card architecture, multimodal input contract, and license are recorded. No checkpoint-specific YAML member is exposed; TAO compatibility and checkpoint load, training, validation, and inference mini-steps remain unverified.",
+          "status_reason": "Official NGC checkpoint identity, SHA-256, size, model-card architecture, multimodal input contract, license, and repository-owned transfer defaults are recorded. Full TAO 7.1.0 checkpoint load, training, validation, standalone evaluation, and inference qualification remains required before runtime support.",
           "source": {
             "provider": "ngc",
             "registry": "nvidia/tao",
@@ -3237,6 +3278,9 @@
           "architecture": "mask_grounding_dino",
           "backbone": "swin_tiny_224_1k",
           "checkpoint_target": "train.pretrained_model_path",
+          "compatible_tao_versions": [
+            "==7.1.0"
+          ],
           "input_contract": {
             "channels": 3,
             "height": 544,
@@ -3246,6 +3290,44 @@
               "layout": "nchw",
               "text_encoder": "bert_base",
               "max_text_length": 256
+            }
+          },
+          "default_spec_overrides": {
+            "model": {
+              "backbone": "swin_tiny_224_1k",
+              "num_feature_levels": 4,
+              "return_interm_indices": [
+                1,
+                2,
+                3,
+                4
+              ],
+              "enc_layers": 6,
+              "dec_layers": 6,
+              "num_queries": 900,
+              "num_select": 300,
+              "hidden_dim": 256,
+              "dim_feedforward": 2048,
+              "has_mask": true,
+              "num_region_queries": 100,
+              "loss_types": [
+                "labels",
+                "boxes",
+                "masks"
+              ]
+            },
+            "dataset": {
+              "has_mask": true,
+              "max_labels": 80
+            }
+          },
+          "checkpoint_spec_file": {
+            "source": "repository",
+            "path": "data/ptm_specs/mask_grounding_dino/mask_grounding_dino.commercial.swin_tiny.trainable.v2.0.yaml",
+            "sha256": "17b6213267b83774af08dff5e79614c396707f2f81eca11e8ca29d9559375c92",
+            "provenance": {
+              "source": "Official NGC Mask Grounding DINO model-card architecture and packaged TAO 7.1 Mask Grounding DINO schema defaults",
+              "evidence": "experiments/cross_model_automl_20260729/mask_grounding_dino_coco2017_campaign/preparation_report.md"
             }
           },
           "task_compatibility": [
@@ -3266,7 +3348,7 @@
         {
           "id": "mask_grounding_dino.commercial.swin_tiny.trainable.v1.0",
           "status": "unverified",
-          "status_reason": "Official immutable NGC checkpoint identity, size, model-card architecture, multimodal input contract, and license are recorded. NGC publishes no checkpoint checksum or checkpoint-specific YAML for this older member; TAO compatibility and checkpoint load, training, validation, and inference mini-steps remain unverified.",
+          "status_reason": "Official immutable NGC checkpoint identity, size, model-card architecture, multimodal input contract, license, and repository-owned transfer defaults are recorded. NGC publishes no checkpoint checksum for this older member; full TAO 7.1.0 artifact hashing, checkpoint load, training, validation, standalone evaluation, and inference qualification remains required before runtime support.",
           "source": {
             "provider": "ngc",
             "registry": "nvidia/tao",
@@ -3281,6 +3363,9 @@
           "architecture": "mask_grounding_dino",
           "backbone": "swin_tiny_224_1k",
           "checkpoint_target": "train.pretrained_model_path",
+          "compatible_tao_versions": [
+            "==7.1.0"
+          ],
           "input_contract": {
             "channels": 3,
             "height": 544,
@@ -3290,6 +3375,44 @@
               "layout": "nchw",
               "text_encoder": "bert_base",
               "max_text_length": 256
+            }
+          },
+          "default_spec_overrides": {
+            "model": {
+              "backbone": "swin_tiny_224_1k",
+              "num_feature_levels": 4,
+              "return_interm_indices": [
+                1,
+                2,
+                3,
+                4
+              ],
+              "enc_layers": 6,
+              "dec_layers": 6,
+              "num_queries": 900,
+              "num_select": 300,
+              "hidden_dim": 256,
+              "dim_feedforward": 2048,
+              "has_mask": true,
+              "num_region_queries": 100,
+              "loss_types": [
+                "labels",
+                "boxes",
+                "masks"
+              ]
+            },
+            "dataset": {
+              "has_mask": true,
+              "max_labels": 80
+            }
+          },
+          "checkpoint_spec_file": {
+            "source": "repository",
+            "path": "data/ptm_specs/mask_grounding_dino/mask_grounding_dino.commercial.swin_tiny.trainable.v1.0.yaml",
+            "sha256": "787d0f41c6368f63519c5549c3e5bb8ed219c20ea66111066c89a6db848cf20d",
+            "provenance": {
+              "source": "Official NGC Mask Grounding DINO model-card architecture and packaged TAO 7.1 Mask Grounding DINO schema defaults",
+              "evidence": "experiments/cross_model_automl_20260729/mask_grounding_dino_coco2017_campaign/preparation_report.md"
             }
           },
           "task_compatibility": [
@@ -3310,7 +3433,7 @@
         {
           "id": "mask_grounding_dino.research.swin_tiny.trainable.v2.0",
           "status": "unverified",
-          "status_reason": "Official NGC checkpoint identity, SHA-256, size, model-card architecture, multimodal input contract, and noncommercial license are recorded. No checkpoint-specific YAML member is exposed; TAO compatibility and checkpoint load, training, validation, and inference mini-steps remain unverified.",
+          "status_reason": "Official NGC checkpoint identity, SHA-256, size, model-card architecture, multimodal input contract, noncommercial license, and repository-owned transfer defaults are recorded. Full TAO 7.1.0 checkpoint load, training, validation, standalone evaluation, and inference qualification remains required before runtime support.",
           "source": {
             "provider": "ngc",
             "registry": "nvidia/tao",
@@ -3326,6 +3449,9 @@
           "architecture": "mask_grounding_dino",
           "backbone": "swin_tiny_224_1k",
           "checkpoint_target": "train.pretrained_model_path",
+          "compatible_tao_versions": [
+            "==7.1.0"
+          ],
           "input_contract": {
             "channels": 3,
             "height": 544,
@@ -3335,6 +3461,44 @@
               "layout": "nchw",
               "text_encoder": "bert_base",
               "max_text_length": 256
+            }
+          },
+          "default_spec_overrides": {
+            "model": {
+              "backbone": "swin_tiny_224_1k",
+              "num_feature_levels": 4,
+              "return_interm_indices": [
+                1,
+                2,
+                3,
+                4
+              ],
+              "enc_layers": 6,
+              "dec_layers": 6,
+              "num_queries": 900,
+              "num_select": 300,
+              "hidden_dim": 256,
+              "dim_feedforward": 2048,
+              "has_mask": true,
+              "num_region_queries": 100,
+              "loss_types": [
+                "labels",
+                "boxes",
+                "masks"
+              ]
+            },
+            "dataset": {
+              "has_mask": true,
+              "max_labels": 80
+            }
+          },
+          "checkpoint_spec_file": {
+            "source": "repository",
+            "path": "data/ptm_specs/mask_grounding_dino/mask_grounding_dino.research.swin_tiny.trainable.v2.0.yaml",
+            "sha256": "b2d1a2d8db8e0c0a31362a307eec7379807089ba51998e9beeb94d9381e527d4",
+            "provenance": {
+              "source": "Official NGC Mask Grounding DINO model-card architecture and packaged TAO 7.1 Mask Grounding DINO schema defaults",
+              "evidence": "experiments/cross_model_automl_20260729/mask_grounding_dino_coco2017_campaign/preparation_report.md"
             }
           },
           "task_compatibility": [

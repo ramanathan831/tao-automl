@@ -88,6 +88,13 @@ def _reason_codes(decision):
         ),
         (
             "mask_grounding_dino",
+            "segm_val_mAP50_95",
+            "category_prompted_grounded_instance_segmentation",
+            "fraction",
+            "supported",
+        ),
+        (
+            "mask_grounding_dino",
             "val_overall_IoU",
             "referring_expression_segmentation",
             "percent",
@@ -206,6 +213,49 @@ def test_mask_grounding_dino_overall_iou_uses_verified_percent_scale(value):
         .scale
         == "percent"
     )
+
+
+@pytest.mark.parametrize("value", [0.0, 0.001, 0.5, 1.0])
+def test_mask_grounding_dino_coco_mask_ap50_95_uses_fraction_scale(value):
+    decision = evaluate_metric_sanity(
+        "mask_grounding_dino",
+        "segm_val_mAP50_95",
+        value,
+        evidence=_evidence(),
+    )
+
+    assert decision.passed
+    assert decision.metric_value == value
+    assert decision.task == (
+        "category_prompted_grounded_instance_segmentation"
+    )
+
+
+@pytest.mark.parametrize("value", [-0.00001, 1.00001])
+def test_mask_grounding_dino_coco_mask_ap50_95_rejects_out_of_range(value):
+    decision = evaluate_metric_sanity(
+        "mask-grounding-dino",
+        "[segm] val_mAP@50-95",
+        value,
+        evidence=_evidence(),
+    )
+
+    assert not decision.passed
+
+
+def test_mask_grounding_dino_od_mask_ap_and_vg_iou_are_distinct():
+    registry = default_metric_sanity_registry()
+
+    mask_ap = registry.resolve("mask_grounding_dino", "coco_mask_ap")
+    vg_iou = registry.resolve("mask_grounding_dino", "overall_IoU")
+
+    assert mask_ap.policy_id != vg_iou.policy_id
+    assert mask_ap.task == (
+        "category_prompted_grounded_instance_segmentation"
+    )
+    assert mask_ap.scale == "fraction"
+    assert vg_iou.task == "referring_expression_segmentation"
+    assert vg_iou.scale == "percent"
 
 
 @pytest.mark.parametrize(
