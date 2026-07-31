@@ -64,6 +64,41 @@ eight replicas, and 4,000 samples per candidate. Preprocessing and
 postprocessing are excluded; candidate-controlled test resolution is therefore
 part of the measured inference graph input contract.
 
+## Data-only PTM stage
+
+The PTM stage resolves exactly the four official OneFormer records frozen by
+the repository registry. It uses the production authenticated NGC HTTPS client
+and atomic verified cache, then create-or-verifies immutable checkpoint bytes
+and a read-only manifest. It imports no TAO model implementation, constructs no
+scheduler client, and submits no job.
+
+The physical publication root and canonical runtime root are deliberately
+separate. This supports a login host where remote Lustre is mounted over SSHFS:
+bytes are written and verified through the physical mount, while the manifest
+contains only the canonical `/lustre/...` paths seen by cluster jobs.
+
+```bash
+cd /localhome/local-rarunachalam/tao-automl
+python -m experiments.cross_model_automl_20260729.oneformer_coco2017_campaign.ptm_stage \
+  --stage \
+  --env-file /localhome/local-rarunachalam/.tao/config.env \
+  --physical-publication-root /path/to/sshfs/mount/oneformer_v1 \
+  --canonical-publication-root /lustre/fsw/portfolios/edgeai/users/rarunachalam/ptms/cross_model_automl_20260729/oneformer_v1
+```
+
+Revalidation is network-free and uses the same explicit mapping:
+
+```bash
+python -m experiments.cross_model_automl_20260729.oneformer_coco2017_campaign.ptm_stage \
+  --check-stage \
+  --physical-publication-root /path/to/sshfs/mount/oneformer_v1 \
+  --canonical-publication-root /lustre/fsw/portfolios/edgeai/users/rarunachalam/ptms/cross_model_automl_20260729/oneformer_v1
+```
+
+An existing destination is reused only when its size, SHA-256, and read-only
+mode are exact. Changed or writable bytes, unexpected files, registry drift,
+and manifest drift are terminal errors; the stager never overwrites them.
+
 ## Seal and launch later
 
 After the exact overlay is staged at its preregistered Lustre path, direct
