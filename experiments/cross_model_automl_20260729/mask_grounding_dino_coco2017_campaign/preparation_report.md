@@ -66,8 +66,11 @@ Their status intentionally remains `unverified`. The qualification controller
 requires one real three-epoch full-COCO train plus standalone validation on one
 node/eight A100s per arm. All four workflows run concurrently with independent
 durable SDK state stores. Every unsuccessful arm is preserved as a terminal
-exclusion. Success is still blocked until the exact registry record is
-independently promoted to `supported`; evidence never bypasses registry policy.
+exclusion. The repository records remain unchanged. After terminal v2 evidence
+exists, the v3 campaign may project only exact successful unverified identities
+to `supported` in a validated, evidence-bound in-memory registry. Ordinary
+runtime still requires repository support; the campaign projection is never
+persisted globally and cannot promote a failed or explicitly unsupported arm.
 
 The repository includes a minimal data-only `ptm_stage.py` path for all
 four arms. It uses `NGCHTTPSClient` and `AtomicArtifactCache`, verifies exact
@@ -120,10 +123,11 @@ the remaining 23 recommendations per mode are automatically released.
 | --- | --- |
 | Four-checkpoint immutable PTM stage manifest | Complete and read-only |
 | Direct-full qualification v1 | Preserved terminal first-batch DDP failure for 4/4 arms |
-| Direct-full qualification v2 | Pending/running until runtime completion evidence exists |
-| Runtime-supported Mask Grounding DINO registry record | None; 4/4 unverified |
-| Clean v2 source commit and matching sealed inputs | Required before v2 launch |
-| Final `campaign.v2.json` | Generated only from the clean v2 commit |
+| Direct-full qualification v2 | Terminal completion evidence required before v3 sealing |
+| Repository Mask Grounding DINO records | Preserved unchanged; 4/4 unverified before qualification |
+| Runtime-local eligibility | Exact successful identities only; schema-v2 in-memory projection, failed/unsupported arms excluded |
+| Clean v3 source commit and matching wheel | Required before automatic three-mode launch |
+| Final `campaign.v3.json` | Generated only after binding exact v2 completion evidence |
 
 The v1 failures are diagnostic qualification evidence, not benchmark results;
 there is no valid Mask Grounding DINO accuracy or latency metric yet.

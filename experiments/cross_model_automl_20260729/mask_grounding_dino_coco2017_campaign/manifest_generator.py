@@ -402,6 +402,90 @@ def ptm_stage_record(path: str | Path) -> dict[str, Any]:
     }
 
 
+def qualification_evidence_record(path: str | Path) -> dict[str, Any]:
+    """Bind the immutable v2 direct-full-run completion for local eligibility."""
+    evidence_path = Path(path).resolve()
+    if not evidence_path.is_file():
+        raise ManifestGenerationError(
+            "completed Mask Grounding DINO qualification is unavailable"
+        )
+    document = json.loads(evidence_path.read_text(encoding="utf-8"))
+    supplied = document.get("evidence_sha256")
+    payload = copy.deepcopy(document)
+    payload.pop("evidence_sha256", None)
+    workflows = document.get("workflows")
+    if (
+        supplied != canonical_sha256(payload)
+        or document.get("schema_version") != 1
+        or document.get("model") != "mask_grounding_dino"
+        or document.get("task")
+        != "category_prompted_grounded_instance_segmentation"
+        or document.get("primary_metric") != "segm_val_mAP50_95"
+        or document.get("sqsh_sha256")
+        != campaign_contract.FROZEN_SQSH["sha256"]
+        or document.get("cpu_model_runs") != 0
+        or document.get("smoke_model_runs") != 0
+        or document.get("mini_step_runs") != 0
+        or document.get("replacement_workflows_submitted") is not False
+        or not isinstance(workflows, list)
+        or len(workflows) != 4
+        or any(
+            not isinstance(item, dict)
+            or item.get("terminal") is not True
+            or item.get("status") not in {"success", "failure"}
+            for item in workflows
+        )
+    ):
+        raise ManifestGenerationError(
+            "completed Mask Grounding DINO qualification is invalid"
+        )
+    for name in (
+        "qualification_contract_sha256",
+        "qualification_campaign_sha256",
+        "registry_sha256",
+        "ptm_stage_manifest_sha256",
+    ):
+        digest = document.get(name)
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ManifestGenerationError(
+                f"qualification {name} is not lowercase SHA-256"
+            )
+    return {
+        "schema_version": 2,
+        "kind": "direct_full_gpu_qualification_runtime_local_v2",
+        "enabled": True,
+        "scope": "campaign_local_in_memory_projection",
+        "model": "mask_grounding_dino",
+        "task": "category_prompted_grounded_instance_segmentation",
+        "tao_version": "7.1.0",
+        "container_sha256": campaign_contract.FROZEN_SQSH["sha256"],
+        "base_registry_version": (
+            campaign_contract.mask_grounding_dino_registry_snapshot()[
+                "registry_version"
+            ]
+        ),
+        "base_registry_sha256": document["registry_sha256"],
+        "qualification_file_sha256": campaign_contract.sha256_file(
+            evidence_path
+        ),
+        "qualification_evidence_sha256": supplied,
+        "qualification_contract_sha256": document[
+            "qualification_contract_sha256"
+        ],
+        "qualification_campaign_sha256": document[
+            "qualification_campaign_sha256"
+        ],
+        "repository_registry_mutation_allowed": False,
+        "failed_arm_promotion_allowed": False,
+        "unsupported_arm_promotion_allowed": False,
+        "agent_override_allowed": False,
+    }
+
+
 def _runtime(
     *,
     repository: Path,
@@ -482,9 +566,19 @@ def _runtime(
         raise ManifestGenerationError(
             "preserved v1 qualification is not the sealed four-arm failure"
         )
+    source_commit = _git(repository, "rev-parse", "HEAD")
+    eligibility = qualification_evidence_record(qualification)
+    eligibility.update(
+        {
+            "eligibility_source_commit": source_commit,
+            "wheel_sha256": EXPECTED_WHEEL_SHA256,
+            "sdk_commit": EXPECTED_SDK_COMMIT,
+            "skills_commit": EXPECTED_SKILLS_COMMIT,
+        }
+    )
     return {
         "repository": str(repository.resolve()),
-        "source_commit": _git(repository, "rev-parse", "HEAD"),
+        "source_commit": source_commit,
         "source_dirty": False,
         "wheel_path": str(wheel.resolve()),
         "wheel_sha256": EXPECTED_WHEEL_SHA256,
@@ -515,6 +609,7 @@ def _runtime(
             text_encoder["offline_runtime"]
         ),
         "qualification_evidence_path": str(qualification.resolve()),
+        "runtime_local_eligibility": eligibility,
         "predecessor_failure_evidence": {
             "path": str(predecessor),
             "sha256": EXPECTED_PREDECESSOR_QUALIFICATION_SHA256,
@@ -562,7 +657,7 @@ def build_contract(
     repository_path = Path(repository).resolve()
     value = campaign_contract.build_preregistered_contract(
         campaign_id=(
-            "mask_grounding_dino-coco2017-objective-aware-three-mode-v2-20260801"
+            "mask_grounding_dino-coco2017-objective-aware-three-mode-v3-20260801"
         ),
         dataset=dataset_record(
             dataset_manifest,

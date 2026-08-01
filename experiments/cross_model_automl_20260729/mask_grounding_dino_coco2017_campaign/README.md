@@ -10,8 +10,11 @@ SHA-256 `a48d8d8d2a5c65e35c9d39bd5ed1362be54e2be0b89dcda5471812da331a6996`:
 all four jobs loaded their exact PTM and full COCO data, then failed on the
 first distributed training batch because plain DDP did not detect unused
 parameters. V2 changes only the effective DDP strategy and writes to a new
-runtime root. The automatic three-mode trigger remains fail-closed until v2
-evidence and reviewed repository-supported PTM status are both available.
+runtime root. After v2 completes, a schema-v2 campaign-local eligibility
+decision can authorize only exact successful PTM identities through a
+validated in-memory registry projection. The repository registry remains
+unchanged, failed arms remain exclusions, and the automatic trigger stays
+fail-closed until that evidence-bound decision is valid.
 
 ## Scientific contract
 
@@ -95,7 +98,8 @@ Each record has an exact immutable NGC identity, expected member size,
 TAO-7.1 compatibility declaration, license/access metadata, and a
 repository-owned path-free YAML sidecar. Known checkpoint hashes are retained;
 the older commercial v1.0 member must be hashed while staging. All four remain
-`unverified` and are not runtime eligible.
+`unverified` and are not globally runtime eligible; only a later sealed v3
+campaign-local projection can authorize exact successful qualification arms.
 
 `ptm_stage.py` is the repository-owned data-only staging path. It supports
 either direct execution where `/lustre` is mounted or local execution through
@@ -122,8 +126,13 @@ workflow on one node/eight A100s. The four arms launch concurrently with an
 independent durable SDK state store per workflow. In-epoch and standalone mask
 AP must be finite and pass the preregistered experiment sanity gate of `0.05`.
 Failures are terminal preserved exclusions. Successful evidence does not
-mutate or bypass the registry: the exact record must then be independently
-reviewed and promoted to `supported`.
+mutate the repository registry. Ordinary product runtime continues to require
+repository `supported` status. This sealed campaign additionally permits a
+versioned in-memory projection for an exact successful identity, bound to the
+completion-file hash, internal evidence hash, base registry and record hashes,
+TAO/SQSH identity, source commit, wheel, SDK, and skills. The projection is
+never written back to the repository registry and cannot promote a failed or
+explicitly unsupported arm.
 
 ### Qualification v2 DDP correction
 
@@ -192,18 +201,20 @@ pass.
 ## Automatic launch gate
 
 The final campaign is sealed only after source, wheel, SDK, skills, SQSH,
-dataset, BERT, PTM stage, qualification evidence, and supported registry status
-all match their frozen identities. `--automatic-trigger --launch` then starts
-the three independent mode controllers without requesting confirmation.
+dataset, BERT, PTM stage, and terminal qualification evidence all match their
+frozen identities. Its runtime-local eligibility record deterministically
+projects only exact successful, previously unverified records in memory;
+`--automatic-trigger --launch` then starts the three independent mode
+controllers without requesting confirmation.
 Candidate zero in all three modes must pass full train, standalone evaluation,
 latency, provenance, and audit gates before the remaining 23 recommendations
 per mode are released automatically.
 
-Current exact blockers are v2 direct-full qualification and reviewed registry
-promotion. The v1 failure is immutable and cannot be overwritten or treated as
-v2 evidence. A durable `--automatic-trigger --launch` watcher may run in
-parallel with qualification; it submits no three-mode job while either gate is
-unmet.
+The v1 failure is immutable and cannot be overwritten or treated as v2
+evidence. The v3 contract cannot be sealed before v2 terminal evidence exists.
+Once sealed, its durable `--automatic-trigger --launch` watcher submits no
+three-mode job unless the exact evidence, projected-registry digest, and every
+other frozen prerequisite pass.
 
 ## Reproduction sequence
 
@@ -237,12 +248,8 @@ secret-free summary. After this stage and a wheel from a clean reviewed commit:
 cd /localhome/local-rarunachalam/tao-automl
 export PATH=/localhome/local-rarunachalam/.tao/venvs/dino-multiobjective-py314/bin:$PATH
 
-python -m \
-  experiments.cross_model_automl_20260729.mask_grounding_dino_coco2017_campaign.manifest_generator \
-  --output \
-  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask_grounding_dino_coco2017_three_mode_v2/campaign.v2.json
-
-# Direct full qualification: four concurrent one-node/eight-A100 jobs.
+# Direct full qualification used the already sealed v2 contract: four
+# concurrent one-node/eight-A100 jobs.
 python -m \
   experiments.cross_model_automl_20260729.mask_grounding_dino_coco2017_campaign.qualification_campaign \
   --contract \
@@ -251,14 +258,22 @@ python -m \
   /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask_grounding_dino_coco2017_ptm_qualification_v2 \
   --launch
 
-# Run concurrently with qualification. This waits and fails closed; it does
-# not infer registry support from qualification evidence.
+# After completion.json exists, seal the evidence-bound v3 campaign from the
+# clean source commit and matching wheel.
+python -m \
+  experiments.cross_model_automl_20260729.mask_grounding_dino_coco2017_campaign.manifest_generator \
+  --repository /localhome/local-rarunachalam/.tao/worktrees/tao-automl-mgdino-eligibility-v3 \
+  --output \
+  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask_grounding_dino_coco2017_three_mode_v3/campaign.v3.json
+
+# The trigger validates the exact local eligibility projection and launches
+# all three objective-aware controllers automatically.
 python -m \
   experiments.cross_model_automl_20260729.mask_grounding_dino_coco2017_campaign.run_campaign \
   --contract \
-  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask_grounding_dino_coco2017_three_mode_v2/campaign.v2.json \
+  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask_grounding_dino_coco2017_three_mode_v3/campaign.v3.json \
   --runtime-root \
-  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask_grounding_dino_coco2017_three_mode_v2 \
+  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask_grounding_dino_coco2017_three_mode_v3 \
   --automatic-trigger \
   --launch
 ```
