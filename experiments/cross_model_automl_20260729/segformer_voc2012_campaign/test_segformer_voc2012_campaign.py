@@ -1297,6 +1297,9 @@ def test_direct_qualification_submission_is_pinned_one_node_eight_gpu(
     )
     assert "NVIDIA A100-SXM4-80GB" in guard
     assert "wc -l)\" -eq 8" in guard
+    assert "export MASTER_ADDR=127.0.0.1" in guard
+    assert "15000 + SLURM_JOB_ID % 10000" in guard
+    assert "s.bind" in guard
     assert "segformer train -e {config_path}" in guard
 
 
@@ -1410,6 +1413,84 @@ def test_training_status_evidence_rejects_missing_epoch_evaluation_record(
         match="emitted 49 val_miou records; expected 50",
     ):
         qualification_campaign._training_status_evidence(object(), "job-id")
+
+
+def test_qualification_terminal_checkpoint_uses_epoch_49_not_search_epoch_9(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    commands = []
+
+    class FakeSDK:
+        def get_job_results_dir(self, job_id):
+            assert job_id == "train-job"
+            return "/lustre/results/train-job"
+
+    def fake_remote_output(command):
+        commands.append(command)
+        return json.dumps(
+            {
+                "path": (
+                    "/lustre/results/train-job/results_dir/train/"
+                    "model_epoch_049_step_09150.pth"
+                ),
+                "filename": "model_epoch_049_step_09150.pth",
+                "size_bytes": 123,
+                "sha256": "a" * 64,
+            }
+        )
+
+    monkeypatch.setattr(
+        qualification_campaign,
+        "remote_output",
+        fake_remote_output,
+    )
+
+    evidence = qualification_campaign._qualification_terminal_checkpoint(
+        FakeSDK(),
+        "train-job",
+    )
+
+    assert len(commands) == 1
+    assert "model_epoch_049_step_*.pth" in commands[0]
+    assert "model_epoch_009" not in commands[0]
+    assert evidence["terminal_epoch_index"] == 49
+    assert evidence["training_epochs"] == 50
+    assert evidence["naming_contract"] == (
+        "model_epoch_049_step_numeric"
+    )
+
+
+def test_qualification_terminal_checkpoint_rejects_search_epoch_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class FakeSDK:
+        def get_job_results_dir(self, _job_id):
+            return "/lustre/results/train-job"
+
+    monkeypatch.setattr(
+        qualification_campaign,
+        "remote_output",
+        lambda _command: json.dumps(
+            {
+                "path": (
+                    "/lustre/results/train-job/results_dir/train/"
+                    "model_epoch_009_step_01830.pth"
+                ),
+                "filename": "model_epoch_009_step_01830.pth",
+                "size_bytes": 123,
+                "sha256": "a" * 64,
+            }
+        ),
+    )
+
+    with pytest.raises(
+        qualification_campaign.CampaignExecutionError,
+        match="checkpoint identity is invalid",
+    ):
+        qualification_campaign._qualification_terminal_checkpoint(
+            FakeSDK(),
+            "train-job",
+        )
 
 
 def test_qualification_slurm_preflight_is_read_only_and_job_free(

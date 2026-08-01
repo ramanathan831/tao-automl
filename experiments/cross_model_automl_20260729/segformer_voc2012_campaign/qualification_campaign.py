@@ -89,6 +89,12 @@ QUALIFICATION_CAMPAIGN_ID = campaign_contract.QUALIFICATION_CAMPAIGN_ID
 EVALUATION_CHECKPOINT_SENTINEL = (
     "__TERMINAL_CHECKPOINT_FROM_THIS_WORKFLOW__"
 )
+# Keep the one-node Lightning rendezvous below the usual Linux ephemeral
+# range and make it unique to the SLURM allocation.  Qualification v2 let
+# Lightning choose a transient high port; one otherwise valid eight-GPU job
+# failed when that port was claimed before rank zero could bind it.
+QUALIFICATION_MASTER_PORT_BASE = 15000
+QUALIFICATION_MASTER_PORT_SPAN = 10000
 TERMINAL_JOB_STATUSES = frozenset({"Complete", "Error", "Canceled"})
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -1033,6 +1039,16 @@ def _gpu_guard(command: str) -> str:
     return " ".join(
         [
             "set -eu;",
+            "case \"${SLURM_JOB_ID:-}\" in "
+            "(''|*[!0-9]*) exit 91;; esac;",
+            "export MASTER_ADDR=127.0.0.1;",
+            "export MASTER_PORT=\"$(("
+            f"{QUALIFICATION_MASTER_PORT_BASE} + SLURM_JOB_ID % "
+            f"{QUALIFICATION_MASTER_PORT_SPAN}"
+            "))\";",
+            "python3 -c 'import os,socket; s=socket.socket(); "
+            "s.bind((os.environ[\"MASTER_ADDR\"], "
+            "int(os.environ[\"MASTER_PORT\"]))); s.close()';",
             "gpu_names=\"$(nvidia-smi --query-gpu=name "
             "--format=csv,noheader)\";",
             "gpu_caps=\"$(nvidia-smi --query-gpu=compute_cap "
@@ -1263,6 +1279,66 @@ def _training_status_evidence(
     }
 
 
+def _qualification_terminal_checkpoint(
+    sdk: Any,
+    job_id: str,
+) -> dict[str, Any]:
+    """Resolve the exact terminal checkpoint for the 50-epoch run."""
+    epochs = campaign_contract.FROZEN_QUALIFICATION_TRAINING_EPOCHS
+    terminal_epoch = epochs - 1
+    epoch_token = f"{terminal_epoch:03d}"
+    root = run_campaign._local_lustre_path(
+        sdk.get_job_results_dir(job_id)
+    )
+    folder = f"{root.rstrip('/')}/results_dir/train"
+    script = (
+        "import glob,hashlib,json,pathlib,sys;"
+        "paths=sorted(glob.glob(sys.argv[1]+'/'+sys.argv[2]));"
+        "assert len(paths)==1,paths;"
+        "p=pathlib.Path(paths[0]);h=hashlib.sha256();f=p.open('rb');"
+        "[(h.update(c)) for c in iter(lambda:f.read(1048576),b'')];"
+        "f.close();print(json.dumps({'path':str(p),'filename':p.name,"
+        "'size_bytes':p.stat().st_size,'sha256':h.hexdigest()}))"
+    )
+    pattern = f"model_epoch_{epoch_token}_step_*.pth"
+    try:
+        evidence = json.loads(
+            remote_output(
+                f"python3 -c {shlex.quote(script)} "
+                f"{shlex.quote(folder)} {shlex.quote(pattern)}"
+            )
+        )
+    except Exception as exc:
+        raise CampaignExecutionError(
+            "exact terminal qualification checkpoint is unavailable "
+            "or ambiguous"
+        ) from exc
+    if (
+        not re.fullmatch(
+            rf"model_epoch_{epoch_token}_step_[0-9]+[.]pth",
+            str(evidence.get("filename", "")),
+        )
+        or not str(evidence.get("path", "")).startswith("/lustre/")
+        or not isinstance(evidence.get("size_bytes"), int)
+        or evidence["size_bytes"] < 1
+        or not _SHA256_RE.fullmatch(str(evidence.get("sha256", "")))
+    ):
+        raise CampaignExecutionError(
+            "terminal qualification checkpoint identity is invalid"
+        )
+    evidence.update(
+        {
+            "training_epochs": epochs,
+            "terminal_epoch_index": terminal_epoch,
+            "naming_contract": (
+                f"model_epoch_{epoch_token}_step_numeric"
+            ),
+            "ambiguity_policy": "fail_closed",
+        }
+    )
+    return evidence
+
+
 def _evaluation_status_evidence(
     sdk: Any,
     job_id: str,
@@ -1443,7 +1519,10 @@ def _run_workflow(
                 f"training job ended with {train_status}"
             )
         train_evidence = _training_status_evidence(sdk, train_job.id)
-        checkpoint = run_campaign._terminal_checkpoint(sdk, train_job.id)
+        checkpoint = _qualification_terminal_checkpoint(
+            sdk,
+            train_job.id,
+        )
         evidence["jobs"]["train"].update(
             {
                 "status_evidence": train_evidence,
