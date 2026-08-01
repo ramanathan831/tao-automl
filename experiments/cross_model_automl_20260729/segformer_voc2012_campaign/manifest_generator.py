@@ -20,7 +20,7 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_REPOSITORY = Path("/localhome/local-rarunachalam/tao-automl")
 DEFAULT_WHEEL = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
-    "cross_model_automl_20260729/wheel/1919228616b8/"
+    "cross_model_automl_20260729/wheel/segformer-v5-selective-recovery/"
     "nvidia_tao_automl-0.1.0-py3-none-any.whl"
 )
 DEFAULT_SDK = Path(
@@ -58,7 +58,7 @@ EXPECTED_STAGE_MANIFEST_SHA256 = (
     "437ff12490637950707b9b951d820ea34d38b926080a478a5d182c2d284a0c5d"
 )
 EXPECTED_WHEEL_SHA256 = (
-    "3463187cb76ec3d07c64a21eaf34140e56bf251b46e56ce3c89c33728ee22784"
+    "a5e78903aa7c540a7c13b9b413ed5daf64534df04cc91a21d9480875e7d16f3e"
 )
 EXPECTED_SDK_COMMIT = "a2e50d0930c3e3785b4b39fa8c3da88b39ff89e5"
 EXPECTED_SKILLS_COMMIT = "2e9c1b25f3c7cb1ae444c75652e36c47eace8229"
