@@ -303,7 +303,6 @@ def validate_runtime_local_eligibility(
         record["id"]: record["registry_record_sha256"]
         for record in snapshot["records"]
     }
-    frozen = FROZEN_V3_QUALIFICATION_CONTRACT
     if (
         policy.get("schema_version") != 2
         or policy.get("kind")
@@ -321,38 +320,23 @@ def validate_runtime_local_eligibility(
         or policy.get("base_record_sha256_by_checkpoint_id")
         != expected_records
         or policy.get("qualification_path")
-        != frozen["qualification_evidence_path"]
-        or policy.get("qualification_path")
         != runtime.get("qualification_evidence_path")
-        or policy.get("qualification_contract_path") != frozen["path"]
-        or policy.get("qualification_contract_file_sha256")
-        != frozen["file_sha256"]
-        or policy.get("qualification_contract_sha256")
-        != frozen["contract_sha256"]
-        or policy.get("qualification_source_commit")
-        != frozen["source_commit"]
-        or policy.get("qualification_source_wheel_sha256")
-        != frozen["wheel_sha256"]
-        or policy.get("qualification_source_sdk_commit")
-        != frozen["sdk_commit"]
-        or policy.get("qualification_source_skills_commit")
-        != frozen["skills_commit"]
-        or policy.get("qualification_campaign_sha256")
-        != frozen["qualification_campaign_sha256"]
-        or policy.get("qualification_campaign_id")
-        != frozen["qualification_campaign_id"]
         or policy.get("ptm_stage_manifest_path")
-        != frozen["ptm_stage_manifest_path"]
+        != runtime.get("ptm_stage_manifest_path")
         or policy.get("ptm_stage_manifest_sha256")
-        != frozen["ptm_stage_manifest_sha256"]
+        != runtime.get("ptm_stage_manifest_sha256")
         or policy.get("ptm_stage_content_sha256")
-        != frozen["ptm_stage_content_sha256"]
+        != runtime.get("ptm_stage_content_sha256")
         or policy.get("eligibility_source_commit")
         != runtime.get("source_commit")
         or policy.get("wheel_sha256") != runtime.get("wheel_sha256")
         or policy.get("sdk_commit") != runtime.get("sdk_commit")
         or policy.get("skills_commit") != runtime.get("skills_commit")
         or any(policy.get(name) is not False for name in required_false)
+        or not isinstance(policy.get("qualification_contract_path"), str)
+        or not policy.get("qualification_contract_path")
+        or not isinstance(policy.get("qualification_campaign_id"), str)
+        or not policy.get("qualification_campaign_id")
         or any(
             not _is_lower_sha256(policy.get(name))
             for name in (

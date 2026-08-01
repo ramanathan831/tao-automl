@@ -20,7 +20,7 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_REPOSITORY = Path("/localhome/local-rarunachalam/tao-automl")
 DEFAULT_WHEEL = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
-    "cross_model_automl_20260729/wheel/1fa7e75066bf/"
+    "cross_model_automl_20260729/wheels/35972c1/"
     "nvidia_tao_automl-0.1.0-py3-none-any.whl"
 )
 DEFAULT_SDK = Path(
@@ -52,12 +52,12 @@ DEFAULT_TEXT_ENCODER_STAGE = (
 DEFAULT_QUALIFICATION = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "mask_grounding_dino_coco2017_ptm_qualification_v2/completion.json"
+    "mask_grounding_dino_coco2017_ptm_qualification_v3/completion.json"
 )
 DEFAULT_PREDECESSOR_QUALIFICATION = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "mask_grounding_dino_coco2017_ptm_qualification_v1/completion.json"
+    "mask_grounding_dino_coco2017_ptm_qualification_v2/completion.json"
 )
 DEFAULT_PTM_STAGE_MANIFEST = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
@@ -77,12 +77,12 @@ EXPECTED_TEXT_ENCODER_STAGE_SHA256 = (
     "ac5b6c12bc7d5abd06beaeb61c79426a6f917d4671551fce202fa63fe6dbe160"
 )
 EXPECTED_WHEEL_SHA256 = (
-    "1fa7e75066bf8a58432e1b2672f86a88a2bf4d7a6b37331ee3ac02e87369275f"
+    "304824dc95ee0ef763ae72f8872e79e593613a36a17e20dbf50b3a561892b381"
 )
 EXPECTED_SDK_COMMIT = "1a981d79af40d156735f3d89b98495e7818d0891"
 EXPECTED_SKILLS_COMMIT = "2e9c1b25f3c7cb1ae444c75652e36c47eace8229"
 EXPECTED_PREDECESSOR_QUALIFICATION_SHA256 = (
-    "a48d8d8d2a5c65e35c9d39bd5ed1362be54e2be0b89dcda5471812da331a6996"
+    "35e2d52317ab8458cbfa4efdf8bfa320f083aa19daaaf822b7cde9ed39dfe0eb"
 )
 
 
@@ -403,7 +403,7 @@ def ptm_stage_record(path: str | Path) -> dict[str, Any]:
 
 
 def qualification_evidence_record(path: str | Path) -> dict[str, Any]:
-    """Bind the immutable v2 direct-full-run completion for local eligibility."""
+    """Bind the immutable checkpoint-resumable v3 completion."""
     evidence_path = Path(path).resolve()
     if not evidence_path.is_file():
         raise ManifestGenerationError(
@@ -426,7 +426,17 @@ def qualification_evidence_record(path: str | Path) -> dict[str, Any]:
         or document.get("cpu_model_runs") != 0
         or document.get("smoke_model_runs") != 0
         or document.get("mini_step_runs") != 0
-        or document.get("replacement_workflows_submitted") is not False
+        or document.get("replacement_workflows_submitted") is not True
+        or document.get("replacement_workflow_count") != 4
+        or document.get("checkpoint_resume_policy")
+        != campaign_contract.CHECKPOINT_RESUME_POLICY
+        or not isinstance(
+            document.get("predecessor_failure_evidence"), dict
+        )
+        or document["predecessor_failure_evidence"].get(
+            "all_terminal_failures_preserved"
+        )
+        is not True
         or not isinstance(workflows, list)
         or len(workflows) != 4
         or any(
@@ -479,6 +489,14 @@ def qualification_evidence_record(path: str | Path) -> dict[str, Any]:
         "qualification_campaign_sha256": document[
             "qualification_campaign_sha256"
         ],
+        "replacement_workflows_submitted": True,
+        "replacement_workflow_count": 4,
+        "checkpoint_resume_policy": copy.deepcopy(
+            campaign_contract.CHECKPOINT_RESUME_POLICY
+        ),
+        "predecessor_failure_evidence": copy.deepcopy(
+            document["predecessor_failure_evidence"]
+        ),
         "repository_registry_mutation_allowed": False,
         "failed_arm_promotion_allowed": False,
         "unsupported_arm_promotion_allowed": False,
@@ -610,14 +628,9 @@ def _runtime(
         ),
         "qualification_evidence_path": str(qualification.resolve()),
         "runtime_local_eligibility": eligibility,
-        "predecessor_failure_evidence": {
-            "path": str(predecessor),
-            "sha256": EXPECTED_PREDECESSOR_QUALIFICATION_SHA256,
-            "campaign_id": predecessor_document.get("campaign_id"),
-            "workflow_count": 4,
-            "all_terminal_failures_preserved": True,
-            "replacement_submitted": False,
-        },
+        "predecessor_failure_evidence": copy.deepcopy(
+            eligibility["predecessor_failure_evidence"]
+        ),
         "ptm_stage_manifest_path": ptm_stage["path"],
         "ptm_stage_manifest_sha256": ptm_stage["sha256"],
         "ptm_stage_content_sha256": ptm_stage["manifest_sha256"],
@@ -657,7 +670,7 @@ def build_contract(
     repository_path = Path(repository).resolve()
     value = campaign_contract.build_preregistered_contract(
         campaign_id=(
-            "mask_grounding_dino-coco2017-objective-aware-three-mode-v3-20260801"
+            "mask_grounding_dino-coco2017-objective-aware-three-mode-v4-20260801"
         ),
         dataset=dataset_record(
             dataset_manifest,

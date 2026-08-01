@@ -32,6 +32,7 @@ from tao_automl.ptm_registry import (
 
 from .campaign_contract import (
     AGENT_FLAGS,
+    CHECKPOINT_RESUME_POLICY,
     FROZEN_DDP_STRATEGY_RESOLUTION,
     FROZEN_SQSH,
     FROZEN_TRAINING_EPOCHS,
@@ -554,6 +555,16 @@ def audit_qualification(
                     != policy["base_registry_sha256"]
                     or registry.registry_version
                     != policy["base_registry_version"]
+                    or document.get(
+                        "replacement_workflows_submitted", False
+                    )
+                    is not policy.get(
+                        "replacement_workflows_submitted", False
+                    )
+                    or document.get("replacement_workflow_count", 0)
+                    != policy.get("replacement_workflow_count", 0)
+                    or document.get("checkpoint_resume_policy")
+                    != policy.get("checkpoint_resume_policy")
                 )
             )
         ):
@@ -599,6 +610,20 @@ def audit_qualification(
         or document.get("cpu_model_runs") != 0
         or document.get("smoke_model_runs") != 0
         or document.get("mini_step_runs") != 0
+        or not (
+            (
+                document.get("replacement_workflows_submitted", False)
+                is False
+                and document.get("replacement_workflow_count", 0) == 0
+                and document.get("checkpoint_resume_policy") is None
+            )
+            or (
+                document.get("replacement_workflows_submitted") is True
+                and document.get("replacement_workflow_count") == 4
+                and document.get("checkpoint_resume_policy")
+                == CHECKPOINT_RESUME_POLICY
+            )
+        )
         or document.get("distributed_strategy_resolution")
         != FROZEN_DDP_STRATEGY_RESOLUTION
         or not isinstance(

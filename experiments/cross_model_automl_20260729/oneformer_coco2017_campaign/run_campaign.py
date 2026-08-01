@@ -65,11 +65,11 @@ ENV_PATH = Path("/localhome/local-rarunachalam/.tao/config.env")
 DEFAULT_CONTRACT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "oneformer_coco2017_three_mode_v4/campaign.v4.json"
+    "oneformer_coco2017_three_mode_v5/campaign.v5.json"
 )
 DEFAULT_RUNTIME_ROOT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
-    "cross_model_automl_20260729/oneformer_coco2017_three_mode_v4"
+    "cross_model_automl_20260729/oneformer_coco2017_three_mode_v5"
 )
 STATIC_SQSH_AUDIT = HERE / "static_sqsh_audit.v1.json"
 TERMINAL_JOB_STATUSES = frozenset({"Complete", "Error", "Canceled"})

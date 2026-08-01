@@ -926,8 +926,13 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
         not isinstance(predecessor, Mapping)
         or not isinstance(predecessor.get("path"), str)
         or not Path(predecessor["path"]).is_absolute()
-        or not isinstance(predecessor.get("sha256"), str)
-        or len(predecessor["sha256"]) != 64
+        or not isinstance(
+            predecessor.get("file_sha256", predecessor.get("sha256")), str
+        )
+        or len(
+            predecessor.get("file_sha256", predecessor.get("sha256", ""))
+        )
+        != 64
         or predecessor.get("workflow_count") != 4
         or predecessor.get("all_terminal_failures_preserved") is not True
         or predecessor.get("replacement_submitted") is not False

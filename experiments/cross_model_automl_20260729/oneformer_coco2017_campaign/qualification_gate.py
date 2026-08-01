@@ -594,7 +594,14 @@ def audit_qualification(
         or document.get("registry_sha256")
         != policy["base_registry_sha256"]
         or registry.registry_version != policy["base_registry_version"]
-        or document.get("replacement_workflows_submitted") is not False
+        or document.get("replacement_workflows_submitted")
+        is not policy.get("replacement_workflows_submitted", False)
+        or document.get("replacement_workflow_count", 0)
+        != policy.get("replacement_workflow_count", 0)
+        or document.get("recovery_checkpoint_ids", [])
+        != policy.get("recovery_checkpoint_ids", [])
+        or document.get("reused_predecessor_checkpoint_ids", [])
+        != policy.get("reused_predecessor_checkpoint_ids", [])
     ):
         raise QualificationGateError(
             "qualification evidence differs from the sealed v3 contract"

@@ -23,7 +23,7 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_REPOSITORY = Path("/localhome/local-rarunachalam/tao-automl")
 DEFAULT_WHEEL = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
-    "cross_model_automl_20260729/wheel/c1a9329f/"
+    "cross_model_automl_20260729/wheels/35972c1/"
     "nvidia_tao_automl-0.1.0-py3-none-any.whl"
 )
 DEFAULT_SDK = Path(
@@ -46,10 +46,12 @@ DEFAULT_STAGE_MANIFEST = (
 DEFAULT_QUALIFICATION = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "oneformer_coco2017_ptm_qualification_v3/completion.json"
+    "oneformer_coco2017_ptm_qualification_v4/completion.json"
 )
 DEFAULT_QUALIFICATION_CONTRACT = Path(
-    campaign_contract.FROZEN_V3_QUALIFICATION_CONTRACT["path"]
+    "/localhome/local-rarunachalam/.tao/artifacts/"
+    "cross_model_automl_20260729/"
+    "oneformer_coco2017_ptm_qualification_v4/qualification.v4.json"
 )
 DEFAULT_PTM_STAGE_MANIFEST = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
@@ -68,10 +70,10 @@ EXPECTED_STAGE_MANIFEST_SHA256 = (
     "437ff12490637950707b9b951d820ea34d38b926080a478a5d182c2d284a0c5d"
 )
 EXPECTED_WHEEL_SHA256 = (
-    "957f7bfd3cd5684addc78ede5519f52edcb8bd69665f400f67b2d3127be3dde9"
+    "304824dc95ee0ef763ae72f8872e79e593613a36a17e20dbf50b3a561892b381"
 )
 WHEEL_BUILD_COMMIT = (
-    "c1a93297032e5978f39ee8daedee2470b16fad59"
+    "35972c1bc63e64901c40b0de5be95cc14c19ec80"
 )
 EXPECTED_WHEEL_REGISTRY_FILE_SHA256 = (
     "c28831814cabcd676909260ab347c6f756294089371be61e941e2de69400a725"
@@ -97,6 +99,178 @@ def _lower_sha256(value: Any, name: str) -> str:
     return value
 
 
+def _successor_qualification_evidence_record(
+    evidence_path: Path,
+    contract_path: Path,
+) -> dict[str, Any]:
+    """Bind the selective v4 recovery and its preserved v3 predecessor."""
+    try:
+        source = json.loads(contract_path.read_text(encoding="utf-8"))
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ManifestGenerationError(
+            "OneFormer v4 qualification JSON is invalid"
+        ) from exc
+    source_payload = copy.deepcopy(source)
+    source_internal = source_payload.pop("contract_sha256", None)
+    policy = source.get("qualification_policy", {})
+    runtime = source.get("runtime", {})
+    predecessor = policy.get("predecessor_evidence", {})
+    expected_recovery = [
+        "oneformer.its.commercial.dinat_large.trainable"
+    ]
+    expected_reused = {
+        "oneformer.ade20k.research.swin_large.trainable.v1.0",
+        "oneformer.coco.research.swin_large.trainable",
+        "oneformer.its.commercial.swin_large.trainable.v1.0",
+    }
+    if (
+        source_internal != canonical_sha256(source_payload)
+        or source.get("campaign_id")
+        != "oneformer-coco2017-direct-full-ptm-qualification-v4-20260801"
+        or source.get("model") != "oneformer"
+        or source.get("task") != "panoptic_segmentation"
+        or source.get("sqsh") != campaign_contract.FROZEN_SQSH
+        or policy.get("version") != 4
+        or policy.get("qualification_campaign_id")
+        != source.get("campaign_id")
+        or policy.get("qualification_evidence_path")
+        != str(evidence_path)
+        or runtime.get("qualification_evidence_path")
+        != str(evidence_path)
+        or runtime.get("source_commit")
+        != "35972c1bc63e64901c40b0de5be95cc14c19ec80"
+        or runtime.get("wheel_sha256") != EXPECTED_WHEEL_SHA256
+        or runtime.get("sdk_commit") != EXPECTED_SDK_COMMIT
+        or runtime.get("skills_commit") != EXPECTED_SKILLS_COMMIT
+        or policy.get("checkpoint_resume_policy")
+        != campaign_contract.CHECKPOINT_RESUME_POLICY
+        or policy.get("recovery_checkpoint_ids") != expected_recovery
+        or set(policy.get("reused_checkpoint_ids", [])) != expected_reused
+        or predecessor.get("failed_workflow_preserved") is not True
+        or predecessor.get("recovery_checkpoint_ids") != expected_recovery
+        or set(predecessor.get("reused_success_checkpoint_ids", []))
+        != expected_reused
+    ):
+        raise ManifestGenerationError(
+            "OneFormer v4 qualification contract identity changed"
+        )
+    snapshot = campaign_contract.oneformer_registry_snapshot()
+    snapshot_records = {
+        record["id"]: record["registry_record_sha256"]
+        for record in source["ptm_inventory"]["records"]
+    }
+    expected_records = {
+        record["id"]: record["registry_record_sha256"]
+        for record in snapshot["records"]
+    }
+    if snapshot_records != expected_records:
+        raise ManifestGenerationError(
+            "OneFormer v4 qualification PTM identities changed"
+        )
+    evidence_payload = copy.deepcopy(evidence)
+    evidence_internal = evidence_payload.pop("evidence_sha256", None)
+    workflows = evidence.get("workflows")
+    if (
+        evidence_internal != canonical_sha256(evidence_payload)
+        or evidence.get("campaign_id") != source.get("campaign_id")
+        or evidence.get("qualification_contract_sha256") != source_internal
+        or evidence.get("qualification_campaign_sha256")
+        != source.get("launcher_integrity", {}).get(
+            "qualification_campaign_sha256"
+        )
+        or evidence.get("registry_sha256") != snapshot["registry_sha256"]
+        or evidence.get("sqsh_sha256")
+        != campaign_contract.FROZEN_SQSH["sha256"]
+        or evidence.get("runtime_overlay_sha256")
+        != campaign_contract.FROZEN_RUNTIME_OVERLAY["archive_sha256"]
+        or evidence.get("ptm_stage_manifest_sha256")
+        != runtime.get("ptm_stage_manifest_sha256")
+        or evidence.get("ptm_stage_content_sha256")
+        != runtime.get("ptm_stage_content_sha256")
+        or evidence.get("replacement_workflows_submitted") is not True
+        or evidence.get("replacement_workflow_count") != 1
+        or evidence.get("recovery_checkpoint_ids") != expected_recovery
+        or set(evidence.get("reused_predecessor_checkpoint_ids", []))
+        != expected_reused
+        or evidence.get("predecessor_evidence") != predecessor
+        or evidence.get("checkpoint_resume_policy")
+        != campaign_contract.CHECKPOINT_RESUME_POLICY
+        or any(evidence.get(name) != 0 for name in (
+            "cpu_model_runs", "smoke_model_runs", "mini_step_runs"
+        ))
+        or not isinstance(workflows, list)
+        or len(workflows) != 4
+        or {item.get("checkpoint_id") for item in workflows}
+        != set(expected_records)
+        or any(
+            not isinstance(item, dict)
+            or item.get("terminal") is not True
+            or item.get("status") not in {"success", "failure"}
+            or canonical_sha256(
+                {key: value for key, value in item.items()
+                 if key != "workflow_sha256"}
+            ) != item.get("workflow_sha256")
+            for item in workflows
+        )
+    ):
+        raise ManifestGenerationError(
+            "terminal OneFormer v4 qualification evidence is invalid"
+        )
+    for name, value in (
+        ("qualification evidence SHA-256", evidence_internal),
+        ("qualification contract SHA-256", source_internal),
+    ):
+        _lower_sha256(value, name)
+    return {
+        "schema_version": 2,
+        "kind": "direct_full_gpu_qualification_runtime_local_v2",
+        "enabled": True,
+        "scope": "campaign_local_in_memory_projection",
+        "model": "oneformer",
+        "task": "panoptic_segmentation",
+        "tao_version": "7.1.0",
+        "container_sha256": campaign_contract.FROZEN_SQSH["sha256"],
+        "base_registry_version": snapshot["registry_version"],
+        "base_registry_sha256": snapshot["registry_sha256"],
+        "base_record_sha256_by_checkpoint_id": snapshot_records,
+        "qualification_path": str(evidence_path),
+        "qualification_file_sha256": campaign_contract.sha256_file(
+            evidence_path
+        ),
+        "qualification_evidence_sha256": evidence_internal,
+        "qualification_contract_path": str(contract_path),
+        "qualification_contract_file_sha256": (
+            campaign_contract.sha256_file(contract_path)
+        ),
+        "qualification_contract_sha256": source_internal,
+        "qualification_source_commit": runtime["source_commit"],
+        "qualification_source_wheel_sha256": runtime["wheel_sha256"],
+        "qualification_source_sdk_commit": runtime["sdk_commit"],
+        "qualification_source_skills_commit": runtime["skills_commit"],
+        "qualification_campaign_sha256": source["launcher_integrity"][
+            "qualification_campaign_sha256"
+        ],
+        "qualification_campaign_id": source["campaign_id"],
+        "ptm_stage_manifest_path": runtime["ptm_stage_manifest_path"],
+        "ptm_stage_manifest_sha256": runtime[
+            "ptm_stage_manifest_sha256"
+        ],
+        "ptm_stage_content_sha256": runtime["ptm_stage_content_sha256"],
+        "qualification_successor_version": 4,
+        "replacement_workflows_submitted": True,
+        "replacement_workflow_count": 1,
+        "recovery_checkpoint_ids": expected_recovery,
+        "reused_predecessor_checkpoint_ids": sorted(expected_reused),
+        "predecessor_evidence": copy.deepcopy(predecessor),
+        "repository_registry_mutation_allowed": False,
+        "projection_persisted_as_global_registry": False,
+        "failed_arm_promotion_allowed": False,
+        "unsupported_arm_promotion_allowed": False,
+        "agent_override_allowed": False,
+    }
+
+
 def qualification_evidence_record(
     path: str | Path,
     qualification_contract: str | Path,
@@ -105,6 +279,14 @@ def qualification_evidence_record(
     evidence_path = Path(path).resolve()
     contract_path = Path(qualification_contract).resolve()
     frozen = campaign_contract.FROZEN_V3_QUALIFICATION_CONTRACT
+    if str(contract_path) != frozen["path"]:
+        if not evidence_path.is_file() or not contract_path.is_file():
+            raise ManifestGenerationError(
+                "terminal OneFormer v4 qualification evidence is unavailable"
+            )
+        return _successor_qualification_evidence_record(
+            evidence_path, contract_path
+        )
     if (
         str(evidence_path) != frozen["qualification_evidence_path"]
         or not evidence_path.is_file()
@@ -697,7 +879,7 @@ def build_contract(
     repository_path = Path(repository).resolve()
     value = campaign_contract.build_preregistered_contract(
         campaign_id=(
-            "oneformer-coco2017-objective-aware-three-mode-v4-20260801"
+            "oneformer-coco2017-objective-aware-three-mode-v5-20260801"
         ),
         dataset=dataset_record(dataset_manifest, stage_manifest),
         skill_dir=(
@@ -781,7 +963,7 @@ def main(argv: list[str] | None = None) -> int:
         "--automatic-trigger",
         action="store_true",
         help=(
-            "Wait for terminal immutable v3 evidence, seal v4, and continue "
+            "Wait for terminal immutable v4 evidence, seal v5, and continue "
             "without another confirmation step."
         ),
     )
@@ -795,7 +977,7 @@ def main(argv: list[str] | None = None) -> int:
         default=Path(
             "/localhome/local-rarunachalam/.tao/artifacts/"
             "cross_model_automl_20260729/"
-            "oneformer_coco2017_three_mode_v4"
+            "oneformer_coco2017_three_mode_v5"
         ),
     )
     parser.add_argument(
@@ -855,7 +1037,7 @@ def main(argv: list[str] | None = None) -> int:
                 "launch_authorized": False,
                 "reason": (
                     "the sealed overlay remediates the immutable base-SQSH "
-                    "findings; the automatic trigger validates the exact v3 "
+                    "findings; the automatic trigger validates the exact v4 "
                     "completion and its campaign-local in-memory PTM registry "
                     "projection before launching"
                 ),

@@ -602,7 +602,7 @@ def test_manifest_constants_bind_final_coco_stage_and_new_wheel():
     )
     assert (
         manifest_generator.WHEEL_BUILD_COMMIT
-        == "c1a93297032e5978f39ee8daedee2470b16fad59"
+        == "35972c1bc63e64901c40b0de5be95cc14c19ec80"
     )
     assert manifest_generator.DEFAULT_WHEEL.is_file()
     assert (
@@ -662,8 +662,8 @@ def test_successor_binds_exact_live_v3_contract_and_will_not_seal_early(
 def test_successor_and_frozen_qualification_cli_defaults_are_decoupled(
     capsys,
 ):
-    assert run_campaign.DEFAULT_CONTRACT.name == "campaign.v4.json"
-    assert run_campaign.DEFAULT_RUNTIME_ROOT.name.endswith("three_mode_v4")
+    assert run_campaign.DEFAULT_CONTRACT.name == "campaign.v5.json"
+    assert run_campaign.DEFAULT_RUNTIME_ROOT.name.endswith("three_mode_v5")
     assert qualification_campaign.DEFAULT_CONTRACT.name == (
         "qualification.v4.json"
     )
