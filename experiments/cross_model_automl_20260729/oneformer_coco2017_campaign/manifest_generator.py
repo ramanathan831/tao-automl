@@ -71,6 +71,9 @@ WHEEL_BUILD_COMMIT = (
 EXPECTED_WHEEL_REGISTRY_FILE_SHA256 = (
     "c5dc1fb5573cfb553150713d94fc2f5ff7f7fb1d4698bc8f9dc14fa4ed664153"
 )
+EXPECTED_WHEEL_ONEFORMER_REGISTRY_SHA256 = (
+    "3872bec8c0e58f79cd2f941d18bcc1bcb5660ed90c9a4500f8ab5cf3004bde2a"
+)
 EXPECTED_SDK_COMMIT = "a2e50d0930c3e3785b4b39fa8c3da88b39ff89e5"
 EXPECTED_SKILLS_COMMIT = "2e9c1b25f3c7cb1ae444c75652e36c47eace8229"
 
@@ -299,13 +302,18 @@ def _runtime(
         )
     head = _git(repository, "rev-parse", "HEAD")
     registry_path = repository / "src/tao_automl/data/ptm_registry.v1.json"
-    if (
-        not registry_path.is_file()
-        or campaign_contract.sha256_file(registry_path)
-        != EXPECTED_WHEEL_REGISTRY_FILE_SHA256
-    ):
+    try:
+        source_registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        oneformer_sha = canonical_sha256(
+            source_registry["models"]["oneformer"]
+        )
+    except (OSError, KeyError, TypeError, ValueError) as exc:
         raise ManifestGenerationError(
-            "campaign source does not match the wheel's OneFormer registry"
+            "campaign source lacks the wheel's OneFormer registry"
+        ) from exc
+    if oneformer_sha != EXPECTED_WHEEL_ONEFORMER_REGISTRY_SHA256:
+        raise ManifestGenerationError(
+            "campaign source does not match the wheel's OneFormer inventory"
         )
     overlay = runtime_overlay_record(runtime_overlay)
     if (
@@ -341,6 +349,9 @@ def _runtime(
         "wheel_build_commit": WHEEL_BUILD_COMMIT,
         "wheel_registry_file_sha256": (
             EXPECTED_WHEEL_REGISTRY_FILE_SHA256
+        ),
+        "wheel_oneformer_registry_sha256": (
+            EXPECTED_WHEEL_ONEFORMER_REGISTRY_SHA256
         ),
         "sdk_dir": str(sdk.resolve()),
         "sdk_commit": EXPECTED_SDK_COMMIT,
