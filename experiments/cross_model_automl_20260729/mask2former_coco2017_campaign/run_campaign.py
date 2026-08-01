@@ -57,10 +57,14 @@ except ModuleNotFoundError:  # pragma: no cover - direct execution
 
 HERE = Path(__file__).resolve().parent
 ENV_PATH = Path("/localhome/local-rarunachalam/.tao/config.env")
-DEFAULT_CONTRACT = HERE / "campaign.v1.json"
+DEFAULT_CONTRACT = Path(
+    "/localhome/local-rarunachalam/.tao/artifacts/"
+    "cross_model_automl_20260729/"
+    "mask2former_coco2017_three_mode_v2/campaign.v2.json"
+)
 DEFAULT_RUNTIME_ROOT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
-    "cross_model_automl_20260729/mask2former_coco2017_three_mode"
+    "cross_model_automl_20260729/mask2former_coco2017_three_mode_v2"
 )
 TERMINAL_JOB_STATUSES = frozenset({"Complete", "Error", "Canceled"})
 SUCCESS_RECOMMENDATION_STATUSES = frozenset({"success", "done"})

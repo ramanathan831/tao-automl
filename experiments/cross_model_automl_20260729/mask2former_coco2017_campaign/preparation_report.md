@@ -29,6 +29,22 @@ The launch gate still fails closed because the exact runtime has not completed
 the direct full-GPU qualification and the one official Mask2Former PTM remains
 `unverified` pending that qualification and independent registry promotion.
 
+## 2026-08-01 qualification/runtime v2 amendment
+
+The first direct GPU qualification exposed an infrastructure-only defect in
+the preregistered v1 envelope: its four-hour allocation/3.8-hour SDK timeout
+cannot contain three full COCO epochs when an observed epoch takes
+approximately 90 minutes. It reached repeated allocation expiry and requeue,
+not a scientific terminal result.
+
+V2 freezes an eight-hour allocation and 7.8-hour SDK timeout for qualification
+and subsequent candidate jobs. The 12-minute difference preserves scheduler
+shutdown headroom. Training remains three complete epochs; the search space,
+20-candidate budget, seeds, PTM, metrics, mode policies, and retry cap are
+unchanged. The incomplete v1 runtime evidence remains untouched. V2 reuses
+only the already immutable, content-addressed v1 PTM stage and writes all new
+qualification/runtime state to separate `*_v2` roots.
+
 ## Frozen scientific scope
 
 | Field | Frozen value |
@@ -120,17 +136,22 @@ No additional model or dataset is implicated by these blockers.
 
 ## Verification performed
 
-The campaign-specific suite passed after the runtime/staging integration:
+The campaign-specific suite passed after the v2 wall-time amendment:
 
 ```text
-33 passed
+37 passed
 ```
 
-The combined production objective-acquisition, selection, PTM,
-recommendation-audit, runtime, wheel, and campaign suites passed:
+The complete repository suite passed:
 
 ```text
-722 passed
+970 passed, 1 skipped
+```
+
+The complete cross-model experiment suite passed:
+
+```text
+420 passed
 ```
 
 Only three established sklearn Gaussian-process convergence warnings were

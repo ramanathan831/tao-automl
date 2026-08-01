@@ -44,8 +44,10 @@ DEFAULT_STAGE_MANIFEST = (
 DEFAULT_QUALIFICATION = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "mask2former_coco2017_ptm_qualification_v1/completion.json"
+    "mask2former_coco2017_ptm_qualification_v2/completion.json"
 )
+# The already sealed PTM bytes are intentionally reused.  Only execution
+# wall time and runtime destinations change in qualification/runtime v2.
 DEFAULT_PTM_STAGE_MANIFEST = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
@@ -345,8 +347,11 @@ def _runtime(
             "/lustre/fsw/portfolios/edgeai/users/rarunachalam"
         ),
         "container_mounts": "/lustre",
-        "time_hours": 4.0,
-        "timeout_hours": 3.8,
+        "time_hours": campaign_contract.FROZEN_SLURM_TIME_HOURS,
+        "timeout_hours": campaign_contract.FROZEN_SLURM_TIMEOUT_HOURS,
+        "walltime_policy": copy.deepcopy(
+            campaign_contract.FROZEN_WALLTIME_POLICY
+        ),
         "max_job_retries": campaign_contract.FROZEN_SLURM_RETRY_CAP,
         "hardware_contract": copy.deepcopy(
             campaign_contract.FROZEN_HARDWARE
@@ -368,7 +373,7 @@ def build_contract(
     repository_path = Path(repository).resolve()
     value = campaign_contract.build_preregistered_contract(
         campaign_id=(
-            "mask2former-coco2017-objective-aware-three-mode-20260731"
+            "mask2former-coco2017-objective-aware-three-mode-v2-20260801"
         ),
         dataset=dataset_record(dataset_manifest, stage_manifest),
         skill_dir=(

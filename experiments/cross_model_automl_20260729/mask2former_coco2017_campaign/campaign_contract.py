@@ -91,6 +91,8 @@ FROZEN_LATENCY_RETENTION = 0.90
 FROZEN_LATENCY_TOLERANCE_MS = 0.73553775
 FROZEN_VALIDATION_SANITY_MIN_MASK_AP = 0.05
 FROZEN_SLURM_RETRY_CAP = 10
+FROZEN_SLURM_TIME_HOURS = 8.0
+FROZEN_SLURM_TIMEOUT_HOURS = 7.8
 FROZEN_BATCH_SIZE_PER_REPLICA = 1
 FROZEN_TEST_MAX_SIZE = 1333
 FROZEN_HARDWARE = {
@@ -110,6 +112,24 @@ FROZEN_SQSH = {
         "nvcr.io/nvstaging/tao/tao-toolkit-pyt:"
         "7.1.0-rc-245-multiarch"
     ),
+}
+FROZEN_WALLTIME_POLICY = {
+    "contract_revision": "qualification_runtime_v2",
+    "supersedes": "qualification_runtime_v1",
+    "prior_time_hours": 4.0,
+    "prior_timeout_hours": 3.8,
+    "observed_full_epoch_minutes_approx": 90.0,
+    "training_epochs": FROZEN_TRAINING_EPOCHS,
+    "observed_minimum_training_hours_approx": 4.5,
+    "time_hours": FROZEN_SLURM_TIME_HOURS,
+    "timeout_hours": FROZEN_SLURM_TIMEOUT_HOURS,
+    "scheduler_timeout_headroom_minutes": 12.0,
+    "applies_to": "qualification_and_automl_candidate_jobs",
+    "training_budget_changed": False,
+    "search_space_changed": False,
+    "candidate_budget_changed": False,
+    "retry_policy_changed": False,
+    "v1_runtime_evidence_preserved": True,
 }
 LATENCY_PROTOCOL = {
     "warmup_iterations": 50,
@@ -519,6 +539,16 @@ def build_preregistered_contract(
     runtime_overlay.validate_contract_record(
         runtime_record.get("tao_pytorch_overlay", {})
     )
+    if (
+        runtime_record.get("time_hours") != FROZEN_SLURM_TIME_HOURS
+        or runtime_record.get("timeout_hours")
+        != FROZEN_SLURM_TIMEOUT_HOURS
+        or runtime_record.get("walltime_policy")
+        != FROZEN_WALLTIME_POLICY
+    ):
+        raise CampaignContractError(
+            "runtime must use the frozen v2 wall-time policy"
+        )
     value = {
         "schema_version": 1,
         "campaign_id": campaign_id,
@@ -732,6 +762,14 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
     runtime_overlay.validate_contract_record(
         runtime.get("tao_pytorch_overlay", {})
     )
+    if (
+        runtime.get("time_hours") != FROZEN_SLURM_TIME_HOURS
+        or runtime.get("timeout_hours") != FROZEN_SLURM_TIMEOUT_HOURS
+        or runtime.get("walltime_policy") != FROZEN_WALLTIME_POLICY
+    ):
+        raise CampaignContractError(
+            "runtime must use the frozen v2 wall-time policy"
+        )
     search = value.get("search", {})
     if (
         value.get("ptm_inventory") != mask2former_registry_snapshot()
@@ -810,10 +848,13 @@ __all__ = [
     "FROZEN_LATENCY_TOLERANCE_MS",
     "FROZEN_SEARCH_SEED",
     "FROZEN_SLURM_RETRY_CAP",
+    "FROZEN_SLURM_TIME_HOURS",
+    "FROZEN_SLURM_TIMEOUT_HOURS",
     "FROZEN_SQSH",
     "FROZEN_TEST_MAX_SIZE",
     "FROZEN_TRAINING_EPOCHS",
     "FROZEN_VALIDATION_SANITY_MIN_MASK_AP",
+    "FROZEN_WALLTIME_POLICY",
     "LATENCY_PROTOCOL",
     "MODES",
     "SEARCH_PARAMETERS",

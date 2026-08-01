@@ -112,6 +112,36 @@ remote mode: 0444
 The staging operation performed zero CPU/GPU model runs and submitted zero
 scheduler jobs.
 
+## Qualification/runtime v2 wall-time correction
+
+The frozen v1 qualification used a four-hour SLURM allocation and a 3.8-hour
+SDK timeout. The direct full-COCO run subsequently showed approximately 90
+minutes per epoch. Three unchanged full epochs therefore require about 4.5
+hours before startup and checkpoint finalization are accounted for. The
+subsequent standalone full validation receives its own allocation under the
+same policy. The v1 training allocation expired and requeued five times before
+this correction was frozen; it could not complete the three-epoch contract.
+
+Qualification/runtime v2 changes only the execution envelope:
+
+```text
+SLURM allocation: 8.0 hours
+SDK timeout: 7.8 hours
+scheduler timeout headroom: 12 minutes
+training epochs: 3 (unchanged)
+candidate budget per mode: 20 (unchanged)
+search space, seeds, metrics, PTM, retry cap: unchanged
+```
+
+The v1 runtime tree remains immutable at
+`mask2former_coco2017_ptm_qualification_v1`. Its completed data-only PTM
+stage is reused by exact hash; its scheduler database, progress events, and
+incomplete runtime evidence are not copied into v2 and cannot satisfy the v2
+gate. New qualification evidence is written under
+`mask2former_coco2017_ptm_qualification_v2`, and the later AutoML campaign
+uses `mask2former_coco2017_three_mode_v2`. This is an infrastructure
+correction, not a training-fidelity or search-policy change.
+
 PTM identity is represented as a hierarchical non-ordinal outer arm. The one
 current arm is not encoded as an ordinal scalar. The common inner search is
 frozen before any result:
@@ -164,37 +194,51 @@ full train, standalone evaluation, and stabilized latency workflow. The
 remaining 19 recommendations per mode are released automatically only after
 all three candidate-zero workflows pass.
 
-The automatic trigger currently remains blocked by the unexecuted full-GPU
-runtime qualification and PTM-support requirements described above. No model
-or scheduler job was launched while preparing this directory.
+The automatic trigger remains blocked until the v2 full-GPU qualification
+completes and the PTM-support requirements described above are satisfied.
+The incomplete v1 qualification is retained as historical evidence and is
+not reused as a successful gate result.
 
-## Reproduction after prerequisites are reviewed
+## Exact v2 qualification and automatic-launch commands
 
 ```bash
 cd /localhome/local-rarunachalam/tao-automl
 
-# Data-only and idempotent. This downloads/checksums/publishes the official
-# PTM and does not load a model or construct a scheduler client.
-python -m \
-  experiments.cross_model_automl_20260729.mask2former_coco2017_campaign.qualification_campaign \
-  --stage
+export PATH=/localhome/local-rarunachalam/.tao/venvs/dino-multiobjective-py314/bin:$PATH
+export PYTHONDONTWRITEBYTECODE=1
 
+# Seal v2 from a clean source commit. The immutable v1 PTM-stage manifest is
+# consumed by hash and is not regenerated.
 python -m \
   experiments.cross_model_automl_20260729.mask2former_coco2017_campaign.manifest_generator \
   --output \
-  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask2former_coco2017_three_mode/campaign.v1.json
+  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask2former_coco2017_three_mode_v2/campaign.v2.json
 
-# Inspect the direct-full qualification plan. Add --launch only after review
-# of the sealed runtime overlay and immutable PTM stage.
+# This is plan-only and constructs no scheduler client.
 python -m \
   experiments.cross_model_automl_20260729.mask2former_coco2017_campaign.qualification_campaign \
   --contract \
-  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask2former_coco2017_three_mode/campaign.v1.json
+  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask2former_coco2017_three_mode_v2/campaign.v2.json
 
+# One direct full three-epoch train followed by standalone full validation,
+# on one node/eight A100s in the pinned SQSH. No CPU/smoke/mini-step path.
+python -m \
+  experiments.cross_model_automl_20260729.mask2former_coco2017_campaign.qualification_campaign \
+  --contract \
+  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask2former_coco2017_three_mode_v2/campaign.v2.json \
+  --runtime-root \
+  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask2former_coco2017_ptm_qualification_v2 \
+  --launch
+
+# After successful qualification and independent registry promotion, reseal
+# the same v2 contract path from the promoted clean source commit, then start
+# the automatic three-mode trigger.
 python -m \
   experiments.cross_model_automl_20260729.mask2former_coco2017_campaign.run_campaign \
   --contract \
-  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask2former_coco2017_three_mode/campaign.v1.json \
+  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask2former_coco2017_three_mode_v2/campaign.v2.json \
+  --runtime-root \
+  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask2former_coco2017_three_mode_v2 \
   --automatic-trigger \
   --launch
 ```

@@ -80,8 +80,11 @@ def _runtime(tmp_path: Path) -> dict:
             "/lustre/fsw/portfolios/edgeai/users/rarunachalam"
         ),
         "container_mounts": "/lustre",
-        "time_hours": 4.0,
-        "timeout_hours": 3.8,
+        "time_hours": campaign_contract.FROZEN_SLURM_TIME_HOURS,
+        "timeout_hours": campaign_contract.FROZEN_SLURM_TIMEOUT_HOURS,
+        "walltime_policy": copy.deepcopy(
+            campaign_contract.FROZEN_WALLTIME_POLICY
+        ),
         "max_job_retries": campaign_contract.FROZEN_SLURM_RETRY_CAP,
         "hardware_contract": copy.deepcopy(
             campaign_contract.FROZEN_HARDWARE
@@ -479,6 +482,40 @@ def test_contract_is_pinned_sqsh_eight_gpu_and_zero_local_runs(contract):
     )
 
 
+def test_v2_walltime_is_frozen_without_changing_scientific_budget(contract):
+    runtime = contract["runtime"]
+    policy = runtime["walltime_policy"]
+    assert runtime["time_hours"] == 8.0
+    assert runtime["timeout_hours"] == 7.8
+    assert policy == campaign_contract.FROZEN_WALLTIME_POLICY
+    assert policy["contract_revision"] == "qualification_runtime_v2"
+    assert policy["observed_full_epoch_minutes_approx"] == 90.0
+    assert policy["observed_minimum_training_hours_approx"] == 4.5
+    assert policy["training_epochs"] == 3
+    assert policy["training_budget_changed"] is False
+    assert policy["search_space_changed"] is False
+    assert policy["candidate_budget_changed"] is False
+    assert policy["retry_policy_changed"] is False
+    assert policy["v1_runtime_evidence_preserved"] is True
+    assert contract["search"]["training_epochs"] == 3
+    assert contract["search"]["candidate_budget_per_mode"] == 20
+    assert contract["search"]["space"] == campaign_contract.SEARCH_SPACE
+
+
+def test_v2_runtime_paths_do_not_overwrite_v1_evidence():
+    assert str(qualification_campaign.DEFAULT_RUNTIME_ROOT).endswith(
+        "mask2former_coco2017_ptm_qualification_v2"
+    )
+    assert str(qualification_campaign.DEFAULT_STAGE_MANIFEST).endswith(
+        "mask2former_coco2017_ptm_qualification_v1/"
+        "ptm_stage_manifest.json"
+    )
+    assert str(run_campaign.DEFAULT_RUNTIME_ROOT).endswith(
+        "mask2former_coco2017_three_mode_v2"
+    )
+    assert run_campaign.DEFAULT_CONTRACT.name == "campaign.v2.json"
+
+
 def test_latency_protocol_is_4000_real_coco_validation_samples(contract):
     protocol = contract["latency_protocol"]
     assert protocol["warmup_iterations"] == 50
@@ -641,6 +678,10 @@ def test_qualification_can_precede_registry_promotion_without_bypass(
 
 def test_direct_full_qualification_plan_is_plan_only(contract):
     plan = qualification_campaign.qualification_plan(contract)
+    assert plan["campaign_id"] == (
+        "mask2former-coco2017-direct-full-qualification-v2-20260801"
+    )
+    assert plan["contract_revision"] == "qualification_runtime_v2"
     assert plan["official_checkpoint_ids"] == [
         "mask2former.coco.swin_tiny.trainable.v1.0"
     ]
@@ -654,12 +695,106 @@ def test_direct_full_qualification_plan_is_plan_only(contract):
     assert plan["training_epochs"] == 3
     assert plan["nodes_per_job"] == 1
     assert plan["gpus_per_job"] == 8
+    assert plan["walltime_policy"] == (
+        campaign_contract.FROZEN_WALLTIME_POLICY
+    )
     assert plan["scheduler_client_constructed"] is False
     assert plan["jobs_submitted"] == 0
     assert plan["cpu_model_runs"] == 0
     assert plan["smoke_model_runs"] == 0
     assert plan["mini_step_runs"] == 0
     assert plan["replacement_workflows_allowed"] is False
+
+
+def test_v2_completion_records_exact_walltime_contract(contract):
+    completion = qualification_campaign.build_completion(contract, [])
+    assert completion["campaign_id"] == (
+        "mask2former-coco2017-direct-full-qualification-v2-20260801"
+    )
+    assert completion["contract_revision"] == "qualification_runtime_v2"
+    assert completion["qualification_contract_sha256"] == (
+        contract["contract_sha256"]
+    )
+    assert completion["walltime_policy"] == (
+        campaign_contract.FROZEN_WALLTIME_POLICY
+    )
+    payload = copy.deepcopy(completion)
+    observed = payload.pop("evidence_sha256")
+    assert observed == canonical_sha256(payload)
+
+
+def test_v1_evidence_cannot_satisfy_v2_contract(
+    contract,
+    tmp_path: Path,
+):
+    record = contract["ptm_inventory"]["records"][0]
+    stage = {
+        "schema_version": 1,
+        "model": "mask2former",
+        "registry_sha256": contract["ptm_inventory"]["registry_sha256"],
+        "checkpoints": [
+            {
+                "id": record["id"],
+                "path": "/lustre/ptms/mask2former.pth",
+                "size_bytes": record["expected_size_bytes"],
+                "sha256": "d" * 64,
+            }
+        ],
+    }
+    stage_path = tmp_path / "stage.json"
+    stage_path.write_text(json.dumps(stage), encoding="utf-8")
+
+    expected = copy.deepcopy(contract)
+    expected["runtime"]["ptm_stage_manifest_path"] = str(stage_path)
+    expected["runtime"]["ptm_stage_manifest_sha256"] = (
+        campaign_contract.sha256_file(stage_path)
+    )
+    expected["qualification_policy"]["ptm_stage_manifest_path"] = str(
+        stage_path
+    )
+    expected.pop("contract_sha256")
+    expected["contract_sha256"] = canonical_sha256(expected)
+
+    document = _qualification_document()
+    document["contract_revision"] = "qualification_runtime_v2"
+    document["qualification_contract_sha256"] = expected[
+        "contract_sha256"
+    ]
+    document["qualification_campaign_sha256"] = expected[
+        "launcher_integrity"
+    ]["qualification_campaign_sha256"]
+    document["ptm_stage_manifest_path"] = str(stage_path)
+    document["ptm_stage_manifest_sha256"] = campaign_contract.sha256_file(
+        stage_path
+    )
+    document["walltime_policy"] = copy.deepcopy(
+        campaign_contract.FROZEN_WALLTIME_POLICY
+    )
+    document["evidence_sha256"] = canonical_sha256(
+        {
+            key: value
+            for key, value in document.items()
+            if key != "evidence_sha256"
+        }
+    )
+    evidence_path = tmp_path / "completion.json"
+    evidence_path.write_text(json.dumps(document), encoding="utf-8")
+    audit_qualification(evidence_path, expected_contract=expected)
+
+    document["contract_revision"] = "qualification_runtime_v1"
+    document["evidence_sha256"] = canonical_sha256(
+        {
+            key: value
+            for key, value in document.items()
+            if key != "evidence_sha256"
+        }
+    )
+    evidence_path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(
+        QualificationGateError,
+        match="wall-time policy",
+    ):
+        audit_qualification(evidence_path, expected_contract=expected)
 
 
 def test_direct_qualification_spec_precedence_preserves_coco_profile(
@@ -919,6 +1054,17 @@ def test_contract_integrity_rejects_policy_mutation(contract):
     changed = copy.deepcopy(contract)
     changed["execution"]["gpus_per_child"] = 1
     with pytest.raises(campaign_contract.CampaignContractError):
+        campaign_contract.validate_contract(changed)
+
+    changed = copy.deepcopy(contract)
+    changed["runtime"]["time_hours"] = 4.0
+    changed["runtime"]["timeout_hours"] = 3.8
+    changed.pop("contract_sha256")
+    changed["contract_sha256"] = canonical_sha256(changed)
+    with pytest.raises(
+        campaign_contract.CampaignContractError,
+        match="frozen v2 wall-time policy",
+    ):
         campaign_contract.validate_contract(changed)
 
     changed = copy.deepcopy(contract)

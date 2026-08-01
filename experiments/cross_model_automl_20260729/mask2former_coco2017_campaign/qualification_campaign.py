@@ -47,9 +47,15 @@ DEFAULT_CONTRACT = run_campaign.DEFAULT_CONTRACT
 DEFAULT_RUNTIME_ROOT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "mask2former_coco2017_ptm_qualification_v1"
+    "mask2former_coco2017_ptm_qualification_v2"
 )
-DEFAULT_STAGE_MANIFEST = DEFAULT_RUNTIME_ROOT / "ptm_stage_manifest.json"
+# Runtime v2 reuses the immutable data-only v1 PTM stage.  It never writes to
+# the v1 runtime tree or republishes the checkpoint.
+DEFAULT_STAGE_MANIFEST = Path(
+    "/localhome/local-rarunachalam/.tao/artifacts/"
+    "cross_model_automl_20260729/"
+    "mask2former_coco2017_ptm_qualification_v1/ptm_stage_manifest.json"
+)
 DEFAULT_LOCAL_CACHE = Path(
     "/localhome/local-rarunachalam/.tao/cache/"
     "mask2former_coco2017_ptm_qualification_v1"
@@ -58,6 +64,9 @@ DEFAULT_LUSTRE_INPUT_ROOT = Path(
     "/lustre/fsw/portfolios/edgeai/users/rarunachalam/"
     "cross_model_automl_20260729/"
     "mask2former_coco2017_ptm_qualification_v1/inputs"
+)
+QUALIFICATION_CAMPAIGN_ID = (
+    "mask2former-coco2017-direct-full-qualification-v2-20260801"
 )
 ENV_PATH = run_campaign.ENV_PATH
 CampaignExecutionError = run_campaign.CampaignExecutionError
@@ -384,9 +393,8 @@ def qualification_plan(contract: Mapping[str, Any]) -> dict[str, Any]:
     inventory = contract["ptm_inventory"]
     return {
         "schema_version": 1,
-        "campaign_id": (
-            "mask2former-coco2017-direct-full-qualification-20260731"
-        ),
+        "campaign_id": QUALIFICATION_CAMPAIGN_ID,
+        "contract_revision": "qualification_runtime_v2",
         "contract_sha256": contract["contract_sha256"],
         "model": "mask2former",
         "task": "instance_segmentation",
@@ -408,6 +416,9 @@ def qualification_plan(contract: Mapping[str, Any]) -> dict[str, Any]:
         "gpus_per_job": 8,
         "hardware": copy.deepcopy(campaign_contract.FROZEN_HARDWARE),
         "sqsh": copy.deepcopy(campaign_contract.FROZEN_SQSH),
+        "walltime_policy": copy.deepcopy(
+            contract["runtime"]["walltime_policy"]
+        ),
         "tao_pytorch_overlay": copy.deepcopy(
             contract["runtime"]["tao_pytorch_overlay"]
         ),
@@ -710,6 +721,9 @@ def _run_one(
     diagnostics: dict[str, Any] = {
         "source_checkpoint": copy.deepcopy(dict(source)),
         "train_spec_sha256": canonical_sha256(train_spec),
+        "walltime_policy": copy.deepcopy(
+            contract["runtime"]["walltime_policy"]
+        ),
         "agent_intervention_flags": {
             name: False for name in campaign_contract.AGENT_FLAGS
         },
@@ -902,9 +916,8 @@ def build_completion(
 ) -> dict[str, Any]:
     value = {
         "schema_version": 1,
-        "campaign_id": (
-            "mask2former-coco2017-direct-full-qualification-20260731"
-        ),
+        "campaign_id": QUALIFICATION_CAMPAIGN_ID,
+        "contract_revision": "qualification_runtime_v2",
         "model": "mask2former",
         "task": "instance_segmentation",
         "primary_metric": VALIDATION_MASK_AP_METRIC,
@@ -928,6 +941,9 @@ def build_completion(
         "sqsh_sha256": contract["sqsh"]["sha256"],
         "tao_pytorch_overlay": copy.deepcopy(
             contract["runtime"]["tao_pytorch_overlay"]
+        ),
+        "walltime_policy": copy.deepcopy(
+            contract["runtime"]["walltime_policy"]
         ),
         "cpu_model_runs": 0,
         "smoke_model_runs": 0,
@@ -980,6 +996,9 @@ def launch(
             ),
             "nodes_per_job": 1,
             "gpus_per_job": 8,
+            "walltime_policy": copy.deepcopy(
+                contract["runtime"]["walltime_policy"]
+            ),
             "cpu_model_runs": 0,
             "smoke_model_runs": 0,
             "mini_step_runs": 0,
