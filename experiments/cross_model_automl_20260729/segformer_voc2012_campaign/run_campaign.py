@@ -4,7 +4,8 @@
 
 There is deliberately no CPU/model-smoke or mini-step execution path.  The
 automatic trigger waits for immutable direct-full-run PTM qualification and
-repository-supported registry status, then starts all three mode controllers.
+an exact evidence-bound runtime eligibility decision, then starts all three
+mode controllers.
 Each candidate trains, runs standalone full validation, and measures stabilized
 latency on one node/eight A100s in the pinned TAO SQSH.  The first successful
 candidate from every mode must pass all gates before the remaining budget is
@@ -32,7 +33,7 @@ from typing import Any
 
 import yaml
 
-from tao_automl.ptm_registry import canonical_sha256, load_ptm_registry
+from tao_automl.ptm_registry import canonical_sha256
 from tao_automl.recommendation_audit import validate_recommendation_audit
 from tao_automl.selection import canonical_spec_fingerprint
 
@@ -308,6 +309,14 @@ def verify_local_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
             ],
         ),
     }
+    runtime_local = contract["qualification_policy"].get(
+        "runtime_local_eligibility"
+    )
+    if runtime_local is not None:
+        identities["qualification_evidence"] = (
+            runtime_local["qualification_evidence_path"],
+            runtime_local["qualification_file_sha256"],
+        )
     evidence = {}
     for name, (path_value, expected_sha) in identities.items():
         path = Path(path_value).resolve()
@@ -356,7 +365,8 @@ def launch_readiness(
         blockers.append({"code": "sqsh_not_ready", "reason": str(exc)})
     try:
         decision = audit_qualification(
-            contract["qualification_policy"]["qualification_evidence_path"]
+            contract["qualification_policy"]["qualification_evidence_path"],
+            expected_contract=contract,
         )
         decision.assert_runtime_ready()
     except Exception as exc:
@@ -442,7 +452,7 @@ def _execution_artifacts(
 def _per_checkpoint_profiles(
     decision: QualificationDecision,
 ) -> dict[str, dict[str, Any]]:
-    registry = load_ptm_registry()
+    registry = decision.runtime_registry
     return {
         checkpoint_id: {
             "model": {
@@ -476,7 +486,7 @@ def build_live_runtime_inventory(
         campaign_contract.mode_settings(str(contract["campaign_id"]), mode)
     )
     report = PTMCheckpointPreflight(
-        registry=load_ptm_registry(),
+        registry=decision.runtime_registry,
         cache=AtomicArtifactCache(cache_root),
         ngc_client=NGCHTTPSClient(NGCCredential.from_environment()),
         load_smoke=QualificationLoadEvidence(decision),
@@ -512,6 +522,7 @@ def build_live_runtime_inventory(
         algorithm="bayesian",
         execution_checkpoint_artifacts=_execution_artifacts(decision),
         per_checkpoint_profile_overrides=_per_checkpoint_profiles(decision),
+        registry=decision.runtime_registry,
     )
     if resolved.checkpoint_ids != decision.checkpoint_ids:
         raise CampaignExecutionError(
@@ -1162,7 +1173,8 @@ def _run_mode(
 ) -> None:
     contract = load_contract(contract_path)
     decision = audit_qualification(
-        contract["qualification_policy"]["qualification_evidence_path"]
+        contract["qualification_policy"]["qualification_evidence_path"],
+        expected_contract=contract,
     )
     decision.assert_runtime_ready()
     root = Path(runtime_root)
@@ -1542,6 +1554,12 @@ def verify_live_runtime_preflight(
         "schema_version": 1,
         "contract_sha256": contract["contract_sha256"],
         "qualification_evidence_sha256": decision.evidence_sha256,
+        "runtime_eligibility_sha256": decision.runtime_eligibility.get(
+            "eligibility_sha256"
+        ),
+        "runtime_registry_sha256": (
+            decision.runtime_registry.document_sha256
+        ),
         "status": "success",
         "model_jobs_launched": False,
         "cpu_or_smoke_model_jobs_launched": False,
@@ -1641,6 +1659,12 @@ def main(argv: list[str] | None = None) -> int:
             "loaded_secret_keys": list(loaded_names),
             "secret_values_recorded": False,
             "qualification_evidence_sha256": decision.evidence_sha256,
+            "runtime_eligibility_sha256": decision.runtime_eligibility.get(
+                "eligibility_sha256"
+            ),
+            "runtime_registry_sha256": (
+                decision.runtime_registry.document_sha256
+            ),
             "live_runtime_preflight_sha256": live["record_sha256"],
             "sqsh_path": contract["sqsh"]["path"],
             "sqsh_sha256": contract["sqsh"]["sha256"],

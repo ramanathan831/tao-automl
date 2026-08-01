@@ -127,23 +127,23 @@ FROZEN_QUALIFICATION_RUNTIME_OVERLAY = {
     "archive_path": (
         "/lustre/fsw/portfolios/edgeai/users/rarunachalam/"
         "tao-pytorch-overlays/segformer-product-fixes/"
-        "3b1e073571f3bbf3702b0ae837e9279ad12f4286/"
-        "tao-pytorch-segformer-product-fixes-3b1e073571f3.tar"
+        "2681dea4c876b759f8a0446491b3619e6120b531/"
+        "tao-pytorch-segformer-product-fixes-2681dea4c876.tar"
     ),
     "archive_sha256": (
-        "b055100d0d3e9e8c5daf94dfd4caf3cccacfb54fbebb423129fb5832066e420b"
+        "a7d5316816710b258c52001f979a22723c88fca5101a05ca3a48838ce81d1ee4"
     ),
-    "archive_size_bytes": 51200,
+    "archive_size_bytes": 61440,
     "installer_path": (
         "/lustre/fsw/portfolios/edgeai/users/rarunachalam/"
         "tao-pytorch-overlays/segformer-product-fixes/"
-        "3b1e073571f3bbf3702b0ae837e9279ad12f4286/"
+        "2681dea4c876b759f8a0446491b3619e6120b531/"
         "install_segformer_source_overlay.py"
     ),
     "installer_sha256": (
-        "8be49911491db19ec632c2847c6684fb8b42423d25f96ae567de1af3a8dda52e"
+        "44535093217b74a7ad82e3bb58ecb45f28538491160de81be5e8e175518dc640"
     ),
-    "installer_size_bytes": 8275,
+    "installer_size_bytes": 8583,
     "receipt_path": (
         "/tmp/segformer-product-fixes-overlay-receipt.json"
     ),
@@ -152,16 +152,40 @@ FROZEN_QUALIFICATION_RUNTIME_OVERLAY = {
     "source_commits": [
         "eacc0c0e2e59776266bb07f0be205c71bd0830c3",
         "3b1e073571f3bbf3702b0ae837e9279ad12f4286",
+        "2681dea4c876b759f8a0446491b3619e6120b531",
     ],
-    "source_commit": "3b1e073571f3bbf3702b0ae837e9279ad12f4286",
-    "combined_commit": "3b1e073571f3bbf3702b0ae837e9279ad12f4286",
-    "file_count": 4,
+    "source_commit": "2681dea4c876b759f8a0446491b3619e6120b531",
+    "combined_commit": "2681dea4c876b759f8a0446491b3619e6120b531",
+    "file_count": 5,
     "required_actions": ["train", "evaluate"],
     "remediates": [
         "trainable_ptm_loaded_as_lightning_checkpoint",
         "ddp_metrics_not_globally_reduced",
         "nonzero_rank_status_kpi_writes",
+        "prefixed_backbone_ptm_loaded_into_bare_backbone",
+        "zero_compatible_tensor_load_fails_closed",
+        "positive_pretrained_load_receipt",
     ],
+}
+RUNTIME_LOCAL_ELIGIBILITY_KIND = (
+    "segformer_positive_load_runtime_local_v1"
+)
+FROZEN_RUNTIME_LOCAL_CHECKPOINT_SPEC_FILE = {
+    "source": "repository",
+    "path": (
+        "data/ptm_specs/segformer/"
+        "segformer.runtime-local-qualified.v1.yaml"
+    ),
+    "sha256": (
+        "67edb37c140aee9c465a56f0d713e22018f46b3877395d853c4cf4bd95d2731e"
+    ),
+    "provenance": {
+        "source": "sealed SegFormer direct-full-run qualification",
+        "evidence": (
+            "Neutral packaged sidecar; exact backbone and checkpoint target "
+            "remain bound by registry identity and campaign profile"
+        ),
+    },
 }
 FROZEN_V1_QUALIFICATION_EVIDENCE = {
     "campaign_id": "segformer-voc2012-direct-full-ptm-qualification-v1",
@@ -840,6 +864,11 @@ def build_preregistered_contract(
             name: False for name in SELECTION_FLAGS
         },
     }
+    runtime_local = runtime.get("runtime_local_eligibility")
+    if runtime_local is not None:
+        value["qualification_policy"]["runtime_local_eligibility"] = (
+            copy.deepcopy(runtime_local)
+        )
     value["contract_sha256"] = canonical_sha256(value)
     return value
 
@@ -889,6 +918,120 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
         raise CampaignContractError(
             "qualification v4 fidelity or provenance changed"
         )
+    runtime_local = qualification.get("runtime_local_eligibility")
+    if runtime_local is not None:
+        required_false = (
+            "repository_registry_mutation_allowed",
+            "missing_license_normalization_allowed",
+            "failed_arm_promotion_allowed",
+            "unsupported_arm_promotion_allowed",
+            "agent_override_allowed",
+        )
+        snapshot = segformer_registry_snapshot()
+        expected_keys = {
+            "schema_version",
+            "kind",
+            "enabled",
+            "scope",
+            "model",
+            "task",
+            "tao_version",
+            "container_sha256",
+            "base_registry_version",
+            "base_registry_sha256",
+            "qualification_evidence_path",
+            "qualification_file_sha256",
+            "qualification_evidence_sha256",
+            "qualification_contract_sha256",
+            "qualification_controller_sha256",
+            "eligibility_gate_sha256",
+            "runtime_resolver_sha256",
+            "eligibility_source_commit",
+            "wheel_sha256",
+            "sdk_commit",
+            "skills_commit",
+            "license_policy",
+            "checkpoint_spec_file",
+            *required_false,
+        }
+        hashes = (
+            "base_registry_sha256",
+            "qualification_file_sha256",
+            "qualification_evidence_sha256",
+            "qualification_contract_sha256",
+            "qualification_controller_sha256",
+            "eligibility_gate_sha256",
+            "runtime_resolver_sha256",
+            "wheel_sha256",
+        )
+        commits = (
+            "eligibility_source_commit",
+            "sdk_commit",
+            "skills_commit",
+        )
+        if (
+            not isinstance(runtime_local, Mapping)
+            or set(runtime_local) != expected_keys
+            or runtime_local.get("schema_version") != 1
+            or runtime_local.get("kind") != RUNTIME_LOCAL_ELIGIBILITY_KIND
+            or runtime_local.get("enabled") is not True
+            or runtime_local.get("scope")
+            != "campaign_local_in_memory_projection"
+            or runtime_local.get("model") != "segformer"
+            or runtime_local.get("task") != "semantic_segmentation"
+            or runtime_local.get("tao_version") != "7.1.0"
+            or runtime_local.get("container_sha256") != FROZEN_SQSH["sha256"]
+            or runtime_local.get("base_registry_version")
+            != snapshot["registry_version"]
+            or runtime_local.get("base_registry_sha256")
+            != snapshot["registry_sha256"]
+            or runtime_local.get("qualification_evidence_path")
+            != qualification.get("qualification_evidence_path")
+            or runtime_local.get("qualification_controller_sha256")
+            != value.get("launcher_integrity", {}).get(
+                "qualification_campaign_sha256"
+            )
+            or runtime_local.get("eligibility_gate_sha256")
+            != value.get("launcher_integrity", {}).get(
+                "qualification_gate_sha256"
+            )
+            or runtime_local.get("eligibility_source_commit")
+            != value.get("runtime", {}).get("source_commit")
+            or runtime_local.get("wheel_sha256")
+            != value.get("runtime", {}).get("wheel_sha256")
+            or runtime_local.get("sdk_commit")
+            != value.get("runtime", {}).get("sdk_commit")
+            or runtime_local.get("skills_commit")
+            != value.get("runtime", {}).get("skills_commit")
+            or runtime_local.get("license_policy")
+            != "complete_existing_registry_metadata_only"
+            or runtime_local.get("checkpoint_spec_file")
+            != FROZEN_RUNTIME_LOCAL_CHECKPOINT_SPEC_FILE
+            or any(runtime_local.get(name) is not False for name in required_false)
+            or any(
+                not isinstance(runtime_local.get(name), str)
+                or len(runtime_local[name]) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in runtime_local[name]
+                )
+                for name in hashes
+            )
+            or any(
+                not isinstance(runtime_local.get(name), str)
+                or len(runtime_local[name]) != 40
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in runtime_local[name]
+                )
+                for name in commits
+            )
+            or value.get("runtime", {}).get("runtime_local_eligibility")
+            != runtime_local
+        ):
+            raise CampaignContractError(
+                "runtime-local SegFormer eligibility seal is invalid"
+            )
     if any(value["agent_intervention_flags"].values()):
         raise CampaignContractError("agent intervention flags must remain false")
     if any(value["selection_isolation_flags"].values()):
@@ -909,6 +1052,7 @@ __all__ = [
     "FROZEN_LATENCY_TOLERANCE_MS",
     "FROZEN_QUALIFICATION_FIDELITY",
     "FROZEN_QUALIFICATION_RUNTIME_OVERLAY",
+    "FROZEN_RUNTIME_LOCAL_CHECKPOINT_SPEC_FILE",
     "FROZEN_QUALIFICATION_TRAINING_EPOCHS",
     "FROZEN_PRIOR_QUALIFICATION_EVIDENCE",
     "FROZEN_SEARCH_SEED",
@@ -926,6 +1070,7 @@ __all__ = [
     "MODES",
     "QUALIFICATION_CAMPAIGN_ID",
     "QUALIFICATION_REVISION",
+    "RUNTIME_LOCAL_ELIGIBILITY_KIND",
     "SEARCH_PARAMETERS",
     "SEARCH_SPACE",
     "SELECTION_FLAGS",

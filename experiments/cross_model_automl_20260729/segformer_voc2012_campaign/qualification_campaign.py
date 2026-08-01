@@ -12,9 +12,10 @@ The controller has two explicit phases:
 
 There is no CPU/model smoke, mini-step, fallback checkpoint, replacement
 workflow, or manual PTM exclusion path.  Every terminal outcome is preserved.
-The completion document is the exact input consumed by ``qualification_gate``;
-successful evidence still requires an independent repository registry
-promotion before the three-mode AutoML trigger can run.
+The completion document is the exact input consumed by ``qualification_gate``.
+It cannot mutate the repository registry.  A separately sealed successor may
+bind exact successful, positive-load workflows into a campaign-local runtime
+view when the base record already contains complete license metadata.
 """
 
 from __future__ import annotations
@@ -97,6 +98,14 @@ QUALIFICATION_MASTER_PORT_BASE = 15000
 QUALIFICATION_MASTER_PORT_SPAN = 10000
 TERMINAL_JOB_STATUSES = frozenset({"Complete", "Error", "Canceled"})
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+PRETRAINED_LOAD_REPORT_PREFIX = "SEGFORMER_PRETRAINED_LOAD_REPORT "
+_PRETRAINED_LOAD_COUNT_FIELDS = (
+    "loaded_tensor_count",
+    "missing_tensor_count",
+    "shape_mismatched_tensor_count",
+    "unmatched_tensor_count",
+    "non_tensor_count",
+)
 
 CampaignExecutionError = run_campaign.CampaignExecutionError
 atomic_json = run_campaign.atomic_json
@@ -1231,10 +1240,30 @@ def _metric(
 def _training_status_evidence(
     sdk: Any,
     job_id: str,
+    *,
+    expected_checkpoint_path: str,
+    expected_component: str,
 ) -> dict[str, Any]:
     records, identity = _status_records(sdk, job_id, action="train")
     validation = []
+    load_reports = []
     for record in records:
+        message = record.get("message")
+        if isinstance(message, str) and message.startswith(
+            PRETRAINED_LOAD_REPORT_PREFIX
+        ):
+            payload_text = message[len(PRETRAINED_LOAD_REPORT_PREFIX):]
+            try:
+                payload = json.loads(payload_text)
+            except json.JSONDecodeError as exc:
+                raise CampaignExecutionError(
+                    "SegFormer pretrained-load report is invalid JSON"
+                ) from exc
+            if not isinstance(payload, Mapping):
+                raise CampaignExecutionError(
+                    "SegFormer pretrained-load report is not an object"
+                )
+            load_reports.append(copy.deepcopy(dict(payload)))
         kpi = record.get("kpi")
         # TAO writes the same validation snapshot twice per epoch: first when
         # evaluation generates it, then again with the training-loop progress
@@ -1269,6 +1298,51 @@ def _training_status_evidence(
         raise CampaignExecutionError(
             "training status lacks the terminal TAO success record"
         )
+    unique_reports = {
+        canonical_sha256(report): report for report in load_reports
+    }
+    if len(unique_reports) != 1:
+        raise CampaignExecutionError(
+            "training must emit exactly one unique positive SegFormer "
+            f"pretrained-load report; observed {len(unique_reports)}"
+        )
+    pretrained_load = next(iter(unique_reports.values()))
+    if (
+        set(pretrained_load)
+        != {
+            "schema_version",
+            "checkpoint",
+            "component",
+            "loaded_keyset_sha256",
+            *_PRETRAINED_LOAD_COUNT_FIELDS,
+        }
+        or pretrained_load.get("schema_version") != 1
+        or pretrained_load.get("checkpoint") != expected_checkpoint_path
+        or pretrained_load.get("component") != expected_component
+        or _SHA256_RE.fullmatch(
+            str(pretrained_load.get("loaded_keyset_sha256", ""))
+        )
+        is None
+        or any(
+            isinstance(pretrained_load.get(name), bool)
+            or not isinstance(pretrained_load.get(name), int)
+            or pretrained_load[name] < 0
+            for name in _PRETRAINED_LOAD_COUNT_FIELDS
+        )
+        or pretrained_load["loaded_tensor_count"] < 1
+    ):
+        raise CampaignExecutionError(
+            "SegFormer pretrained-load report does not prove a positive "
+            "load from the exact staged checkpoint and component"
+        )
+    pretrained_load["status_record_occurrences"] = len(load_reports)
+    pretrained_load["report_sha256"] = canonical_sha256(
+        {
+            key: value
+            for key, value in pretrained_load.items()
+            if key not in {"status_record_occurrences", "report_sha256"}
+        }
+    )
     return {
         **identity,
         "validation_record_count": len(validation),
@@ -1276,6 +1350,7 @@ def _training_status_evidence(
         "val_miou": validation[-1]["val_miou"],
         "terminal_success": True,
         "terminal_success_message": "Train finished successfully.",
+        "pretrained_load": pretrained_load,
     }
 
 
@@ -1518,7 +1593,17 @@ def _run_workflow(
             raise CampaignExecutionError(
                 f"training job ended with {train_status}"
             )
-        train_evidence = _training_status_evidence(sdk, train_job.id)
+        expected_load_component = (
+            "model"
+            if row["checkpoint_target"] == "train.pretrained_model_path"
+            else "backbone"
+        )
+        train_evidence = _training_status_evidence(
+            sdk,
+            train_job.id,
+            expected_checkpoint_path=row["checkpoint"]["path"],
+            expected_component=expected_load_component,
+        )
         checkpoint = _qualification_terminal_checkpoint(
             sdk,
             train_job.id,
@@ -1802,7 +1887,10 @@ def build_handoff(
     qualification_path: Path,
 ) -> dict[str, Any]:
     """Create the automatic, non-promoting qualification handoff."""
-    decision = audit_qualification(qualification_path)
+    decision = audit_qualification(
+        qualification_path,
+        expected_contract=contract,
+    )
     successful_ids = [
         item["checkpoint_id"]
         for item in completion["workflows"]
@@ -1827,16 +1915,19 @@ def build_handoff(
         "successful_checkpoint_ids": successful_ids,
         "terminal_failure_checkpoint_ids": failed_ids,
         "runtime_ready_under_current_registry": decision.runtime_ready,
+        "runtime_eligibility": copy.deepcopy(
+            dict(decision.runtime_eligibility)
+        ),
         "status": (
             "ready_for_three_mode_automatic_trigger"
             if decision.runtime_ready
             else (
-                "ready_for_independent_registry_review_and_reseal"
+                "ready_for_evidence_bound_successor_seal"
                 if successful_ids
                 else "terminal_no_successful_ptm"
             )
         ),
-        "next_command_after_independent_registry_promotion_and_reseal": (
+        "next_command_after_evidence_bound_successor_seal": (
             "python -m experiments.cross_model_automl_20260729."
             "segformer_voc2012_campaign.run_campaign "
             "--automatic-trigger --launch"

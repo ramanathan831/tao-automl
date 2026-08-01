@@ -143,6 +143,27 @@ def _workflow(
         }
         value["workflow_sha256"] = canonical_sha256(value)
         return value
+    source_path = f"/lustre/ptms/{checkpoint_id}.pth"
+    load_payload = {
+        "checkpoint": source_path,
+        "component": (
+            "model"
+            if record["checkpoint_target"] == "train.pretrained_model_path"
+            else "backbone"
+        ),
+        "loaded_keyset_sha256": "c" * 64,
+        "loaded_tensor_count": 365,
+        "missing_tensor_count": 4,
+        "non_tensor_count": 0,
+        "schema_version": 1,
+        "shape_mismatched_tensor_count": 4,
+        "unmatched_tensor_count": 2,
+    }
+    pretrained_load = {
+        **load_payload,
+        "status_record_occurrences": 1,
+        "report_sha256": canonical_sha256(load_payload),
+    }
     value = {
         "schema_version": 2,
         "qualification_revision": campaign_contract.QUALIFICATION_REVISION,
@@ -151,7 +172,7 @@ def _workflow(
         "terminal": True,
         "failure_preserved": False,
         "source_checkpoint": {
-            "path": f"/lustre/ptms/{checkpoint_id}.pth",
+            "path": source_path,
             "size_bytes": record["expected_size_bytes"],
             "sha256": "a" * 64,
         },
@@ -186,6 +207,9 @@ def _workflow(
                 "terminal_epoch_index": 49,
                 "naming_contract": "model_epoch_049_step_numeric",
                 "ambiguity_policy": "fail_closed",
+            },
+            "status_evidence": {
+                "pretrained_load": pretrained_load,
             },
         },
         "evaluation": {
@@ -246,6 +270,87 @@ def _qualification_document(success_id: str | None = None) -> dict:
     }
     value["evidence_sha256"] = canonical_sha256(value)
     return value
+
+
+def _seal_runtime_local_qualification(
+    contract: dict,
+    tmp_path: Path,
+    success_ids: tuple[str, ...],
+) -> tuple[dict, Path]:
+    document = _qualification_document()
+    by_id = {
+        item["checkpoint_id"]: index
+        for index, item in enumerate(document["workflows"])
+    }
+    for checkpoint_id in success_ids:
+        document["workflows"][by_id[checkpoint_id]] = _workflow(
+            checkpoint_id,
+            success=True,
+        )
+    document["automl_contract_sha256"] = contract["contract_sha256"]
+    document["qualification_controller_sha256"] = contract[
+        "launcher_integrity"
+    ]["qualification_campaign_sha256"]
+    document["evidence_sha256"] = canonical_sha256(
+        {
+            key: value
+            for key, value in document.items()
+            if key != "evidence_sha256"
+        }
+    )
+    qualification_path = tmp_path / "qualification.json"
+    qualification_path.write_text(json.dumps(document), encoding="utf-8")
+
+    snapshot = campaign_contract.segformer_registry_snapshot()
+    policy = {
+        "schema_version": 1,
+        "kind": campaign_contract.RUNTIME_LOCAL_ELIGIBILITY_KIND,
+        "enabled": True,
+        "scope": "campaign_local_in_memory_projection",
+        "model": "segformer",
+        "task": "semantic_segmentation",
+        "tao_version": "7.1.0",
+        "container_sha256": campaign_contract.FROZEN_SQSH["sha256"],
+        "base_registry_version": snapshot["registry_version"],
+        "base_registry_sha256": snapshot["registry_sha256"],
+        "qualification_evidence_path": str(qualification_path),
+        "qualification_file_sha256": campaign_contract.sha256_file(
+            qualification_path
+        ),
+        "qualification_evidence_sha256": document["evidence_sha256"],
+        "qualification_contract_sha256": contract["contract_sha256"],
+        "qualification_controller_sha256": contract[
+            "launcher_integrity"
+        ]["qualification_campaign_sha256"],
+        "eligibility_gate_sha256": contract["launcher_integrity"][
+            "qualification_gate_sha256"
+        ],
+        "runtime_resolver_sha256": campaign_contract.sha256_file(
+            Path(contract["runtime"]["repository"])
+            / "src/tao_automl/ptm_runtime.py"
+        ),
+        "eligibility_source_commit": contract["runtime"]["source_commit"],
+        "wheel_sha256": contract["runtime"]["wheel_sha256"],
+        "sdk_commit": contract["runtime"]["sdk_commit"],
+        "skills_commit": contract["runtime"]["skills_commit"],
+        "license_policy": "complete_existing_registry_metadata_only",
+        "checkpoint_spec_file": copy.deepcopy(
+            campaign_contract.FROZEN_RUNTIME_LOCAL_CHECKPOINT_SPEC_FILE
+        ),
+        "repository_registry_mutation_allowed": False,
+        "missing_license_normalization_allowed": False,
+        "failed_arm_promotion_allowed": False,
+        "unsupported_arm_promotion_allowed": False,
+        "agent_override_allowed": False,
+    }
+    sealed = copy.deepcopy(contract)
+    sealed.pop("contract_sha256")
+    sealed["runtime"]["runtime_local_eligibility"] = copy.deepcopy(policy)
+    sealed["qualification_policy"]["runtime_local_eligibility"] = (
+        copy.deepcopy(policy)
+    )
+    sealed["contract_sha256"] = canonical_sha256(sealed)
+    return campaign_contract.validate_contract(sealed), qualification_path
 
 
 def _fake_qualification_stage(contract: dict) -> dict:
@@ -613,13 +718,15 @@ def test_qualification_v4_paths_preserve_frozen_v1_v2_v3_evidence():
 def test_qualification_v4_binds_combined_runtime_overlay(contract):
     overlay = campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
     assert overlay["combined_commit"] == (
-        "3b1e073571f3bbf3702b0ae837e9279ad12f4286"
+        "2681dea4c876b759f8a0446491b3619e6120b531"
     )
     assert overlay["source_commit"] == overlay["combined_commit"]
     assert overlay["archive_sha256"] == (
-        "b055100d0d3e9e8c5daf94dfd4caf3cccacfb54fbebb423129fb5832066e420b"
+        "a7d5316816710b258c52001f979a22723c88fca5101a05ca3a48838ce81d1ee4"
     )
     assert overlay["required_actions"] == ["train", "evaluate"]
+    assert overlay["file_count"] == 5
+    assert "positive_pretrained_load_receipt" in overlay["remediates"]
     policy = contract["qualification_policy"]
     assert policy["revision"] == 4
     assert policy["campaign_id"].endswith("-v4")
@@ -763,6 +870,99 @@ def test_unverified_full_run_success_cannot_bypass_registry(tmp_path: Path):
         )
         with pytest.raises(QualificationGateError):
             QualificationLoadEvidence(decision)
+
+
+def test_sealed_runtime_local_projection_admits_only_exact_success_with_license(
+    contract,
+    tmp_path: Path,
+):
+    snapshot = campaign_contract.segformer_registry_snapshot()
+    city_id = next(
+        item["id"]
+        for item in snapshot["records"]
+        if item["checkpoint_target"] == "train.pretrained_model_path"
+    )
+    backbone_id = next(
+        item["id"]
+        for item in snapshot["records"]
+        if item["checkpoint_target"]
+        == "model.backbone.pretrained_backbone_path"
+    )
+    sealed, qualification_path = _seal_runtime_local_qualification(
+        contract,
+        tmp_path,
+        (city_id, backbone_id),
+    )
+    base = load_ptm_registry()
+    base_sha = base.document_sha256
+
+    decision = audit_qualification(
+        qualification_path,
+        expected_contract=sealed,
+    )
+
+    assert decision.runtime_ready is True
+    assert decision.checkpoint_ids == (city_id,)
+    assert decision.blockers == ()
+    assert decision.runtime_registry.checkpoint(city_id)["status"] == (
+        "supported"
+    )
+    assert decision.runtime_registry.checkpoint(backbone_id)["status"] == (
+        "unverified"
+    )
+    incomplete = next(
+        item
+        for item in decision.exclusions
+        if item["checkpoint_id"] == backbone_id
+    )
+    assert incomplete["code"] == "runtime_metadata_incomplete"
+    assert "will not invent or normalize a license" in incomplete["reason"]
+    eligibility = decision.runtime_eligibility
+    assert eligibility["qualified_checkpoint_ids"] == [city_id]
+    assert eligibility[
+        "runtime_metadata_incomplete_checkpoint_ids"
+    ] == [backbone_id]
+    assert eligibility["repository_registry_mutated"] is False
+    assert eligibility["missing_license_normalization_allowed"] is False
+    assert eligibility["failed_arms_preserved"] is True
+    assert load_ptm_registry().document_sha256 == base_sha
+    assert load_ptm_registry().checkpoint(city_id)["status"] == "unverified"
+
+
+def test_runtime_local_projection_fails_closed_on_evidence_hash_change(
+    contract,
+    tmp_path: Path,
+):
+    city_id = next(
+        item["id"]
+        for item in campaign_contract.segformer_registry_snapshot()["records"]
+        if item["checkpoint_target"] == "train.pretrained_model_path"
+    )
+    sealed, qualification_path = _seal_runtime_local_qualification(
+        contract,
+        tmp_path,
+        (city_id,),
+    )
+    changed = copy.deepcopy(sealed)
+    changed.pop("contract_sha256")
+    for location in (
+        changed["runtime"],
+        changed["qualification_policy"],
+    ):
+        location["runtime_local_eligibility"][
+            "qualification_file_sha256"
+        ] = "f" * 64
+    changed["contract_sha256"] = canonical_sha256(changed)
+    changed = campaign_contract.validate_contract(changed)
+
+    with pytest.raises(
+        QualificationGateError,
+        match="exact base registry and qualification evidence",
+    ):
+        audit_qualification(
+            qualification_path,
+            expected_contract=changed,
+        )
 
 
 def test_prior_evidence_is_preserved_but_cannot_satisfy_v4_gate(
@@ -1184,6 +1384,19 @@ def test_completion_exactly_round_trips_through_qualification_gate(
         workflow["source_checkpoint"] = copy.deepcopy(
             row["checkpoint"]
         )
+        if workflow["status"] == "success":
+            report = workflow["train"]["status_evidence"][
+                "pretrained_load"
+            ]
+            report["checkpoint"] = row["checkpoint"]["path"]
+            report["report_sha256"] = canonical_sha256(
+                {
+                    key: value
+                    for key, value in report.items()
+                    if key
+                    not in {"status_record_occurrences", "report_sha256"}
+                }
+            )
         workflow["workflow_sha256"] = canonical_sha256(
             {
                 key: value
@@ -1241,6 +1454,19 @@ def test_qualification_handoff_is_automatic_but_never_promotes_registry(
         workflow["source_checkpoint"] = copy.deepcopy(
             row["checkpoint"]
         )
+        if workflow["status"] == "success":
+            report = workflow["train"]["status_evidence"][
+                "pretrained_load"
+            ]
+            report["checkpoint"] = row["checkpoint"]["path"]
+            report["report_sha256"] = canonical_sha256(
+                {
+                    key: value
+                    for key, value in report.items()
+                    if key
+                    not in {"status_record_occurrences", "report_sha256"}
+                }
+            )
         workflow["workflow_sha256"] = canonical_sha256(
             {
                 key: value
@@ -1301,6 +1527,19 @@ def test_independent_status_promotion_preserves_pre_promotion_evidence(
         workflow["source_checkpoint"] = copy.deepcopy(
             row["checkpoint"]
         )
+        if workflow["status"] == "success":
+            report = workflow["train"]["status_evidence"][
+                "pretrained_load"
+            ]
+            report["checkpoint"] = row["checkpoint"]["path"]
+            report["report_sha256"] = canonical_sha256(
+                {
+                    key: value
+                    for key, value in report.items()
+                    if key
+                    not in {"status_record_occurrences", "report_sha256"}
+                }
+            )
         workflow["workflow_sha256"] = canonical_sha256(
             {
                 key: value
@@ -1496,6 +1735,27 @@ def test_training_status_evidence_counts_one_evaluation_record_per_epoch(
     monkeypatch: pytest.MonkeyPatch,
 ):
     records = []
+    checkpoint_path = "/lustre/staged/segformer.ptm"
+    load_report = {
+        "checkpoint": checkpoint_path,
+        "component": "backbone",
+        "loaded_keyset_sha256": "d" * 64,
+        "loaded_tensor_count": 365,
+        "missing_tensor_count": 0,
+        "non_tensor_count": 0,
+        "schema_version": 1,
+        "shape_mismatched_tensor_count": 0,
+        "unmatched_tensor_count": 2,
+    }
+    records.append(
+        {
+            "message": (
+                qualification_campaign.PRETRAINED_LOAD_REPORT_PREFIX
+                + json.dumps(load_report, sort_keys=True, separators=(",", ":"))
+            )
+        }
+    )
+    records.append(copy.deepcopy(records[-1]))
     epochs = campaign_contract.FROZEN_QUALIFICATION_TRAINING_EPOCHS
     for epoch in range(epochs):
         metric = 0.10 + epoch / 100
@@ -1525,6 +1785,8 @@ def test_training_status_evidence_counts_one_evaluation_record_per_epoch(
     evidence = qualification_campaign._training_status_evidence(
         object(),
         "job-id",
+        expected_checkpoint_path=checkpoint_path,
+        expected_component="backbone",
     )
 
     assert evidence["validation_record_count"] == epochs
@@ -1533,6 +1795,11 @@ def test_training_status_evidence_counts_one_evaluation_record_per_epoch(
     ]
     assert evidence["val_miou"] == pytest.approx(0.59)
     assert evidence["terminal_success"] is True
+    assert evidence["pretrained_load"]["loaded_tensor_count"] == 365
+    assert evidence["pretrained_load"]["status_record_occurrences"] == 2
+    assert evidence["pretrained_load"]["report_sha256"] == canonical_sha256(
+        load_report
+    )
 
 
 def test_training_status_evidence_rejects_missing_epoch_evaluation_record(
@@ -1566,7 +1833,111 @@ def test_training_status_evidence_rejects_missing_epoch_evaluation_record(
         qualification_campaign.CampaignExecutionError,
         match="emitted 49 val_miou records; expected 50",
     ):
-        qualification_campaign._training_status_evidence(object(), "job-id")
+        qualification_campaign._training_status_evidence(
+            object(),
+            "job-id",
+            expected_checkpoint_path="/lustre/staged/segformer.ptm",
+            expected_component="backbone",
+        )
+
+
+@pytest.mark.parametrize(
+    ("report_change", "expected"),
+    [
+        (None, "exactly one unique positive"),
+        ({"loaded_tensor_count": 0}, "does not prove a positive load"),
+        ({"checkpoint": "/lustre/other.ptm"}, "does not prove a positive load"),
+        ({"component": "model"}, "does not prove a positive load"),
+    ],
+)
+def test_training_status_evidence_requires_exact_positive_load_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+    report_change: dict | None,
+    expected: str,
+):
+    checkpoint_path = "/lustre/staged/segformer.ptm"
+    report = {
+        "checkpoint": checkpoint_path,
+        "component": "backbone",
+        "loaded_keyset_sha256": "d" * 64,
+        "loaded_tensor_count": 365,
+        "missing_tensor_count": 0,
+        "non_tensor_count": 0,
+        "schema_version": 1,
+        "shape_mismatched_tensor_count": 0,
+        "unmatched_tensor_count": 2,
+    }
+    records = [
+        {
+            "message": "Eval metrics generated.",
+            "kpi": {"val_miou": 0.4},
+        }
+        for _ in range(
+            campaign_contract.FROZEN_QUALIFICATION_TRAINING_EPOCHS
+        )
+    ]
+    if report_change is not None:
+        report.update(report_change)
+        records.insert(
+            0,
+            {
+                "message": (
+                    qualification_campaign.PRETRAINED_LOAD_REPORT_PREFIX
+                    + json.dumps(report, separators=(",", ":"))
+                )
+            },
+        )
+    records.append({"message": "Train finished successfully."})
+    monkeypatch.setattr(
+        qualification_campaign,
+        "_status_records",
+        lambda *_args, **_kwargs: (records, {"record_count": len(records)}),
+    )
+
+    with pytest.raises(
+        qualification_campaign.CampaignExecutionError,
+        match=expected,
+    ):
+        qualification_campaign._training_status_evidence(
+            object(),
+            "job-id",
+            expected_checkpoint_path=checkpoint_path,
+            expected_component="backbone",
+        )
+
+
+def test_qualification_gate_rejects_finite_metrics_without_positive_load():
+    checkpoint_id = campaign_contract.segformer_registry_snapshot()[
+        "records"
+    ][0]["id"]
+    workflow = _workflow(checkpoint_id, success=True, metric=0.7)
+    report = workflow["train"]["status_evidence"]["pretrained_load"]
+    report["loaded_tensor_count"] = 0
+    report["report_sha256"] = canonical_sha256(
+        {
+            key: value
+            for key, value in report.items()
+            if key not in {"status_record_occurrences", "report_sha256"}
+        }
+    )
+    workflow["workflow_sha256"] = canonical_sha256(
+        {
+            key: value
+            for key, value in workflow.items()
+            if key != "workflow_sha256"
+        }
+    )
+    record = load_ptm_registry().checkpoint(checkpoint_id)
+
+    with pytest.raises(
+        QualificationGateError,
+        match="does not prove a nonzero exact-component load",
+    ):
+        qualification_gate._successful_workflow(
+            workflow,
+            checkpoint_id=checkpoint_id,
+            registry_record=record,
+        )
 
 
 def test_qualification_terminal_checkpoint_uses_epoch_49_not_search_epoch_9(

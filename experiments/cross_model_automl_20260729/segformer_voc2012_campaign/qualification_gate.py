@@ -4,18 +4,21 @@
 
 The user explicitly disallowed CPU/model smokes and mini-steps.  This adapter
 therefore accepts only stronger evidence from real one-node/eight-GPU,
-full-VOC2012 training plus standalone evaluation.  Evidence never mutates or
-bypasses the repository PTM registry: a successful workflow becomes runtime
-eligible only after its exact registry record is independently ``supported``.
+full-VOC2012 training plus standalone evaluation.  Evidence never mutates the
+repository PTM registry.  Ordinary callers still require a supported record;
+an explicitly sealed successor campaign may additionally authorize an exact,
+versioned in-memory registry projection bound to immutable qualification
+evidence and complete pre-existing registry license metadata.
 """
 
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -23,25 +26,42 @@ from tao_automl.ptm_preflight import (
     CheckpointLoadSmokeRequest,
     CheckpointLoadSmokeResult,
 )
-from tao_automl.ptm_registry import canonical_sha256, load_ptm_registry
+from tao_automl.ptm_registry import (
+    PTMRegistry,
+    canonical_sha256,
+    load_ptm_registry,
+)
 
 from .campaign_contract import (
     AGENT_FLAGS,
     FROZEN_QUALIFICATION_FIDELITY,
     FROZEN_QUALIFICATION_RUNTIME_OVERLAY,
     FROZEN_QUALIFICATION_TRAINING_EPOCHS,
+    FROZEN_RUNTIME_LOCAL_CHECKPOINT_SPEC_FILE,
     FROZEN_SQSH,
     FROZEN_VALIDATION_SANITY_MIN_MIOU,
     FROZEN_PRIOR_QUALIFICATION_EVIDENCE,
     QUALIFICATION_CAMPAIGN_ID,
     QUALIFICATION_REVISION,
+    RUNTIME_LOCAL_ELIGIBILITY_KIND,
     segformer_registry_snapshot,
     sha256_file,
+    validate_contract,
 )
 
 
 class QualificationGateError(RuntimeError):
     """Qualification evidence cannot authorize the campaign."""
+
+
+_PRETRAINED_LOAD_COUNT_FIELDS = (
+    "loaded_tensor_count",
+    "missing_tensor_count",
+    "shape_mismatched_tensor_count",
+    "unmatched_tensor_count",
+    "non_tensor_count",
+)
+_RUNTIME_LOCAL_SPEC = FROZEN_RUNTIME_LOCAL_CHECKPOINT_SPEC_FILE
 
 
 def _sha(value: Any, name: str) -> str:
@@ -227,6 +247,8 @@ def _workflow_integrity(
 @dataclass(frozen=True)
 class QualifiedPTM:
     checkpoint_id: str
+    checkpoint_target: str
+    registry_core_identity_sha256: str
     source_checkpoint_path: str
     source_checkpoint_sha256: str
     source_checkpoint_size_bytes: int
@@ -235,11 +257,19 @@ class QualifiedPTM:
     terminal_checkpoint_size_bytes: int
     val_miou: float
     test_miou: float
+    pretrained_load_component: str
+    pretrained_loaded_tensor_count: int
+    pretrained_loaded_keyset_sha256: str
+    pretrained_load_report_sha256: str
     workflow_sha256: str
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "checkpoint_id": self.checkpoint_id,
+            "checkpoint_target": self.checkpoint_target,
+            "registry_core_identity_sha256": (
+                self.registry_core_identity_sha256
+            ),
             "source_checkpoint_path": self.source_checkpoint_path,
             "source_checkpoint_sha256": self.source_checkpoint_sha256,
             "source_checkpoint_size_bytes": self.source_checkpoint_size_bytes,
@@ -248,6 +278,16 @@ class QualifiedPTM:
             "terminal_checkpoint_size_bytes": self.terminal_checkpoint_size_bytes,
             "val_miou": self.val_miou,
             "test_miou": self.test_miou,
+            "pretrained_load_component": self.pretrained_load_component,
+            "pretrained_loaded_tensor_count": (
+                self.pretrained_loaded_tensor_count
+            ),
+            "pretrained_loaded_keyset_sha256": (
+                self.pretrained_loaded_keyset_sha256
+            ),
+            "pretrained_load_report_sha256": (
+                self.pretrained_load_report_sha256
+            ),
             "workflow_sha256": self.workflow_sha256,
         }
 
@@ -260,7 +300,9 @@ class QualificationDecision:
     qualified: tuple[QualifiedPTM, ...]
     exclusions: tuple[Mapping[str, Any], ...]
     blockers: tuple[Mapping[str, Any], ...]
+    runtime_eligibility: Mapping[str, Any]
     decision_sha256: str
+    runtime_registry: PTMRegistry = field(repr=False, compare=False)
 
     @property
     def runtime_ready(self) -> bool:
@@ -272,16 +314,20 @@ class QualificationDecision:
 
     def stable_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 2,
-            "gate": "segformer_direct_full_gpu_then_supported_registry_v4",
+            "schema_version": 3,
+            "gate": self.runtime_eligibility["kind"],
             "evidence_path": self.evidence_path,
             "evidence_sha256": self.evidence_sha256,
             "qualification_campaign_id": self.qualification_campaign_id,
             "qualified": [item.to_dict() for item in self.qualified],
             "exclusions": [copy.deepcopy(dict(item)) for item in self.exclusions],
             "blockers": [copy.deepcopy(dict(item)) for item in self.blockers],
+            "runtime_eligibility": copy.deepcopy(
+                dict(self.runtime_eligibility)
+            ),
             "runtime_ready": self.runtime_ready,
             "registry_bypass_allowed": False,
+            "repository_registry_mutated": False,
             "cpu_or_smoke_model_job_launched": False,
         }
 
@@ -299,8 +345,9 @@ class QualificationDecision:
         )
         raise QualificationGateError(
             "SegFormer AutoML is fail-closed: "
-            f"{codes or 'no runtime-qualified PTM'}. Direct GPU evidence "
-            "cannot mutate or bypass the repository PTM registry."
+            f"{codes or 'no runtime-qualified PTM'}. Qualification evidence "
+            "cannot mutate the repository PTM registry or admit an arm "
+            "outside the sealed runtime-eligibility policy."
         )
 
 
@@ -325,6 +372,79 @@ def _artifact(
     ):
         raise QualificationGateError(f"{name} artifact identity is invalid")
     return path, digest, size
+
+
+def _pretrained_load_evidence(
+    train: Mapping[str, Any],
+    *,
+    checkpoint_id: str,
+    checkpoint_path: str,
+    checkpoint_target: str,
+) -> dict[str, Any]:
+    """Require the exact positive loader receipt emitted by product code."""
+    expected_component = {
+        "train.pretrained_model_path": "model",
+        "model.backbone.pretrained_backbone_path": "backbone",
+    }.get(checkpoint_target)
+    status_evidence = train.get("status_evidence")
+    report = (
+        status_evidence.get("pretrained_load")
+        if isinstance(status_evidence, Mapping)
+        else None
+    )
+    if expected_component is None or not isinstance(report, Mapping):
+        raise QualificationGateError(
+            f"{checkpoint_id} has no exact positive pretrained-load evidence"
+        )
+    required = {
+        "schema_version",
+        "checkpoint",
+        "component",
+        "loaded_keyset_sha256",
+        "status_record_occurrences",
+        "report_sha256",
+        *_PRETRAINED_LOAD_COUNT_FIELDS,
+    }
+    if (
+        set(report) != required
+        or report.get("schema_version") != 1
+        or report.get("checkpoint") != checkpoint_path
+        or report.get("component") != expected_component
+        or _sha(
+            report.get("loaded_keyset_sha256"),
+            f"{checkpoint_id}.loaded_keyset_sha256",
+        )
+        != report.get("loaded_keyset_sha256")
+        or _sha(
+            report.get("report_sha256"),
+            f"{checkpoint_id}.pretrained_load.report_sha256",
+        )
+        != report.get("report_sha256")
+        or any(
+            isinstance(report.get(name), bool)
+            or not isinstance(report.get(name), int)
+            or report[name] < 0
+            for name in _PRETRAINED_LOAD_COUNT_FIELDS
+        )
+        or report["loaded_tensor_count"] < 1
+        or isinstance(report.get("status_record_occurrences"), bool)
+        or not isinstance(report.get("status_record_occurrences"), int)
+        or report["status_record_occurrences"] < 1
+    ):
+        raise QualificationGateError(
+            f"{checkpoint_id} pretrained-load receipt is invalid or does not "
+            "prove a nonzero exact-component load"
+        )
+    payload = {
+        key: copy.deepcopy(value)
+        for key, value in report.items()
+        if key not in {"status_record_occurrences", "report_sha256"}
+    }
+    if canonical_sha256(payload) != report["report_sha256"]:
+        raise QualificationGateError(
+            f"{checkpoint_id} pretrained-load receipt integrity failed"
+        )
+    return copy.deepcopy(dict(report))
 
 
 def _successful_workflow(
@@ -403,6 +523,12 @@ def _successful_workflow(
         raise QualificationGateError(
             f"{checkpoint_id} full train/evaluation contract is incomplete"
         )
+    pretrained_load = _pretrained_load_evidence(
+        train,
+        checkpoint_id=checkpoint_id,
+        checkpoint_path=source_path,
+        checkpoint_target=str(registry_record.get("checkpoint_target", "")),
+    )
     terminal_checkpoint = train.get("terminal_checkpoint")
     checkpoint_path, checkpoint_sha, checkpoint_size = _artifact(
         terminal_checkpoint,
@@ -446,6 +572,10 @@ def _successful_workflow(
     )
     return QualifiedPTM(
         checkpoint_id=checkpoint_id,
+        checkpoint_target=str(registry_record["checkpoint_target"]),
+        registry_core_identity_sha256=canonical_sha256(
+            _registry_core_identity(registry_record)
+        ),
         source_checkpoint_path=source_path,
         source_checkpoint_sha256=source_sha,
         source_checkpoint_size_bytes=source_size,
@@ -454,22 +584,319 @@ def _successful_workflow(
         terminal_checkpoint_size_bytes=checkpoint_size,
         val_miou=val_miou,
         test_miou=test_miou,
+        pretrained_load_component=pretrained_load["component"],
+        pretrained_loaded_tensor_count=pretrained_load[
+            "loaded_tensor_count"
+        ],
+        pretrained_loaded_keyset_sha256=pretrained_load[
+            "loaded_keyset_sha256"
+        ],
+        pretrained_load_report_sha256=pretrained_load["report_sha256"],
         workflow_sha256=expected,
     )
 
 
-def audit_qualification(path: str | Path) -> QualificationDecision:
+def _runtime_local_policy(
+    expected_contract: Mapping[str, Any] | None,
+) -> Mapping[str, Any] | None:
+    """Return a separately sealed, post-qualification authorization policy."""
+    if expected_contract is None:
+        return None
+    value = expected_contract.get("qualification_policy", {}).get(
+        "runtime_local_eligibility"
+    )
+    if not isinstance(value, Mapping) or value.get("enabled") is not True:
+        return None
+    required_false = (
+        "repository_registry_mutation_allowed",
+        "missing_license_normalization_allowed",
+        "failed_arm_promotion_allowed",
+        "unsupported_arm_promotion_allowed",
+        "agent_override_allowed",
+    )
+    if (
+        value.get("schema_version") != 1
+        or value.get("kind")
+        != RUNTIME_LOCAL_ELIGIBILITY_KIND
+        or value.get("scope") != "campaign_local_in_memory_projection"
+        or value.get("model") != "segformer"
+        or value.get("task") != "semantic_segmentation"
+        or value.get("tao_version") != "7.1.0"
+        or value.get("container_sha256") != FROZEN_SQSH["sha256"]
+        or value.get("license_policy")
+        != "complete_existing_registry_metadata_only"
+        or value.get("checkpoint_spec_file") != _RUNTIME_LOCAL_SPEC
+        or any(value.get(name) is not False for name in required_false)
+    ):
+        raise QualificationGateError(
+            "sealed runtime-local SegFormer eligibility policy is invalid"
+        )
+    for name in (
+        "base_registry_sha256",
+        "qualification_file_sha256",
+        "qualification_evidence_sha256",
+        "qualification_contract_sha256",
+        "qualification_controller_sha256",
+        "eligibility_gate_sha256",
+        "runtime_resolver_sha256",
+        "wheel_sha256",
+    ):
+        _sha(value.get(name), f"runtime_local_eligibility.{name}")
+    for name in ("eligibility_source_commit", "sdk_commit", "skills_commit"):
+        commit = value.get(name)
+        if (
+            not isinstance(commit, str)
+            or len(commit) != 40
+            or any(character not in "0123456789abcdef" for character in commit)
+        ):
+            raise QualificationGateError(
+                f"runtime_local_eligibility.{name} must be a Git commit"
+            )
+    evidence_path = value.get("qualification_evidence_path")
+    if (
+        not isinstance(evidence_path, str)
+        or not Path(evidence_path).is_absolute()
+    ):
+        raise QualificationGateError(
+            "runtime_local_eligibility.qualification_evidence_path must be "
+            "absolute"
+        )
+    return value
+
+
+def _has_complete_existing_license(record: Mapping[str, Any]) -> bool:
+    license_info = record.get("license")
+    return bool(
+        isinstance(license_info, Mapping)
+        and isinstance(license_info.get("name"), str)
+        and license_info["name"].strip()
+        and isinstance(license_info.get("access_requirements"), list)
+        and all(
+            isinstance(item, str) and item.strip()
+            for item in license_info["access_requirements"]
+        )
+    )
+
+
+def _project_runtime_registry(
+    *,
+    base_registry: PTMRegistry,
+    qualified: tuple[QualifiedPTM, ...],
+    metadata_incomplete_ids: tuple[str, ...],
+    evidence_path: Path,
+    evidence_file_sha256: str,
+    evidence_sha256: str,
+    policy: Mapping[str, Any] | None,
+) -> tuple[PTMRegistry, dict[str, Any]]:
+    """Build a validated run-local view without changing global registry data."""
+    base_sha = base_registry.document_sha256
+    base_version = base_registry.registry_version
+    base_model_records = base_registry.to_dict()["models"]["segformer"][
+        "checkpoints"
+    ]
+    base_record_hashes = {
+        record["id"]: canonical_sha256(record)
+        for record in sorted(base_model_records, key=lambda value: value["id"])
+    }
+    if policy is None:
+        return base_registry, {
+            "schema_version": 1,
+            "kind": "repository_supported_registry",
+            "scope": "repository_registry",
+            "base_registry_version": base_version,
+            "base_registry_sha256": base_sha,
+            "projected_registry_version": base_version,
+            "projected_registry_sha256": base_sha,
+            "qualified_checkpoint_ids": [
+                item.checkpoint_id for item in qualified
+            ],
+            "runtime_metadata_incomplete_checkpoint_ids": list(
+                metadata_incomplete_ids
+            ),
+            "base_record_sha256_by_checkpoint_id": base_record_hashes,
+            "transformations": [],
+            "repository_registry_mutated": False,
+            "failed_arms_preserved": True,
+        }
+    if (
+        policy["base_registry_sha256"] != base_sha
+        or policy.get("base_registry_version") != base_version
+        or policy["qualification_file_sha256"] != evidence_file_sha256
+        or policy["qualification_evidence_sha256"] != evidence_sha256
+    ):
+        raise QualificationGateError(
+            "runtime-local eligibility is not bound to the exact base "
+            "registry and qualification evidence"
+        )
+
+    document = base_registry.to_dict()
+    document["registry_version"] = (
+        f"{base_version}+segformer-runtime-local-v1."
+        f"{evidence_sha256[:12]}"
+    )
+    records = {
+        record["id"]: record
+        for record in document["models"]["segformer"]["checkpoints"]
+    }
+    transformations = []
+    for item in sorted(qualified, key=lambda value: value.checkpoint_id):
+        record = records[item.checkpoint_id]
+        original = copy.deepcopy(record)
+        if record["status"] == "unsupported":
+            raise QualificationGateError(
+                f"{item.checkpoint_id} is explicitly unsupported and cannot "
+                "enter a runtime-local projection"
+            )
+        if not _has_complete_existing_license(record):
+            raise QualificationGateError(
+                f"{item.checkpoint_id} lacks complete existing license "
+                "metadata and cannot enter a runtime-local projection"
+            )
+        if (
+            canonical_sha256(_registry_core_identity(record))
+            != item.registry_core_identity_sha256
+            or record.get("sha256")
+            not in (None, item.source_checkpoint_sha256)
+        ):
+            raise QualificationGateError(
+                f"{item.checkpoint_id} registry/source identity mismatch"
+            )
+        record["status"] = "supported"
+        record.pop("status_reason", None)
+        record["sha256"] = item.source_checkpoint_sha256
+        record["compatible_tao_versions"] = ["==7.1.0"]
+        record["default_spec_overrides"] = {}
+        record["checkpoint_spec_file"] = copy.deepcopy(_RUNTIME_LOCAL_SPEC)
+        record["deprecation"] = {
+            "is_deprecated": False,
+            "reason": None,
+            "replacement_id": None,
+        }
+        record["validation"] = {
+            "status": "validated",
+            "tao_version": policy["tao_version"],
+            "container_identity": (
+                "sqsh-sha256:" + policy["container_sha256"]
+            ),
+            "evidence": (
+                f"{evidence_path}#evidence_sha256={evidence_sha256};"
+                f"workflow_sha256={item.workflow_sha256};"
+                "pretrained_load_report_sha256="
+                f"{item.pretrained_load_report_sha256}"
+            ),
+        }
+        transformations.append(
+            {
+                "checkpoint_id": item.checkpoint_id,
+                "action": (
+                    "retain_supported_identity"
+                    if original["status"] == "supported"
+                    else "qualify_exact_unverified_identity"
+                ),
+                "base_status": original["status"],
+                "projected_status": "supported",
+                "base_record_sha256": canonical_sha256(original),
+                "projected_record_sha256": canonical_sha256(record),
+                "source_checkpoint_sha256": (
+                    item.source_checkpoint_sha256
+                ),
+                "workflow_sha256": item.workflow_sha256,
+                "pretrained_load_report_sha256": (
+                    item.pretrained_load_report_sha256
+                ),
+                "pretrained_loaded_tensor_count": (
+                    item.pretrained_loaded_tensor_count
+                ),
+                "license_metadata_source": "unchanged_base_registry_record",
+            }
+        )
+
+    projected = PTMRegistry(document)
+    if base_registry.document_sha256 != base_sha:
+        raise QualificationGateError(
+            "base repository registry changed during projection"
+        )
+    qualified_ids = [
+        item.checkpoint_id
+        for item in sorted(qualified, key=lambda value: value.checkpoint_id)
+    ]
+    eligibility = {
+        "schema_version": 1,
+        "kind": RUNTIME_LOCAL_ELIGIBILITY_KIND,
+        "scope": "campaign_local_in_memory_projection",
+        "model": "segformer",
+        "task": "semantic_segmentation",
+        "tao_version": policy["tao_version"],
+        "container_sha256": policy["container_sha256"],
+        "qualification_path": str(evidence_path),
+        "qualification_file_sha256": evidence_file_sha256,
+        "qualification_evidence_sha256": evidence_sha256,
+        "qualification_contract_sha256": policy[
+            "qualification_contract_sha256"
+        ],
+        "qualification_controller_sha256": policy[
+            "qualification_controller_sha256"
+        ],
+        "eligibility_gate_sha256": policy["eligibility_gate_sha256"],
+        "runtime_resolver_sha256": policy["runtime_resolver_sha256"],
+        "eligibility_source_commit": policy["eligibility_source_commit"],
+        "wheel_sha256": policy["wheel_sha256"],
+        "sdk_commit": policy["sdk_commit"],
+        "skills_commit": policy["skills_commit"],
+        "base_registry_version": base_version,
+        "base_registry_sha256": base_sha,
+        "projected_registry_version": projected.registry_version,
+        "projected_registry_sha256": projected.document_sha256,
+        "qualified_checkpoint_ids": qualified_ids,
+        "runtime_metadata_incomplete_checkpoint_ids": list(
+            metadata_incomplete_ids
+        ),
+        "base_record_sha256_by_checkpoint_id": base_record_hashes,
+        "unchanged_checkpoint_ids": sorted(
+            set(base_record_hashes) - set(qualified_ids)
+        ),
+        "transformations": transformations,
+        "license_policy": "complete_existing_registry_metadata_only",
+        "checkpoint_spec_file": copy.deepcopy(_RUNTIME_LOCAL_SPEC),
+        "repository_registry_mutated": False,
+        "projection_persisted_as_global_registry": False,
+        "failed_arms_preserved": True,
+        "missing_license_normalization_allowed": False,
+        "failed_arm_promotion_allowed": False,
+        "unsupported_arm_promotion_allowed": False,
+        "agent_override_allowed": False,
+        "agent_intervention_flags": {name: False for name in AGENT_FLAGS},
+    }
+    eligibility["eligibility_sha256"] = canonical_sha256(eligibility)
+    return projected, eligibility
+
+
+def audit_qualification(
+    path: str | Path,
+    *,
+    expected_contract: Mapping[str, Any] | None = None,
+) -> QualificationDecision:
     evidence_path = Path(path).resolve()
     if not evidence_path.is_file():
         raise QualificationGateError(
             f"qualification evidence is unavailable: {evidence_path}"
         )
-    document = json.loads(evidence_path.read_text(encoding="utf-8"))
+    if expected_contract is not None:
+        try:
+            expected_contract = validate_contract(expected_contract)
+        except Exception as exc:
+            raise QualificationGateError(
+                "expected successor campaign contract is invalid"
+            ) from exc
+    evidence_bytes = evidence_path.read_bytes()
+    evidence_file_sha256 = hashlib.sha256(evidence_bytes).hexdigest()
+    document = json.loads(evidence_bytes.decode("utf-8"))
     supplied_sha = document.get("evidence_sha256")
     payload = copy.deepcopy(document)
     payload.pop("evidence_sha256", None)
     if supplied_sha != canonical_sha256(payload):
         raise QualificationGateError("qualification evidence integrity failed")
+    policy = _runtime_local_policy(expected_contract)
     snapshot = segformer_registry_snapshot()
     registry = load_ptm_registry()
     if (
@@ -492,6 +919,35 @@ def audit_qualification(path: str | Path) -> QualificationDecision:
         raise QualificationGateError(
             "qualification campaign identity or execution policy changed"
         )
+    if policy is not None:
+        runtime = expected_contract.get("runtime", {})
+        launchers = expected_contract.get("launcher_integrity", {})
+        repository = Path(str(runtime.get("repository", ""))).resolve()
+        runtime_resolver = repository / "src/tao_automl/ptm_runtime.py"
+        if (
+            str(evidence_path) != policy["qualification_evidence_path"]
+            or document.get("automl_contract_sha256")
+            != policy["qualification_contract_sha256"]
+            or document.get("qualification_controller_sha256")
+            != policy["qualification_controller_sha256"]
+            or policy["qualification_controller_sha256"]
+            != launchers.get("qualification_campaign_sha256")
+            or policy["eligibility_gate_sha256"]
+            != launchers.get("qualification_gate_sha256")
+            or policy["eligibility_gate_sha256"] != sha256_file(__file__)
+            or not runtime_resolver.is_file()
+            or policy["runtime_resolver_sha256"]
+            != sha256_file(runtime_resolver)
+            or policy["eligibility_source_commit"]
+            != runtime.get("source_commit")
+            or policy["wheel_sha256"] != runtime.get("wheel_sha256")
+            or policy["sdk_commit"] != runtime.get("sdk_commit")
+            or policy["skills_commit"] != runtime.get("skills_commit")
+        ):
+            raise QualificationGateError(
+                "runtime-local policy is not bound to the exact completed "
+                "qualification and sealed successor runtime"
+            )
     _sha(document.get("registry_sha256"), "registry_sha256")
     stage_by_id = _stage_evidence(
         document,
@@ -517,6 +973,7 @@ def audit_qualification(path: str | Path) -> QualificationDecision:
     qualified: list[QualifiedPTM] = []
     exclusions: list[dict[str, Any]] = []
     blockers: list[dict[str, Any]] = []
+    metadata_incomplete_ids: list[str] = []
     for checkpoint_id in expected_ids:
         workflow = by_id[checkpoint_id]
         record = registry.checkpoint(checkpoint_id)
@@ -579,14 +1036,46 @@ def audit_qualification(path: str | Path) -> QualificationDecision:
                     }
                 )
                 continue
-            if record.get("status") != "supported":
+            if record.get("status") == "unsupported":
+                blockers.append(
+                    {
+                        "checkpoint_id": checkpoint_id,
+                        "code": "registry_explicitly_unsupported",
+                        "reason": (
+                            "An explicitly unsupported repository record "
+                            "cannot be authorized by campaign-local evidence"
+                        ),
+                    }
+                )
+            elif policy is not None and not _has_complete_existing_license(
+                record
+            ):
+                metadata_incomplete_ids.append(checkpoint_id)
+                exclusions.append(
+                    {
+                        "checkpoint_id": checkpoint_id,
+                        "code": "runtime_metadata_incomplete",
+                        "reason": (
+                            "The exact PTM passed technical qualification, "
+                            "but its base registry record has no complete "
+                            "normalized license metadata; the campaign will "
+                            "not invent or normalize a license"
+                        ),
+                        "workflow_sha256": item.workflow_sha256,
+                        "pretrained_load_report_sha256": (
+                            item.pretrained_load_report_sha256
+                        ),
+                    }
+                )
+            elif record.get("status") != "supported" and policy is None:
                 blockers.append(
                     {
                         "checkpoint_id": checkpoint_id,
                         "code": "registry_not_supported",
                         "reason": (
-                            "Direct full-run success exists, but the exact "
-                            "repository record is not independently supported"
+                            "Direct full-run success exists, but neither "
+                            "repository support nor a separately sealed "
+                            "runtime-local eligibility policy is available"
                         ),
                     }
                 )
@@ -633,11 +1122,20 @@ def audit_qualification(path: str | Path) -> QualificationDecision:
                 "checkpoint_id": None,
                 "code": "no_runtime_qualified_ptm",
                 "reason": (
-                    "No exact PTM has both successful direct full-run evidence "
-                    "and repository-supported status"
+                    "No exact PTM has successful positive-load direct-full-run "
+                    "evidence and an authorized runtime eligibility path"
                 ),
             }
         )
+    runtime_registry, runtime_eligibility = _project_runtime_registry(
+        base_registry=registry,
+        qualified=tuple(qualified),
+        metadata_incomplete_ids=tuple(sorted(metadata_incomplete_ids)),
+        evidence_path=evidence_path,
+        evidence_file_sha256=evidence_file_sha256,
+        evidence_sha256=supplied_sha,
+        policy=policy,
+    )
     decision_payload = {
         "evidence_path": str(evidence_path),
         "evidence_sha256": supplied_sha,
@@ -645,6 +1143,7 @@ def audit_qualification(path: str | Path) -> QualificationDecision:
         "qualified": [item.to_dict() for item in qualified],
         "exclusions": exclusions,
         "blockers": blockers,
+        "runtime_eligibility": runtime_eligibility,
     }
     return QualificationDecision(
         evidence_path=str(evidence_path),
@@ -653,7 +1152,9 @@ def audit_qualification(path: str | Path) -> QualificationDecision:
         qualified=tuple(qualified),
         exclusions=tuple(exclusions),
         blockers=tuple(blockers),
+        runtime_eligibility=runtime_eligibility,
         decision_sha256=canonical_sha256(decision_payload),
+        runtime_registry=runtime_registry,
     )
 
 
@@ -678,19 +1179,34 @@ class QualificationLoadEvidence:
                 code="qualification_evidence_missing",
                 reason="No completed direct full-run qualification exists",
             )
-        registry_record = load_ptm_registry().checkpoint(request.checkpoint_id)
+        registry_record = self._decision.runtime_registry.checkpoint(
+            request.checkpoint_id
+        )
         observed_size = request.checkpoint_path.stat().st_size
         observed_sha = sha256_file(request.checkpoint_path)
         if (
             registry_record.get("status") != "supported"
+            or canonical_sha256(_registry_core_identity(registry_record))
+            != record.registry_core_identity_sha256
+            or registry_record.get("checkpoint_target")
+            != record.checkpoint_target
+            or request.registry_record != registry_record
             or observed_size != record.source_checkpoint_size_bytes
             or observed_sha != record.source_checkpoint_sha256
+            or record.pretrained_loaded_tensor_count < 1
+            or record.pretrained_load_component
+            != (
+                "model"
+                if record.checkpoint_target == "train.pretrained_model_path"
+                else "backbone"
+            )
         ):
             return CheckpointLoadSmokeResult(
                 ok=False,
                 code="qualification_artifact_or_registry_mismatch",
                 reason=(
-                    "Live artifact or supported registry identity differs "
+                    "Live artifact, positive-load receipt, or bound runtime "
+                    "registry identity differs "
                     "from direct full-run evidence"
                 ),
             )
@@ -700,14 +1216,34 @@ class QualificationLoadEvidence:
             reason=(
                 "Exact checkpoint passed full-dataset one-node/eight-GPU "
                 "50-epoch training, validation, terminal reload, and "
-                "standalone eval with the sealed v4 runtime overlay"
+                "standalone eval with the sealed positive-load runtime overlay"
             ),
             details={
                 "cpu_or_smoke_model_job_launched": False,
                 "qualification_evidence_sha256": (
                     self._decision.evidence_sha256
                 ),
+                "runtime_eligibility_sha256": (
+                    self._decision.runtime_eligibility.get(
+                        "eligibility_sha256"
+                    )
+                ),
+                "projected_registry_sha256": (
+                    self._decision.runtime_registry.document_sha256
+                ),
                 "workflow_sha256": record.workflow_sha256,
+                "pretrained_load_component": (
+                    record.pretrained_load_component
+                ),
+                "pretrained_loaded_tensor_count": (
+                    record.pretrained_loaded_tensor_count
+                ),
+                "pretrained_loaded_keyset_sha256": (
+                    record.pretrained_loaded_keyset_sha256
+                ),
+                "pretrained_load_report_sha256": (
+                    record.pretrained_load_report_sha256
+                ),
                 "qualified_val_miou": record.val_miou,
                 "qualified_test_miou": record.test_miou,
             },
