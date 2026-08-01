@@ -733,6 +733,17 @@ def test_explicit_in_memory_registry_is_bound_without_mutating_packaged_registry
         registry=explicit_registry,
     )
     assert resolved.report.registry_sha256 == explicit_registry.document_sha256
+    parameters, ranges = _conditional_inputs()
+    built = build_hierarchical_ptm_runtime(
+        resolved_inventory=resolved,
+        objective_config=_objective("latency"),
+        conditional_parameters=parameters,
+        conditional_ranges=ranges,
+        context=_context(),
+        state_store=_StateStore(),
+        random_seed=271828,
+    )
+    assert built.resolved_inventory.runtime_registry is explicit_registry
 
     with pytest.raises(ValueError, match="registry identity"):
         _resolve(report, "latency", registry=unrelated_registry)

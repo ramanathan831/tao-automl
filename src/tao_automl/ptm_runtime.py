@@ -382,6 +382,11 @@ class ResolvedPTMRuntimeInventory:
     base_layers_sha256: Mapping[str, str]
     arms: tuple[ResolvedPTMRuntimeArm, ...]
     inventory_sha256: str
+    runtime_registry: PTMRegistry | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     @property
     def checkpoint_ids(self) -> tuple[str, ...]:
@@ -717,6 +722,7 @@ def resolve_ptm_runtime_inventory(
         base_layers_sha256=layers,
         arms=tuple(arms),
         inventory_sha256="",
+        runtime_registry=registry,
     )
     resolved = ResolvedPTMRuntimeInventory(
         **{
@@ -899,6 +905,7 @@ def build_hierarchical_ptm_runtime(
     _validate_runtime_report(
         resolved_inventory.report,
         model=resolved_inventory.model,
+        registry=resolved_inventory.runtime_registry,
     )
 
     checkpoint_ids = resolved_inventory.checkpoint_ids
