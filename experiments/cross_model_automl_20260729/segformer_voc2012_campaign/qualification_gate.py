@@ -36,12 +36,15 @@ from .campaign_contract import (
     AGENT_FLAGS,
     FROZEN_QUALIFICATION_FIDELITY,
     FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY,
+    FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY,
     FROZEN_QUALIFICATION_RUNTIME_OVERLAY,
     FROZEN_QUALIFICATION_TRAINING_EPOCHS,
     FROZEN_RUNTIME_LOCAL_CHECKPOINT_SPEC_FILE,
     FROZEN_SQSH,
     FROZEN_VALIDATION_SANITY_MIN_MIOU,
     FROZEN_PRIOR_QUALIFICATION_EVIDENCE,
+    FROZEN_V4_REUSABLE_TRAIN_CHECKPOINT_IDS,
+    FROZEN_V5_FRESH_TRAIN_CHECKPOINT_IDS,
     QUALIFICATION_CAMPAIGN_ID,
     QUALIFICATION_REVISION,
     RUNTIME_LOCAL_ELIGIBILITY_KIND,
@@ -172,6 +175,8 @@ def _stage_evidence(
         != FROZEN_QUALIFICATION_RUNTIME_OVERLAY
         or stage.get("runtime", {}).get("infrastructure_retry_policy")
         != FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
+        or stage.get("runtime", {}).get("phase_recovery_policy")
+        != FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY
         or stage.get("prior_revision_evidence")
         != FROZEN_PRIOR_QUALIFICATION_EVIDENCE
         or not isinstance(rows, list)
@@ -205,6 +210,7 @@ def _stage_evidence(
                 "during independent promotion"
             )
         checkpoint = row.get("checkpoint")
+        execution_plan = row.get("execution_plan")
         if (
             not isinstance(checkpoint, Mapping)
             or checkpoint.get("size_bytes")
@@ -216,6 +222,11 @@ def _stage_evidence(
             != checkpoint.get("sha256")
             or not isinstance(checkpoint.get("path"), str)
             or not checkpoint["path"].startswith("/lustre/")
+            or not isinstance(execution_plan, Mapping)
+            or canonical_sha256(execution_plan)
+            != FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY[
+                "execution_plan_sha256_by_checkpoint_id"
+            ].get(checkpoint_id)
         ):
             raise QualificationGateError(
                 f"{checkpoint_id} staged checkpoint identity is invalid"
@@ -377,12 +388,56 @@ def _artifact(
     return path, digest, size
 
 
+def _execution_plan(
+    workflow: Mapping[str, Any],
+    *,
+    checkpoint_id: str,
+    stage_row: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    plan = workflow.get("execution_plan")
+    policy = FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY
+    expected_hash = policy["execution_plan_sha256_by_checkpoint_id"].get(
+        checkpoint_id
+    )
+    if (
+        workflow.get("phase_recovery_policy") != policy
+        or not isinstance(plan, Mapping)
+        or expected_hash is None
+        or canonical_sha256(plan) != expected_hash
+        or (
+            stage_row is not None
+            and plan != stage_row.get("execution_plan")
+        )
+    ):
+        raise QualificationGateError(
+            f"{checkpoint_id} phase-recovery plan is invalid"
+        )
+    if checkpoint_id in FROZEN_V4_REUSABLE_TRAIN_CHECKPOINT_IDS:
+        expected = ("reuse_sealed_v4_terminal_train", False)
+    elif checkpoint_id in FROZEN_V5_FRESH_TRAIN_CHECKPOINT_IDS:
+        expected = ("run_fresh_full_train", True)
+    else:  # pragma: no cover - frozen registry/partition guard
+        raise QualificationGateError(
+            f"{checkpoint_id} is absent from the phase-recovery partition"
+        )
+    if (
+        plan.get("mode") != expected[0]
+        or plan.get("new_train_job_required") is not expected[1]
+        or plan.get("new_standalone_evaluation_job_required") is not True
+    ):
+        raise QualificationGateError(
+            f"{checkpoint_id} phase-recovery action changed"
+        )
+    return copy.deepcopy(dict(plan))
+
+
 def _pretrained_load_evidence(
     train: Mapping[str, Any],
     *,
     checkpoint_id: str,
     checkpoint_path: str,
     checkpoint_target: str,
+    execution_plan: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Require the exact positive loader receipt emitted by product code."""
     expected_component = {
@@ -408,9 +463,65 @@ def _pretrained_load_evidence(
         "report_sha256",
         *_PRETRAINED_LOAD_COUNT_FIELDS,
     }
+    schema_version = report.get("schema_version")
+    if schema_version == 2:
+        if (
+            execution_plan.get("mode")
+            != "reuse_sealed_v4_terminal_train"
+            or report != execution_plan.get("pretrained_load")
+            or set(report)
+            != {
+                "schema_version",
+                "evidence_kind",
+                "checkpoint",
+                "component",
+                "loaded_tensor_count",
+                "loaded_keyset_sha256",
+                "status_record_occurrences",
+                "v4_load_audit_path",
+                "v4_load_audit_whole_file_sha256",
+                "v4_load_audit_sha256",
+                "v4_load_audit_row_sha256",
+                "v4_workflow_sha256",
+                "v4_train_log_sha256",
+                "report_sha256",
+            }
+            or report.get("evidence_kind")
+            != "sealed_v4_legacy_positive_load_audit"
+            or report.get("checkpoint") != checkpoint_path
+            or report.get("component") != expected_component
+            or isinstance(report.get("loaded_tensor_count"), bool)
+            or not isinstance(report.get("loaded_tensor_count"), int)
+            or report["loaded_tensor_count"] < 1
+            or isinstance(report.get("status_record_occurrences"), bool)
+            or not isinstance(report.get("status_record_occurrences"), int)
+            or report["status_record_occurrences"] < 1
+        ):
+            raise QualificationGateError(
+                f"{checkpoint_id} sealed v4 pretrained-load receipt is invalid"
+            )
+        for name in (
+            "loaded_keyset_sha256",
+            "v4_load_audit_whole_file_sha256",
+            "v4_load_audit_sha256",
+            "v4_load_audit_row_sha256",
+            "v4_workflow_sha256",
+            "v4_train_log_sha256",
+            "report_sha256",
+        ):
+            _sha(report.get(name), f"{checkpoint_id}.{name}")
+        payload = copy.deepcopy(dict(report))
+        supplied = payload.pop("report_sha256")
+        if canonical_sha256(payload) != supplied:
+            raise QualificationGateError(
+                f"{checkpoint_id} sealed v4 pretrained-load receipt "
+                "integrity failed"
+            )
+        return copy.deepcopy(dict(report))
     if (
         set(report) != required
-        or report.get("schema_version") != 1
+        or schema_version != 1
+        or execution_plan.get("mode") != "run_fresh_full_train"
         or report.get("checkpoint") != checkpoint_path
         or report.get("component") != expected_component
         or _sha(
@@ -581,11 +692,70 @@ def _job_infrastructure_evidence(
         )
 
 
+def _reused_train_job_evidence(
+    train: Mapping[str, Any],
+    *,
+    checkpoint_id: str,
+    execution_plan: Mapping[str, Any],
+) -> None:
+    """Require exact predecessor provenance and prove no new train ran."""
+    predecessor_job = copy.deepcopy(dict(execution_plan["train_job"]))
+    status_evidence = copy.deepcopy(
+        dict(execution_plan["validation_status_evidence"])
+    )
+    status_evidence["pretrained_load"] = copy.deepcopy(
+        execution_plan["pretrained_load"]
+    )
+    terminal_checkpoint = copy.deepcopy(
+        dict(execution_plan["terminal_checkpoint"])
+    )
+    policy = FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY
+    expected_job = {
+        "execution_mode": "reuse_sealed_v4_terminal_train",
+        "new_job_submitted": False,
+        "successful_train_reexecution": False,
+        "runtime_overlay_required": True,
+        "runtime_overlay": copy.deepcopy(
+            execution_plan["predecessor_runtime_overlay"]
+        ),
+        "predecessor_campaign_id": policy["predecessor_campaign_id"],
+        "predecessor_completion_whole_file_sha256": policy[
+            "predecessor_completion_whole_file_sha256"
+        ],
+        "predecessor_load_audit_whole_file_sha256": policy[
+            "predecessor_load_audit_whole_file_sha256"
+        ],
+        "v4_workflow_sha256": execution_plan["v4_workflow_sha256"],
+        "v4_load_audit_row_sha256": execution_plan[
+            "v4_load_audit_row_sha256"
+        ],
+        "tao_job_id": predecessor_job["tao_job_id"],
+        "tao_job_id_origin": "sealed_predecessor_v4",
+        "status": "Complete",
+        "result_root": predecessor_job["result_root"],
+        "command_sha256": predecessor_job["command_sha256"],
+        "spec_sha256": predecessor_job["spec_sha256"],
+        "predecessor_train_job": predecessor_job,
+        "status_evidence": copy.deepcopy(status_evidence),
+        "terminal_checkpoint": copy.deepcopy(terminal_checkpoint),
+    }
+    if (
+        train.get("job") != expected_job
+        or train.get("status_evidence") != status_evidence
+        or train.get("terminal_checkpoint") != terminal_checkpoint
+        or train.get("val_miou") != status_evidence.get("val_miou")
+    ):
+        raise QualificationGateError(
+            f"{checkpoint_id} reused train provenance is invalid"
+        )
+
+
 def _successful_workflow(
     workflow: Mapping[str, Any],
     *,
     checkpoint_id: str,
     registry_record: Mapping[str, Any],
+    stage_row: Mapping[str, Any] | None = None,
 ) -> QualifiedPTM:
     if (
         workflow.get("schema_version") != 2
@@ -627,21 +797,44 @@ def _successful_workflow(
             f"{checkpoint_id} source checkpoint differs from the "
             "promoted registry checksum"
         )
+    plan = _execution_plan(
+        workflow,
+        checkpoint_id=checkpoint_id,
+        stage_row=stage_row,
+    )
+    execution_mode = plan["mode"]
+    reused = execution_mode == "reuse_sealed_v4_terminal_train"
+    expected_train_recipe = (
+        plan["predecessor_recipe_fidelity"]
+        if reused
+        else FROZEN_QUALIFICATION_FIDELITY
+    )
+    expected_train_overlay = (
+        plan["predecessor_runtime_overlay"]
+        if reused
+        else FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+    )
+    expected_train_revision = (
+        plan["predecessor_qualification_revision"]
+        if reused
+        else QUALIFICATION_REVISION
+    )
     train = workflow.get("train")
     evaluation = workflow.get("evaluation")
     if (
         not isinstance(train, Mapping)
         or train.get("status") != "Complete"
+        or train.get("execution_mode") != execution_mode
+        or train.get("source_qualification_revision")
+        != expected_train_revision
         or train.get("full_dataset") is not True
         or train.get("training_epochs")
         != FROZEN_QUALIFICATION_TRAINING_EPOCHS
         or train.get("validation_interval") != 1
         or train.get("validation_record_count")
         != FROZEN_QUALIFICATION_TRAINING_EPOCHS
-        or train.get("recipe_fidelity")
-        != FROZEN_QUALIFICATION_FIDELITY
-        or train.get("runtime_overlay")
-        != FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+        or train.get("recipe_fidelity") != expected_train_recipe
+        or train.get("runtime_overlay") != expected_train_overlay
         or not isinstance(train.get("job"), Mapping)
         or train["job"].get("runtime_overlay_required") is not True
         or train.get("nodes") != 1
@@ -653,17 +846,36 @@ def _successful_workflow(
         != FROZEN_QUALIFICATION_RUNTIME_OVERLAY
         or not isinstance(evaluation.get("job"), Mapping)
         or evaluation["job"].get("runtime_overlay_required") is not True
+        or evaluation["job"].get("execution_mode")
+        != "new_standalone_evaluation"
+        or evaluation["job"].get("new_job_submitted") is not True
+        or evaluation["job"].get("checkpoint")
+        != train.get("terminal_checkpoint")
         or evaluation.get("nodes") != 1
         or evaluation.get("gpus") != 8
     ):
         raise QualificationGateError(
             f"{checkpoint_id} full train/evaluation contract is incomplete"
         )
-    _job_infrastructure_evidence(
-        train["job"],
-        checkpoint_id=checkpoint_id,
-        phase="train",
-    )
+    if reused:
+        _reused_train_job_evidence(
+            train,
+            checkpoint_id=checkpoint_id,
+            execution_plan=plan,
+        )
+    else:
+        if (
+            train["job"].get("execution_mode") != "run_fresh_full_train"
+            or train["job"].get("new_job_submitted") is not True
+        ):
+            raise QualificationGateError(
+                f"{checkpoint_id} fresh train submission evidence is invalid"
+            )
+        _job_infrastructure_evidence(
+            train["job"],
+            checkpoint_id=checkpoint_id,
+            phase="train",
+        )
     _job_infrastructure_evidence(
         evaluation["job"],
         checkpoint_id=checkpoint_id,
@@ -674,6 +886,7 @@ def _successful_workflow(
         checkpoint_id=checkpoint_id,
         checkpoint_path=source_path,
         checkpoint_target=str(registry_record.get("checkpoint_target", "")),
+        execution_plan=plan,
     )
     terminal_checkpoint = train.get("terminal_checkpoint")
     checkpoint_path, checkpoint_sha, checkpoint_size = _artifact(
@@ -1058,6 +1271,8 @@ def audit_qualification(
         != FROZEN_QUALIFICATION_RUNTIME_OVERLAY
         or document.get("infrastructure_retry_policy")
         != FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
+        or document.get("phase_recovery_policy")
+        != FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY
         or document.get("prior_revision_evidence")
         != FROZEN_PRIOR_QUALIFICATION_EVIDENCE
         or document.get("cpu_model_runs") != 0
@@ -1117,6 +1332,30 @@ def audit_qualification(
         raise QualificationGateError(
             "qualification must preserve exactly one workflow per official PTM"
         )
+    successful_count = sum(
+        item.get("status") == "success" for item in workflows
+    )
+    failed_count = len(workflows) - successful_count
+    expected_status = (
+        "success" if successful_count == len(workflows)
+        else "terminal_with_failures"
+    )
+    summary_flags = document.get("agent_intervention_flags")
+    if (
+        document.get("terminal") is not True
+        or document.get("status") != expected_status
+        or document.get("successful_workflows") != successful_count
+        or document.get("failed_workflows") != failed_count
+        or document.get("all_official_arms_attempted") is not True
+        or document.get("failure_records_preserved") is not True
+        or document.get("replacement_workflows_submitted") is not False
+        or not isinstance(summary_flags, Mapping)
+        or set(summary_flags) != set(AGENT_FLAGS)
+        or any(value is not False for value in summary_flags.values())
+    ):
+        raise QualificationGateError(
+            "qualification completion summary is inconsistent"
+        )
 
     qualified: list[QualifiedPTM] = []
     exclusions: list[dict[str, Any]] = []
@@ -1137,10 +1376,18 @@ def audit_qualification(
                 != FROZEN_QUALIFICATION_RUNTIME_OVERLAY
                 or workflow.get("infrastructure_retry_policy")
                 != FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
+                or workflow.get("phase_recovery_policy")
+                != FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY
             ):
                 raise QualificationGateError(
-                    f"{checkpoint_id} qualification v4 identity changed"
+                    f"{checkpoint_id} qualification v5 identity changed"
                 )
+            stage_row = stage_by_id.get(checkpoint_id)
+            _execution_plan(
+                workflow,
+                checkpoint_id=checkpoint_id,
+                stage_row=stage_row,
+            )
             workflow_sha = _workflow_integrity(
                 workflow,
                 checkpoint_id=checkpoint_id,
@@ -1176,6 +1423,7 @@ def audit_qualification(
                     workflow,
                     checkpoint_id=checkpoint_id,
                     registry_record=record,
+                    stage_row=stage_by_id.get(checkpoint_id),
                 )
             except QualificationGateError as exc:
                 blockers.append(

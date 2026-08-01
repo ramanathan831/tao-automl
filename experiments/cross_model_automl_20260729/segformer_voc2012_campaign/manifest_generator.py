@@ -44,12 +44,12 @@ DEFAULT_STAGE_MANIFEST = (
 DEFAULT_QUALIFICATION = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "segformer_voc2012_ptm_qualification_v4/completion.json"
+    "segformer_voc2012_ptm_qualification_v5/completion.json"
 )
 DEFAULT_PTM_STAGE_MANIFEST = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "segformer_voc2012_ptm_qualification_v4/ptm_stage_manifest.json"
+    "segformer_voc2012_ptm_qualification_v5/ptm_stage_manifest.json"
 )
 EXPECTED_DATASET_FILE_MANIFEST_SHA256 = (
     "051ab20215b8e6976763ac82a3db20a68264759edef3d62fd0c8553c501123ff"
@@ -244,7 +244,8 @@ def _runtime(
         "partition": campaign_contract.FROZEN_SLURM_PARTITION,
         "account": "edgeai_tao-ptm_image-foundation-model-clip",
         "base_results_dir": (
-            "/lustre/fsw/portfolios/edgeai/users/rarunachalam"
+            "/lustre/fsw/portfolios/edgeai/projects/"
+            "edgeai_tao-ptm_image-foundation-model-clip/users/rarunachalam"
         ),
         "container_mounts": "/lustre",
         "time_hours": campaign_contract.FROZEN_SLURM_TIME_HOURS,
@@ -270,7 +271,7 @@ def build_contract(
     repository_path = Path(repository).resolve()
     value = campaign_contract.build_preregistered_contract(
         campaign_id=(
-            "segformer-voc2012-objective-aware-three-mode-20260801-v4"
+            "segformer-voc2012-objective-aware-three-mode-20260801-v5"
         ),
         dataset=dataset_record(dataset_manifest, stage_manifest),
         skill_dir=(

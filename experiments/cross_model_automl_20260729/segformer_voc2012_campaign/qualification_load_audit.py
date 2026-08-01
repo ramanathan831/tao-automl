@@ -42,7 +42,7 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _POSITIVE_RE = re.compile(
     r"Loaded (?P<count>[1-9][0-9]*) compatible SegFormer "
     r"(?:(?P<component>model|backbone) )?pretrained tensors from "
-    r"(?P<path>/lustre/[^:\s]+):"
+    r"(?P<path>/lustre/[^:\s]+): (?P<keys>\[[^\n]*\])"
 )
 _LEGACY_LOAD_RE = re.compile(
     r"Loaded pretrained weights from (?P<path>/lustre/[^\s()]+)"
@@ -124,14 +124,34 @@ def extract_log_observations(text: str) -> dict[str, Any]:
     if not isinstance(text, str):
         raise TypeError("text must be a string")
     normalized = _ANSI_RE.sub("", text)
-    positive = [
-        {
-            "loaded_tensor_count": int(match.group("count")),
-            "component": match.group("component"),
-            "checkpoint": match.group("path"),
-        }
-        for match in _POSITIVE_RE.finditer(normalized)
-    ]
+    positive = []
+    for match in _POSITIVE_RE.finditer(normalized):
+        try:
+            loaded_keys = ast.literal_eval(match.group("keys"))
+        except (SyntaxError, ValueError) as exc:
+            raise QualificationLoadAuditError(
+                "legacy positive-load keyset is malformed"
+            ) from exc
+        count = int(match.group("count"))
+        if (
+            not isinstance(loaded_keys, list)
+            or any(not isinstance(item, str) for item in loaded_keys)
+            or len(loaded_keys) != count
+            or len(set(loaded_keys)) != count
+        ):
+            raise QualificationLoadAuditError(
+                "legacy positive-load count and keyset disagree"
+            )
+        positive.append(
+            {
+                "loaded_tensor_count": count,
+                "loaded_keyset_sha256": _sha256_bytes(
+                    "\n".join(sorted(loaded_keys)).encode("utf-8")
+                ),
+                "component": match.group("component"),
+                "checkpoint": match.group("path"),
+            }
+        )
     legacy_paths = [
         match.group("path")
         for match in _LEGACY_LOAD_RE.finditer(normalized)
@@ -380,8 +400,11 @@ with p.open("rb") as f:
 text=p.read_text(errors="replace")
 text=re.sub(r"\x1b\[[0-9;]*m","",text)
 pos=[]
-for m in re.finditer(r"Loaded ([1-9][0-9]*) compatible SegFormer (?:(model|backbone) )?pretrained tensors from (/lustre/[^:\s]+):",text):
-    pos.append({"loaded_tensor_count":int(m.group(1)),"component":m.group(2),"checkpoint":m.group(3)})
+for m in re.finditer(r"Loaded ([1-9][0-9]*) compatible SegFormer (?:(model|backbone) )?pretrained tensors from (/lustre/[^:\s]+): (\[[^\n]*\])",text):
+    keys=ast.literal_eval(m.group(4));count=int(m.group(1))
+    assert isinstance(keys,list) and len(keys)==count and len(set(keys))==count
+    assert all(isinstance(x,str) for x in keys)
+    pos.append({"loaded_tensor_count":count,"loaded_keyset_sha256":hashlib.sha256("\n".join(sorted(keys)).encode()).hexdigest(),"component":m.group(2),"checkpoint":m.group(3)})
 legacy=[m.group(1) for m in re.finditer(r"Loaded pretrained weights from (/lustre/[^\s()]+)",text)]
 bad=[]
 for m in re.finditer(r"_IncompatibleKeys\(missing_keys=(\[[^\n]*?\]), unexpected_keys=(\[[^\n]*?\])\)",text):
@@ -575,8 +598,8 @@ def build_v4_load_audit(
             }
         )
     value = {
-        "schema_version": 1,
-        "audit_kind": "segformer_v4_pretrained_load_forensic_audit",
+        "schema_version": 2,
+        "audit_kind": "segformer_v4_pretrained_load_forensic_audit_v2",
         "qualification_revision": V4_QUALIFICATION_REVISION,
         "qualification_campaign_id": V4_CAMPAIGN_ID,
         "inputs": {

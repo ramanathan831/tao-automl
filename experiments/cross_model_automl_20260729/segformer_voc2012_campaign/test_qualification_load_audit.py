@@ -20,7 +20,7 @@ from .qualification_load_audit import (
 def test_legacy_positive_load_allows_only_identical_rank_duplicates():
     path = "/lustre/ptms/city.ptm"
     line = (
-        "Loaded 427 compatible SegFormer pretrained tensors from "
+        "Loaded 1 compatible SegFormer pretrained tensors from "
         f"{path}: ['backbone.weight']\n"
     )
     observations = extract_log_observations(line * 8)
@@ -33,7 +33,10 @@ def test_legacy_positive_load_allows_only_identical_rank_duplicates():
 
     assert result["ptm_load_success"] is True
     assert result["classification"] == "positive_compatible_tensor_load"
-    assert result["loaded_tensor_count"] == 427
+    assert result["loaded_tensor_count"] == 1
+    assert result["unique_positive_observations"][0][
+        "loaded_keyset_sha256"
+    ] == hashlib.sha256(b"backbone.weight").hexdigest()
     assert result["positive_observation_occurrences"] == 8
     assert len(result["unique_positive_observations"]) == 1
     assert result["finite_metric_override_allowed"] is False
@@ -97,11 +100,11 @@ def test_backbone_prefix_failure_allows_only_exact_classifier_head_extras():
     "text",
     [
         (
-            "Loaded 10 compatible SegFormer pretrained tensors from "
+            "Loaded 1 compatible SegFormer pretrained tensors from "
             "/lustre/ptms/other.ptm: ['x']\n"
         ),
         (
-            "Loaded 10 compatible SegFormer pretrained tensors from "
+            "Loaded 1 compatible SegFormer pretrained tensors from "
             "/lustre/ptms/backbone.ptm: ['x']\n"
         ),
         (
@@ -110,7 +113,7 @@ def test_backbone_prefix_failure_allows_only_exact_classifier_head_extras():
             "unexpected_keys=['not_backbone.x'])\n"
         ),
         (
-            "Loaded 10 compatible SegFormer backbone pretrained tensors from "
+            "Loaded 1 compatible SegFormer backbone pretrained tensors from "
             "/lustre/ptms/backbone.ptm: ['x']\n"
             "_IncompatibleKeys(missing_keys=['x'], "
             "unexpected_keys=['backbone.x'])\n"

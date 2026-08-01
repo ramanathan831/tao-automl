@@ -41,23 +41,27 @@ and evaluation YAMLs from the packaged SegFormer templates, checksums them, and
 publishes every checkpoint and spec read-only on Lustre. It does not import a
 model framework, load a checkpoint, or construct a scheduler job.
 
-The launch phase re-hashes the complete stage and submits exactly 13 independent
-workflows. Each workflow applies the same official multi-class recipe fidelity:
-50 epochs, AdamW learning rate `1e-4`, weight decay `5e-4`, random-color and
-random-blur augmentation disabled, and the distributed sampler enabled.
-Validation runs every epoch, followed by standalone evaluation over the
-complete validation split. Each train and evaluation job uses one node, eight
+Qualification v5 re-hashes the complete stage and executes a sealed selective
+recovery plan: four Cityscapes arms reuse their exact successful v4 50-epoch
+train phases, while the nine backbone-prefix load-failure arms run new full
+50-epoch trains. All 13 arms run a new standalone evaluation. The controller
+therefore submits exactly 9 new train jobs and 13 new evaluation jobs, and its
+atomic launch claim forbids re-entry that could repeat a successful train.
+Fresh training uses AdamW learning rate `1e-4`, weight decay `5e-4`,
+random-color and random-blur augmentation disabled, and the distributed
+sampler enabled. Validation runs every epoch. Each new train and evaluation
+job uses one node, eight
 `NVIDIA A100-SXM4-80GB` GPUs, and the pinned SQSH. `polar3` is capped at four
 hours, so the controller freezes the skill-compliant `4.0`-hour scheduler limit
 and `3.8`-hour SDK timeout.
 
-Qualification v4 also requires the combined TAO PyTorch SegFormer product-fix
-overlay from commit
+Every new v5 train and evaluation verifies and installs the TAO PyTorch
+SegFormer product-fix overlay from commit
+`2681dea4c876b759f8a0446491b3619e6120b531`, archive SHA-256
+`a7d5316816710b258c52001f979a22723c88fca5101a05ca3a48838ce81d1ee4`.
+The four reused trains retain their truthful v4 runtime provenance: commit
 `3b1e073571f3bbf3702b0ae837e9279ad12f4286`, archive SHA-256
 `b055100d0d3e9e8c5daf94dfd4caf3cccacfb54fbebb423129fb5832066e420b`.
-Every train and evaluate command verifies and installs that overlay before TAO
-starts. It provides generic trainable-PTM loading and global DDP metric
-reduction, which makes the distributed sampler valid for this qualification.
 
 The terminal v1 evidence remains immutable at
 `/localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/segformer_voc2012_ptm_qualification_v1`.
@@ -79,10 +83,13 @@ retained at
 `/localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/segformer_voc2012_ptm_qualification_v3/completion.json`,
 with SHA-256
 `b8279dd87df2389c56a02db69dc8038f8bd84dcebe93cd1d3d66d04cb3fdfabc`.
-V4 keeps the epoch-49 and rendezvous fixes but uses an unbraced shell variable
-that survives exact SDK command rendering. It has distinct local, cache,
-Lustre-input, campaign, stage, completion, and handoff identities and never
-resumes or overwrites v1, v2, or v3.
+V4 kept the epoch-49 and rendezvous fixes and completed all 13 train phases.
+Its terminal audit proves positive exact-model loads for four Cityscapes arms;
+the other nine checkpoints exposed a uniform loadable `backbone.` prefix
+mismatch. V4 evaluation evidence was terminal but not workflow-qualifying.
+V5 preserves v1-v4 byte-for-byte, binds the v4 completion and load audit by
+whole-file and internal hashes, reuses only those four proven train phases,
+and retrains only the nine failed-load arms with the corrected product loader.
 
 All arms are attempted. A failed arm is retained as a terminal structured
 failure; it is never replaced with a fallback checkpoint. Completion
@@ -115,10 +122,10 @@ files.
 First seal the clean integrated source into an external campaign contract:
 
 ```bash
-cd /localhome/local-rarunachalam/tao-automl
+cd /localhome/local-rarunachalam/.tao/worktrees/tao-automl-segformer-v5-successor
 PYTHONPATH="$PWD/src" \
 python -m experiments.cross_model_automl_20260729.segformer_voc2012_campaign.manifest_generator \
-  --output /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/segformer_voc2012_three_mode/campaign.v4.json
+  --output /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/segformer_voc2012_three_mode/campaign.v5.json
 ```
 
 Stage and independently verify all PTM/spec inputs without reserving GPUs:
@@ -134,8 +141,8 @@ python -m experiments.cross_model_automl_20260729.segformer_voc2012_campaign.qua
 ```
 
 The following explicit command is the only qualification path that submits
-jobs. It starts all 13 independent direct-full-run workflows; no smoke or
-mini-step precedes them:
+jobs. It starts 13 independent workers implementing the exact 4-reuse,
+9-train, 13-evaluate plan; no smoke or mini-step precedes them:
 
 ```bash
 PYTHONPATH="$PWD/src" \
@@ -151,7 +158,7 @@ trigger:
 ```bash
 PYTHONPATH="$PWD/src" \
 python -m experiments.cross_model_automl_20260729.segformer_voc2012_campaign.run_campaign \
-  --contract /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/segformer_voc2012_three_mode/campaign.v4.json \
+  --contract /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/segformer_voc2012_three_mode/campaign.v5.json \
   --automatic-trigger \
   --launch
 ```
