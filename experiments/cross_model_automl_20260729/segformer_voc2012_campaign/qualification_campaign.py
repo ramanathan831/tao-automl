@@ -1039,7 +1039,7 @@ def _gpu_guard(command: str) -> str:
     return " ".join(
         [
             "set -eu;",
-            "case \"${SLURM_JOB_ID:-}\" in "
+            "case \"$SLURM_JOB_ID\" in "
             "(''|*[!0-9]*) exit 91;; esac;",
             "export MASTER_ADDR=127.0.0.1;",
             "export MASTER_PORT=\"$(("

@@ -1354,6 +1354,9 @@ def test_direct_qualification_submission_is_pinned_one_node_eight_gpu(
     assert "15000 + SLURM_JOB_ID % 10000" in guard
     assert "s.bind" in guard
     assert "segformer train -e {config_path}" in guard
+    rendered = guard.format(config_path="/tmp/spec.yaml")
+    assert "case \"$SLURM_JOB_ID\"" in rendered
+    assert "segformer train -e /tmp/spec.yaml" in rendered
 
 
 def test_qualification_gpu_guard_exports_usable_allocation_port(
