@@ -20,7 +20,7 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_REPOSITORY = Path("/localhome/local-rarunachalam/tao-automl")
 DEFAULT_WHEEL = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
-    "cross_model_automl_20260729/wheel/1919228616b8/"
+    "cross_model_automl_20260729/wheel/1fa7e75066bf/"
     "nvidia_tao_automl-0.1.0-py3-none-any.whl"
 )
 DEFAULT_SDK = Path(
@@ -77,7 +77,7 @@ EXPECTED_TEXT_ENCODER_STAGE_SHA256 = (
     "ac5b6c12bc7d5abd06beaeb61c79426a6f917d4671551fce202fa63fe6dbe160"
 )
 EXPECTED_WHEEL_SHA256 = (
-    "3463187cb76ec3d07c64a21eaf34140e56bf251b46e56ce3c89c33728ee22784"
+    "1fa7e75066bf8a58432e1b2672f86a88a2bf4d7a6b37331ee3ac02e87369275f"
 )
 EXPECTED_SDK_COMMIT = "a2e50d0930c3e3785b4b39fa8c3da88b39ff89e5"
 EXPECTED_SKILLS_COMMIT = "2e9c1b25f3c7cb1ae444c75652e36c47eace8229"
