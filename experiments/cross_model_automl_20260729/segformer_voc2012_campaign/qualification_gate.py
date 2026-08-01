@@ -44,6 +44,7 @@ from .campaign_contract import (
     FROZEN_VALIDATION_SANITY_MIN_MIOU,
     FROZEN_PRIOR_QUALIFICATION_EVIDENCE,
     FROZEN_V4_REUSABLE_TRAIN_CHECKPOINT_IDS,
+    FROZEN_V5_QUALIFICATION_CONTRACT,
     FROZEN_V5_FRESH_TRAIN_CHECKPOINT_IDS,
     QUALIFICATION_CAMPAIGN_ID,
     QUALIFICATION_REVISION,
@@ -982,6 +983,8 @@ def _runtime_local_policy(
         or value.get("task") != "semantic_segmentation"
         or value.get("tao_version") != "7.1.0"
         or value.get("container_sha256") != FROZEN_SQSH["sha256"]
+        or value.get("qualification_contract_sha256")
+        != FROZEN_V5_QUALIFICATION_CONTRACT["contract_sha256"]
         or value.get("license_policy")
         != "complete_existing_registry_metadata_only"
         or value.get("checkpoint_spec_file") != _RUNTIME_LOCAL_SPEC
@@ -1035,6 +1038,88 @@ def _has_complete_existing_license(record: Mapping[str, Any]) -> bool:
             for item in license_info["access_requirements"]
         )
     )
+
+
+def _validate_sealed_v5_predecessor(
+    *,
+    policy: Mapping[str, Any],
+    document: Mapping[str, Any],
+    evidence_path: Path,
+) -> None:
+    """Verify the exact v5 source contract and stage before projection."""
+    frozen = FROZEN_V5_QUALIFICATION_CONTRACT
+    contract_path = Path(frozen["path"]).resolve()
+    stage_path = Path(frozen["ptm_stage_manifest_path"]).resolve()
+    if (
+        str(evidence_path) != frozen["qualification_evidence_path"]
+        or sha256_file(evidence_path) != policy["qualification_file_sha256"]
+        or document.get("evidence_sha256") != policy[
+            "qualification_evidence_sha256"
+        ]
+        or not contract_path.is_file()
+        or sha256_file(contract_path) != frozen["whole_file_sha256"]
+        or not stage_path.is_file()
+        or sha256_file(stage_path)
+        != frozen["ptm_stage_manifest_whole_file_sha256"]
+    ):
+        raise QualificationGateError(
+            "sealed v5 completion, contract, or stage file identity changed"
+        )
+    try:
+        source_contract = json.loads(contract_path.read_text(encoding="utf-8"))
+        stage = json.loads(stage_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError) as exc:
+        raise QualificationGateError(
+            "sealed v5 qualification contract or stage is invalid JSON"
+        ) from exc
+    contract_payload = copy.deepcopy(source_contract)
+    contract_sha = contract_payload.pop("contract_sha256", None)
+    stage_payload = copy.deepcopy(stage)
+    stage_sha = stage_payload.pop("stage_manifest_sha256", None)
+    if (
+        contract_sha != canonical_sha256(contract_payload)
+        or contract_sha != policy["qualification_contract_sha256"]
+        or contract_sha != frozen["contract_sha256"]
+        or source_contract.get("campaign_id") != frozen["campaign_id"]
+        or source_contract.get("runtime", {}).get("source_commit")
+        != frozen["source_commit"]
+        or source_contract.get("runtime", {}).get("wheel_sha256")
+        != frozen["wheel_sha256"]
+        or source_contract.get("launcher_integrity", {}).get(
+            "qualification_campaign_sha256"
+        )
+        != policy["qualification_controller_sha256"]
+        or source_contract.get("launcher_integrity", {}).get(
+            "qualification_gate_sha256"
+        )
+        != frozen["qualification_gate_sha256"]
+        or source_contract.get("qualification_policy", {}).get(
+            "qualification_evidence_path"
+        )
+        != str(evidence_path)
+        or source_contract.get("qualification_policy", {}).get(
+            "ptm_stage_manifest_path"
+        )
+        != str(stage_path)
+        or stage_sha != canonical_sha256(stage_payload)
+        or stage_sha != frozen["ptm_stage_manifest_sha256"]
+        or stage.get("automl_contract_sha256")
+        != frozen["contract_sha256"]
+        or stage.get("runtime", {}).get("source_commit")
+        != frozen["source_commit"]
+        or document.get("automl_contract_sha256")
+        != policy["qualification_contract_sha256"]
+        or document.get("qualification_controller_sha256")
+        != policy["qualification_controller_sha256"]
+        or document.get("source_commit")
+        != frozen["source_commit"]
+        or document.get("ptm_stage_manifest_path") != str(stage_path)
+        or document.get("ptm_stage_manifest_sha256")
+        != frozen["ptm_stage_manifest_sha256"]
+    ):
+        raise QualificationGateError(
+            "sealed v5 source, controller, contract, or stage identity changed"
+        )
 
 
 def _project_runtime_registry(
@@ -1283,6 +1368,11 @@ def audit_qualification(
             "qualification campaign identity or execution policy changed"
         )
     if policy is not None:
+        _validate_sealed_v5_predecessor(
+            policy=policy,
+            document=document,
+            evidence_path=evidence_path,
+        )
         runtime = expected_contract.get("runtime", {})
         launchers = expected_contract.get("launcher_integrity", {})
         repository = Path(str(runtime.get("repository", ""))).resolve()

@@ -425,6 +425,28 @@ def wait_for_launch_authorization(
                 decision.to_dict(),
             )
             return decision
+        immutable_blockers = {
+            "sealed_local_contract_not_ready",
+            "ptm_qualification_not_ready",
+        }
+        if (
+            contract.get("qualification_policy", {}).get(
+                "runtime_local_eligibility"
+            )
+            is not None
+            and any(item.get("code") in immutable_blockers for item in blockers)
+        ):
+            status["terminal"] = True
+            status["state"] = "sealed_terminal_evidence_rejected"
+            atomic_json(
+                runtime_root / "automatic_trigger_status.json",
+                status,
+            )
+            raise CampaignExecutionError(
+                "sealed immutable terminal qualification evidence no longer "
+                "passes the automatic launch gate: "
+                + ", ".join(item["code"] for item in blockers)
+            )
         if (
             timeout_seconds is not None
             and time.monotonic() - started >= timeout_seconds
@@ -1623,6 +1645,22 @@ def main(argv: list[str] | None = None) -> int:
     contract_path = args.contract.resolve()
     contract = load_contract(contract_path)
     runtime_root = args.runtime_root.resolve()
+    if args.automatic_trigger:
+        runtime = contract.get("runtime", {})
+        if (
+            contract_path
+            != Path(
+                str(runtime.get("automatic_successor_contract_path", ""))
+            ).resolve()
+            or runtime_root
+            != Path(
+                str(runtime.get("automatic_successor_runtime_root", ""))
+            ).resolve()
+        ):
+            raise CampaignExecutionError(
+                "automatic successor contract or runtime root differs from "
+                "its sealed path"
+            )
     runtime_root.mkdir(parents=True, exist_ok=True)
     loaded_names = load_env_file(args.env_file)
     configure_slurm_runtime(contract)
