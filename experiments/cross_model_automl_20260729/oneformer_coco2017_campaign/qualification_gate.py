@@ -5,8 +5,9 @@
 The user explicitly disallowed CPU/model smokes and mini-steps.  This adapter
 therefore accepts only stronger evidence from real one-node/eight-GPU,
 full-COCO2017 training plus standalone evaluation.  Evidence never mutates or
-bypasses the repository PTM registry: a successful workflow becomes runtime
-eligible only after its exact registry record is independently ``supported``.
+bypasses or mutates the repository PTM registry. The versioned successor may
+project an exact successful v3 arm to ``supported`` only inside a validated,
+campaign-local in-memory registry bound to the sealed completion evidence.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import json
 import math
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -24,8 +25,13 @@ from tao_automl.ptm_preflight import (
     CheckpointLoadSmokeRequest,
     CheckpointLoadSmokeResult,
 )
-from tao_automl.ptm_registry import canonical_sha256, load_ptm_registry
+from tao_automl.ptm_registry import (
+    PTMRegistry,
+    canonical_sha256,
+    load_ptm_registry,
+)
 
+from . import campaign_contract, ptm_stage
 from .campaign_contract import (
     AGENT_FLAGS,
     FROZEN_RUNTIME_OVERLAY,
@@ -101,7 +107,9 @@ class QualificationDecision:
     qualified: tuple[QualifiedPTM, ...]
     exclusions: tuple[Mapping[str, Any], ...]
     blockers: tuple[Mapping[str, Any], ...]
+    runtime_eligibility: Mapping[str, Any]
     decision_sha256: str
+    runtime_registry: PTMRegistry = field(repr=False, compare=False)
 
     @property
     def runtime_ready(self) -> bool:
@@ -113,16 +121,20 @@ class QualificationDecision:
 
     def stable_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
-            "gate": "oneformer_direct_full_gpu_then_supported_registry_v1",
+            "schema_version": 2,
+            "gate": self.runtime_eligibility["kind"],
             "evidence_path": self.evidence_path,
             "evidence_sha256": self.evidence_sha256,
             "qualification_campaign_id": self.qualification_campaign_id,
             "qualified": [item.to_dict() for item in self.qualified],
             "exclusions": [copy.deepcopy(dict(item)) for item in self.exclusions],
             "blockers": [copy.deepcopy(dict(item)) for item in self.blockers],
+            "runtime_eligibility": copy.deepcopy(
+                dict(self.runtime_eligibility)
+            ),
             "runtime_ready": self.runtime_ready,
             "registry_bypass_allowed": False,
+            "repository_registry_mutated": False,
             "cpu_or_smoke_model_job_launched": False,
         }
 
@@ -339,7 +351,200 @@ def _successful_workflow(
     )
 
 
-def audit_qualification(path: str | Path) -> QualificationDecision:
+def _runtime_local_policy(
+    expected_contract: Mapping[str, Any] | None,
+) -> Mapping[str, Any] | None:
+    if expected_contract is None:
+        return None
+    runtime = expected_contract.get("runtime")
+    qualification = expected_contract.get("qualification_policy")
+    if not isinstance(runtime, Mapping) or not isinstance(
+        qualification, Mapping
+    ):
+        raise QualificationGateError(
+            "sealed runtime-local PTM eligibility policy is unavailable"
+        )
+    value = runtime.get("runtime_local_eligibility")
+    if value != qualification.get("runtime_local_eligibility"):
+        raise QualificationGateError(
+            "runtime-local PTM eligibility policy differs across contract layers"
+        )
+    try:
+        return campaign_contract.validate_runtime_local_eligibility(
+            value,
+            runtime=runtime,
+            snapshot=oneformer_registry_snapshot(),
+        )
+    except campaign_contract.CampaignContractError as exc:
+        raise QualificationGateError(str(exc)) from exc
+
+
+def _repository_runtime_eligibility(
+    registry: PTMRegistry,
+    successful: tuple[QualifiedPTM, ...],
+) -> dict[str, Any]:
+    records = registry.to_dict()["models"]["oneformer"]["checkpoints"]
+    return {
+        "schema_version": 1,
+        "kind": "repository_supported_registry",
+        "scope": "repository_registry",
+        "base_registry_version": registry.registry_version,
+        "base_registry_sha256": registry.document_sha256,
+        "projected_registry_version": registry.registry_version,
+        "projected_registry_sha256": registry.document_sha256,
+        "qualified_checkpoint_ids": [
+            item.checkpoint_id for item in successful
+        ],
+        "base_record_sha256_by_checkpoint_id": {
+            record["id"]: canonical_sha256(record)
+            for record in sorted(records, key=lambda item: item["id"])
+        },
+        "transformations": [],
+        "repository_registry_mutated": False,
+        "failed_arms_preserved": True,
+    }
+
+
+def _project_runtime_registry(
+    *,
+    base_registry: PTMRegistry,
+    successful: tuple[QualifiedPTM, ...],
+    evidence_path: Path,
+    evidence_sha256: str,
+    policy: Mapping[str, Any] | None,
+) -> tuple[PTMRegistry, dict[str, Any]]:
+    """Project only exact successful v3 arms into an in-memory registry."""
+    if policy is None:
+        return (
+            base_registry,
+            _repository_runtime_eligibility(base_registry, successful),
+        )
+    base_document = base_registry.to_dict()
+    base_model = base_document["models"]["oneformer"]
+    base_records = {
+        record["id"]: record
+        for record in sorted(
+            base_model["checkpoints"], key=lambda item: item["id"]
+        )
+    }
+    base_record_hashes = {
+        checkpoint_id: canonical_sha256(record)
+        for checkpoint_id, record in base_records.items()
+    }
+    if (
+        policy["base_registry_version"] != base_registry.registry_version
+        or policy["base_registry_sha256"] != base_registry.document_sha256
+        or policy["base_record_sha256_by_checkpoint_id"]
+        != base_record_hashes
+        or policy["qualification_path"] != str(evidence_path)
+        or policy["qualification_file_sha256"]
+        != sha256_file(evidence_path)
+        or policy["qualification_evidence_sha256"] != evidence_sha256
+    ):
+        raise QualificationGateError(
+            "runtime-local eligibility is not bound to the exact v3 "
+            "completion, base registry, and registry records"
+        )
+
+    document = copy.deepcopy(base_document)
+    document["registry_version"] = (
+        f"{base_registry.registry_version}+oneformer-runtime-local-v2"
+    )
+    projected_records = {
+        record["id"]: record
+        for record in document["models"]["oneformer"]["checkpoints"]
+    }
+    transformations = []
+    for item in sorted(successful, key=lambda value: value.checkpoint_id):
+        record = projected_records[item.checkpoint_id]
+        original = copy.deepcopy(record)
+        if record["status"] == "unsupported":
+            raise QualificationGateError(
+                f"{item.checkpoint_id} is explicitly unsupported and cannot "
+                "enter a runtime-local projection"
+            )
+        if record.get("sha256") not in (
+            None,
+            item.source_checkpoint_sha256,
+        ):
+            raise QualificationGateError(
+                f"{item.checkpoint_id} registry/source checksum mismatch"
+            )
+        record["status"] = "supported"
+        record.pop("status_reason", None)
+        record["sha256"] = item.source_checkpoint_sha256
+        record["validation"] = {
+            "status": "validated",
+            "tao_version": policy["tao_version"],
+            "container_identity": (
+                "sqsh-sha256:" + policy["container_sha256"]
+            ),
+            "evidence": (
+                f"{evidence_path}#evidence_sha256={evidence_sha256};"
+                f"workflow_sha256={item.workflow_sha256}"
+            ),
+        }
+        transformations.append(
+            {
+                "checkpoint_id": item.checkpoint_id,
+                "action": (
+                    "retain_supported_identity"
+                    if original["status"] == "supported"
+                    else "qualify_exact_unverified_identity"
+                ),
+                "base_status": original["status"],
+                "projected_status": "supported",
+                "base_record_sha256": canonical_sha256(original),
+                "projected_record_sha256": canonical_sha256(record),
+                "source_checkpoint_sha256": (
+                    item.source_checkpoint_sha256
+                ),
+                "workflow_sha256": item.workflow_sha256,
+            }
+        )
+    projected = PTMRegistry(document)
+    if base_registry.document_sha256 != policy["base_registry_sha256"]:
+        raise QualificationGateError(
+            "base repository registry changed during projection"
+        )
+    successful_ids = {
+        item.checkpoint_id for item in successful
+    }
+    eligibility = {
+        **copy.deepcopy(dict(policy)),
+        "projected_registry_version": projected.registry_version,
+        "projected_registry_sha256": projected.document_sha256,
+        "qualified_checkpoint_ids": sorted(successful_ids),
+        "unchanged_checkpoint_ids": sorted(
+            set(base_record_hashes) - successful_ids
+        ),
+        "transformations": transformations,
+        "repository_registry_mutated": False,
+        "projection_persisted_as_global_registry": False,
+        "failed_arms_preserved": True,
+        "agent_intervention_flags": {
+            name: False for name in AGENT_FLAGS
+        },
+    }
+    eligibility["eligibility_sha256"] = canonical_sha256(eligibility)
+    return projected, eligibility
+
+
+def audit_qualification(
+    path: str | Path,
+    *,
+    expected_contract: Mapping[str, Any] | None = None,
+) -> QualificationDecision:
+    if expected_contract is not None:
+        try:
+            expected_contract = campaign_contract.validate_contract(
+                expected_contract
+            )
+        except campaign_contract.CampaignContractError as exc:
+            raise QualificationGateError(
+                "sealed successor contract is invalid"
+            ) from exc
+    policy = _runtime_local_policy(expected_contract)
     evidence_path = Path(path).resolve()
     if not evidence_path.is_file():
         raise QualificationGateError(
@@ -352,6 +557,8 @@ def audit_qualification(path: str | Path) -> QualificationDecision:
     if supplied_sha != canonical_sha256(payload):
         raise QualificationGateError("qualification evidence integrity failed")
     snapshot = oneformer_registry_snapshot()
+    registry = load_ptm_registry()
+    sealed_stage_by_id: dict[str, Mapping[str, Any]] = {}
     if (
         document.get("schema_version") != 1
         or document.get("model") != "oneformer"
@@ -374,6 +581,59 @@ def audit_qualification(path: str | Path) -> QualificationDecision:
         raise QualificationGateError(
             "qualification campaign identity or execution policy changed"
         )
+    if policy is not None and (
+        document.get("campaign_id") != policy["qualification_campaign_id"]
+        or document.get("qualification_contract_sha256")
+        != policy["qualification_contract_sha256"]
+        or document.get("qualification_campaign_sha256")
+        != policy["qualification_campaign_sha256"]
+        or document.get("ptm_stage_manifest_sha256")
+        != policy["ptm_stage_manifest_sha256"]
+        or document.get("ptm_stage_content_sha256")
+        != policy["ptm_stage_content_sha256"]
+        or document.get("registry_sha256")
+        != policy["base_registry_sha256"]
+        or registry.registry_version != policy["base_registry_version"]
+        or document.get("replacement_workflows_submitted") is not False
+    ):
+        raise QualificationGateError(
+            "qualification evidence differs from the sealed v3 contract"
+        )
+    if policy is not None:
+        stage_path = Path(policy["ptm_stage_manifest_path"])
+        if (
+            not stage_path.is_file()
+            or sha256_file(stage_path)
+            != policy["ptm_stage_manifest_sha256"]
+        ):
+            raise QualificationGateError(
+                "sealed v3 PTM stage manifest is unavailable or changed"
+            )
+        try:
+            stage_document = json.loads(
+                stage_path.read_text(encoding="utf-8")
+            )
+            stage_document = ptm_stage.validate_stage_manifest(
+                stage_document,
+                registry=registry,
+                canonical_root=stage_document.get("publication", {}).get(
+                    "canonical_root"
+                ),
+            )
+        except Exception as exc:
+            raise QualificationGateError(
+                "sealed v3 PTM stage manifest is invalid"
+            ) from exc
+        if (
+            stage_document.get("manifest_sha256")
+            != policy["ptm_stage_content_sha256"]
+        ):
+            raise QualificationGateError(
+                "sealed v3 PTM stage content identity changed"
+            )
+        sealed_stage_by_id = {
+            item["id"]: item for item in stage_document["checkpoints"]
+        }
     workflows = document.get("workflows")
     if not isinstance(workflows, list):
         raise QualificationGateError("qualification workflows are unavailable")
@@ -390,7 +650,6 @@ def audit_qualification(path: str | Path) -> QualificationDecision:
             "qualification must preserve exactly one workflow per official PTM"
         )
 
-    registry = load_ptm_registry()
     qualified: list[QualifiedPTM] = []
     exclusions: list[dict[str, Any]] = []
     blockers: list[dict[str, Any]] = []
@@ -414,7 +673,20 @@ def audit_qualification(path: str | Path) -> QualificationDecision:
                     }
                 )
                 continue
-            if record.get("status") != "supported":
+            if record.get("status") == "unsupported":
+                exclusions.append(
+                    {
+                        "checkpoint_id": checkpoint_id,
+                        "code": "registry_explicitly_unsupported",
+                        "reason": (
+                            "The repository explicitly marks this PTM "
+                            "unsupported; direct-run evidence cannot promote it"
+                        ),
+                        "workflow_sha256": item.workflow_sha256,
+                        "base_record_sha256": canonical_sha256(record),
+                    }
+                )
+            elif policy is None and record.get("status") != "supported":
                 blockers.append(
                     {
                         "checkpoint_id": checkpoint_id,
@@ -426,7 +698,31 @@ def audit_qualification(path: str | Path) -> QualificationDecision:
                     }
                 )
             else:
-                qualified.append(item)
+                staged = sealed_stage_by_id.get(checkpoint_id)
+                if policy is not None and (
+                    not isinstance(staged, Mapping)
+                    or staged.get("path") != item.source_checkpoint_path
+                    or staged.get("sha256")
+                    != item.source_checkpoint_sha256
+                    or staged.get("size_bytes")
+                    != item.source_checkpoint_size_bytes
+                    or staged.get("registry_record_sha256")
+                    != policy["base_record_sha256_by_checkpoint_id"][
+                        checkpoint_id
+                    ]
+                ):
+                    blockers.append(
+                        {
+                            "checkpoint_id": checkpoint_id,
+                            "code": "qualification_source_not_in_sealed_stage",
+                            "reason": (
+                                "Direct-run source differs from the exact "
+                                "sealed v3 PTM stage record"
+                            ),
+                        }
+                    )
+                else:
+                    qualified.append(item)
             continue
         if (
             status != "failure"
@@ -466,7 +762,7 @@ def audit_qualification(path: str | Path) -> QualificationDecision:
             "reason": workflow["failure_reason"],
             "workflow_sha256": workflow_sha256,
         }
-        if record.get("status") == "supported":
+        if policy is None and record.get("status") == "supported":
             blockers.append(
                 {
                     **exclusion,
@@ -474,19 +770,28 @@ def audit_qualification(path: str | Path) -> QualificationDecision:
                 }
             )
         else:
-            exclusions.append(exclusion)
+            exclusions.append(
+                {
+                    **exclusion,
+                    "base_record_sha256": canonical_sha256(record),
+                }
+            )
 
     if not qualified:
         blockers.append(
             {
                 "checkpoint_id": None,
                 "code": "no_runtime_qualified_ptm",
-                "reason": (
-                    "No exact PTM has both successful direct full-run evidence "
-                    "and repository-supported status"
-                ),
+                "reason": "No exact PTM is runtime eligible",
             }
         )
+    projected_registry, runtime_eligibility = _project_runtime_registry(
+        base_registry=registry,
+        successful=tuple(qualified),
+        evidence_path=evidence_path,
+        evidence_sha256=supplied_sha,
+        policy=policy,
+    )
     decision_payload = {
         "evidence_path": str(evidence_path),
         "evidence_sha256": supplied_sha,
@@ -494,6 +799,7 @@ def audit_qualification(path: str | Path) -> QualificationDecision:
         "qualified": [item.to_dict() for item in qualified],
         "exclusions": exclusions,
         "blockers": blockers,
+        "runtime_eligibility": runtime_eligibility,
     }
     return QualificationDecision(
         evidence_path=str(evidence_path),
@@ -502,7 +808,9 @@ def audit_qualification(path: str | Path) -> QualificationDecision:
         qualified=tuple(qualified),
         exclusions=tuple(exclusions),
         blockers=tuple(blockers),
+        runtime_eligibility=runtime_eligibility,
         decision_sha256=canonical_sha256(decision_payload),
+        runtime_registry=projected_registry,
     )
 
 
@@ -515,6 +823,7 @@ class QualificationLoadEvidence:
         self._records = {
             item.checkpoint_id: item for item in decision.qualified
         }
+        self._registry = decision.runtime_registry
 
     def __call__(
         self,
@@ -527,7 +836,7 @@ class QualificationLoadEvidence:
                 code="qualification_evidence_missing",
                 reason="No completed direct full-run qualification exists",
             )
-        registry_record = load_ptm_registry().checkpoint(request.checkpoint_id)
+        registry_record = self._registry.checkpoint(request.checkpoint_id)
         observed_size = request.checkpoint_path.stat().st_size
         observed_sha = sha256_file(request.checkpoint_path)
         if (
@@ -554,6 +863,9 @@ class QualificationLoadEvidence:
                 "cpu_or_smoke_model_job_launched": False,
                 "qualification_evidence_sha256": (
                     self._decision.evidence_sha256
+                ),
+                "projected_registry_sha256": (
+                    self._registry.document_sha256
                 ),
                 "workflow_sha256": record.workflow_sha256,
                 "qualified_val_pq": record.val_pq,

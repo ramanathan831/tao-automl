@@ -152,6 +152,51 @@ FROZEN_RUNTIME_OVERLAY = {
     "primary_accuracy_metric": "PQ",
     "receipt_required_for_every_model_job": True,
 }
+FROZEN_V3_QUALIFICATION_CONTRACT = {
+    "path": (
+        "/localhome/local-rarunachalam/.tao/artifacts/"
+        "cross_model_automl_20260729/"
+        "oneformer_coco2017_three_mode_v3/campaign.v3.json"
+    ),
+    "file_sha256": (
+        "05917bb71b3aad03ee25d7b94d65ffeb559d8dc237a3605556648bb4813abe3f"
+    ),
+    "contract_sha256": (
+        "92fdc075274d2be9045edf2efa346863556bbe5287305a7b61902a712788364d"
+    ),
+    "source_commit": "8ab096c92ccba41a6107b7fbc60186e3a75a84e2",
+    "wheel_sha256": (
+        "e0ca6ab7efdd3af886b61b312fcf6f28506f440450d137316e075a463fcc7622"
+    ),
+    "sdk_commit": "a2e50d0930c3e3785b4b39fa8c3da88b39ff89e5",
+    "skills_commit": "2e9c1b25f3c7cb1ae444c75652e36c47eace8229",
+    "registry_version": "1.5.0",
+    "registry_sha256": (
+        "8d40ebde0eec2b7c53f4c698285146c44056d3cc2560ce481cc57b6375b25f74"
+    ),
+    "qualification_campaign_sha256": (
+        "f7070209292ecababf7ee2f18d19db1df2ba8c9b0edc840408e73ff9bcc46873"
+    ),
+    "qualification_campaign_id": (
+        "oneformer-coco2017-direct-full-ptm-qualification-v3-20260801"
+    ),
+    "qualification_evidence_path": (
+        "/localhome/local-rarunachalam/.tao/artifacts/"
+        "cross_model_automl_20260729/"
+        "oneformer_coco2017_ptm_qualification_v3/completion.json"
+    ),
+    "ptm_stage_manifest_path": (
+        "/localhome/local-rarunachalam/.tao/artifacts/"
+        "cross_model_automl_20260729/"
+        "oneformer_coco2017_ptm_qualification_v1/ptm_stage_manifest.json"
+    ),
+    "ptm_stage_manifest_sha256": (
+        "c14f13649ea3ba649a31f03cc8382bcdb4f9d4d08f3f5db83941b131537537c6"
+    ),
+    "ptm_stage_content_sha256": (
+        "d319157816a6cfd17832ad996f46f7b5052c568884db044edaff033c96ce51e3"
+    ),
+}
 LATENCY_PROTOCOL = {
     "warmup_iterations": 50,
     "timed_iterations": 100,
@@ -214,6 +259,129 @@ def _finite_fraction(value: Any, name: str) -> float:
     if not math.isfinite(number) or not 0.0 < number <= 1.0:
         raise CampaignContractError(f"{name} must be finite in (0, 1]")
     return number
+
+
+def _is_lower_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def validate_runtime_local_eligibility(
+    value: Any,
+    *,
+    runtime: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the sealed v3-evidence-bound in-memory registry policy."""
+    if not isinstance(value, Mapping):
+        raise CampaignContractError(
+            "runtime-local PTM eligibility policy is unavailable"
+        )
+    policy = copy.deepcopy(dict(value))
+    required_false = (
+        "repository_registry_mutation_allowed",
+        "projection_persisted_as_global_registry",
+        "failed_arm_promotion_allowed",
+        "unsupported_arm_promotion_allowed",
+        "agent_override_allowed",
+    )
+    expected_records = {
+        record["id"]: record["registry_record_sha256"]
+        for record in snapshot["records"]
+    }
+    frozen = FROZEN_V3_QUALIFICATION_CONTRACT
+    if (
+        policy.get("schema_version") != 2
+        or policy.get("kind")
+        != "direct_full_gpu_qualification_runtime_local_v2"
+        or policy.get("enabled") is not True
+        or policy.get("scope") != "campaign_local_in_memory_projection"
+        or policy.get("model") != "oneformer"
+        or policy.get("task") != "panoptic_segmentation"
+        or policy.get("tao_version") != "7.1.0"
+        or policy.get("container_sha256") != FROZEN_SQSH["sha256"]
+        or policy.get("base_registry_version")
+        != snapshot["registry_version"]
+        or policy.get("base_registry_sha256")
+        != snapshot["registry_sha256"]
+        or policy.get("base_record_sha256_by_checkpoint_id")
+        != expected_records
+        or policy.get("qualification_path")
+        != frozen["qualification_evidence_path"]
+        or policy.get("qualification_path")
+        != runtime.get("qualification_evidence_path")
+        or policy.get("qualification_contract_path") != frozen["path"]
+        or policy.get("qualification_contract_file_sha256")
+        != frozen["file_sha256"]
+        or policy.get("qualification_contract_sha256")
+        != frozen["contract_sha256"]
+        or policy.get("qualification_source_commit")
+        != frozen["source_commit"]
+        or policy.get("qualification_source_wheel_sha256")
+        != frozen["wheel_sha256"]
+        or policy.get("qualification_source_sdk_commit")
+        != frozen["sdk_commit"]
+        or policy.get("qualification_source_skills_commit")
+        != frozen["skills_commit"]
+        or policy.get("qualification_campaign_sha256")
+        != frozen["qualification_campaign_sha256"]
+        or policy.get("qualification_campaign_id")
+        != frozen["qualification_campaign_id"]
+        or policy.get("ptm_stage_manifest_path")
+        != frozen["ptm_stage_manifest_path"]
+        or policy.get("ptm_stage_manifest_sha256")
+        != frozen["ptm_stage_manifest_sha256"]
+        or policy.get("ptm_stage_content_sha256")
+        != frozen["ptm_stage_content_sha256"]
+        or policy.get("eligibility_source_commit")
+        != runtime.get("source_commit")
+        or policy.get("wheel_sha256") != runtime.get("wheel_sha256")
+        or policy.get("sdk_commit") != runtime.get("sdk_commit")
+        or policy.get("skills_commit") != runtime.get("skills_commit")
+        or any(policy.get(name) is not False for name in required_false)
+        or any(
+            not _is_lower_sha256(policy.get(name))
+            for name in (
+                "base_registry_sha256",
+                "qualification_file_sha256",
+                "qualification_evidence_sha256",
+                "qualification_contract_file_sha256",
+                "qualification_contract_sha256",
+                "qualification_source_wheel_sha256",
+                "qualification_campaign_sha256",
+                "ptm_stage_manifest_sha256",
+                "ptm_stage_content_sha256",
+                "wheel_sha256",
+            )
+        )
+    ):
+        raise CampaignContractError(
+            "runtime-local PTM eligibility contract changed"
+        )
+    for name in (
+        "qualification_source_commit",
+        "qualification_source_sdk_commit",
+        "qualification_source_skills_commit",
+        "eligibility_source_commit",
+        "sdk_commit",
+        "skills_commit",
+    ):
+        commit = policy.get(name)
+        if (
+            not isinstance(commit, str)
+            or len(commit) != 40
+            or any(
+                character not in "0123456789abcdef"
+                for character in commit
+            )
+        ):
+            raise CampaignContractError(
+                f"runtime-local eligibility {name} is not a Git commit"
+            )
+    return policy
 
 
 def oneformer_registry_snapshot() -> dict[str, Any]:
@@ -554,8 +722,14 @@ def build_preregistered_contract(
     dataset_record = validate_dataset_record(dataset)
     schema = validate_packaged_train_schema(skill_dir)
     ptm_inventory = oneformer_registry_snapshot()
+    runtime_record = copy.deepcopy(dict(runtime))
+    runtime_local_eligibility = validate_runtime_local_eligibility(
+        runtime_record.get("runtime_local_eligibility"),
+        runtime=runtime_record,
+        snapshot=ptm_inventory,
+    )
     value = {
-        "schema_version": 1,
+        "schema_version": 2,
         "campaign_id": campaign_id,
         "model": "oneformer",
         "network_arch": "oneformer",
@@ -573,13 +747,16 @@ def build_preregistered_contract(
             ),
         },
         "dataset": dataset_record,
-        "runtime": copy.deepcopy(dict(runtime)),
+        "runtime": runtime_record,
         "sqsh": copy.deepcopy(FROZEN_SQSH),
         "runtime_overlay": copy.deepcopy(FROZEN_RUNTIME_OVERLAY),
         "schema": schema,
         "ptm_inventory": ptm_inventory,
         "qualification_policy": {
-            "kind": "direct_full_gpu_train_eval_then_supported_registry",
+            "kind": (
+                "direct_full_gpu_train_eval_then_evidence_bound_runtime_"
+                "eligibility"
+            ),
             "cpu_model_runs": 0,
             "smoke_model_runs": 0,
             "mini_step_runs": 0,
@@ -589,6 +766,9 @@ def build_preregistered_contract(
             "training_epochs": FROZEN_TRAINING_EPOCHS,
             "standalone_evaluation": True,
             "registry_bypass_allowed": False,
+            "runtime_local_eligibility": copy.deepcopy(
+                runtime_local_eligibility
+            ),
             "qualification_evidence_path": runtime[
                 "qualification_evidence_path"
             ],
@@ -698,7 +878,8 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
         for mode in MODES
     ]
     if (
-        value.get("model") != "oneformer"
+        value.get("schema_version") != 2
+        or value.get("model") != "oneformer"
         or value.get("network_arch") != "oneformer"
         or value.get("task") != "panoptic_segmentation"
         or value.get("primary_accuracy_metric") != "PQ"
@@ -726,6 +907,10 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
             "ptm_stage_content_sha256"
         )
         != value.get("runtime", {}).get("ptm_stage_content_sha256")
+        or value.get("qualification_policy", {}).get(
+            "runtime_local_eligibility"
+        )
+        != value.get("runtime", {}).get("runtime_local_eligibility")
     ):
         raise CampaignContractError("campaign execution policy changed")
     validate_dataset_record(value["dataset"])
@@ -733,6 +918,15 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
         raise CampaignContractError("pinned SQSH identity changed")
     if value.get("runtime_overlay") != FROZEN_RUNTIME_OVERLAY:
         raise CampaignContractError("pinned OneFormer runtime overlay changed")
+    runtime = value.get("runtime", {})
+    snapshot = oneformer_registry_snapshot()
+    validate_runtime_local_eligibility(
+        runtime.get("runtime_local_eligibility"),
+        runtime=runtime,
+        snapshot=snapshot,
+    )
+    if value.get("ptm_inventory") != snapshot:
+        raise CampaignContractError("OneFormer PTM inventory changed")
     if any(value["agent_intervention_flags"].values()):
         raise CampaignContractError("agent intervention flags must remain false")
     if any(value["selection_isolation_flags"].values()):
@@ -756,6 +950,7 @@ __all__ = [
     "FROZEN_SQSH",
     "FROZEN_TRAINING_EPOCHS",
     "FROZEN_VALIDATION_SANITY_MIN_PQ",
+    "FROZEN_V3_QUALIFICATION_CONTRACT",
     "LATENCY_PROTOCOL",
     "MODES",
     "SEARCH_PARAMETERS",
@@ -771,4 +966,5 @@ __all__ = [
     "validate_contract",
     "validate_dataset_record",
     "validate_packaged_train_schema",
+    "validate_runtime_local_eligibility",
 ]

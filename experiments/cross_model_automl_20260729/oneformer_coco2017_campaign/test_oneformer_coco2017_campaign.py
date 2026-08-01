@@ -6,7 +6,9 @@ import copy
 import json
 import shlex
 import subprocess
+import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -86,7 +88,8 @@ def dataset_record() -> dict:
 
 
 def runtime() -> dict:
-    return {
+    snapshot = campaign_contract.oneformer_registry_snapshot()
+    value = {
         "repository": "/localhome/local-rarunachalam/tao-automl",
         "source_commit": "a" * 40,
         "source_dirty": False,
@@ -118,6 +121,64 @@ def runtime() -> dict:
         "max_job_retries": 10,
         "hardware_contract": copy.deepcopy(campaign_contract.FROZEN_HARDWARE),
     }
+    frozen = campaign_contract.FROZEN_V3_QUALIFICATION_CONTRACT
+    value["qualification_evidence_path"] = frozen[
+        "qualification_evidence_path"
+    ]
+    value["ptm_stage_manifest_path"] = frozen[
+        "ptm_stage_manifest_path"
+    ]
+    value["ptm_stage_manifest_sha256"] = frozen[
+        "ptm_stage_manifest_sha256"
+    ]
+    value["ptm_stage_content_sha256"] = frozen[
+        "ptm_stage_content_sha256"
+    ]
+    value["runtime_local_eligibility"] = {
+        "schema_version": 2,
+        "kind": "direct_full_gpu_qualification_runtime_local_v2",
+        "enabled": True,
+        "scope": "campaign_local_in_memory_projection",
+        "model": "oneformer",
+        "task": "panoptic_segmentation",
+        "tao_version": "7.1.0",
+        "container_sha256": campaign_contract.FROZEN_SQSH["sha256"],
+        "base_registry_version": snapshot["registry_version"],
+        "base_registry_sha256": snapshot["registry_sha256"],
+        "base_record_sha256_by_checkpoint_id": {
+            record["id"]: record["registry_record_sha256"]
+            for record in snapshot["records"]
+        },
+        "qualification_path": frozen["qualification_evidence_path"],
+        "qualification_file_sha256": "1" * 64,
+        "qualification_evidence_sha256": "2" * 64,
+        "qualification_contract_path": frozen["path"],
+        "qualification_contract_file_sha256": frozen["file_sha256"],
+        "qualification_contract_sha256": frozen["contract_sha256"],
+        "qualification_source_commit": frozen["source_commit"],
+        "qualification_source_wheel_sha256": frozen["wheel_sha256"],
+        "qualification_source_sdk_commit": frozen["sdk_commit"],
+        "qualification_source_skills_commit": frozen["skills_commit"],
+        "qualification_campaign_sha256": frozen[
+            "qualification_campaign_sha256"
+        ],
+        "qualification_campaign_id": frozen[
+            "qualification_campaign_id"
+        ],
+        "ptm_stage_manifest_path": frozen["ptm_stage_manifest_path"],
+        "ptm_stage_manifest_sha256": frozen["ptm_stage_manifest_sha256"],
+        "ptm_stage_content_sha256": frozen["ptm_stage_content_sha256"],
+        "eligibility_source_commit": value["source_commit"],
+        "wheel_sha256": value["wheel_sha256"],
+        "sdk_commit": value["sdk_commit"],
+        "skills_commit": value["skills_commit"],
+        "repository_registry_mutation_allowed": False,
+        "projection_persisted_as_global_registry": False,
+        "failed_arm_promotion_allowed": False,
+        "unsupported_arm_promotion_allowed": False,
+        "agent_override_allowed": False,
+    }
+    return value
 
 
 def contract() -> dict:
@@ -127,6 +188,180 @@ def contract() -> dict:
         skill_dir=str(SKILL_DIR),
         runtime=runtime(),
     )
+
+
+def _qualification_receipt(token: str) -> dict:
+    overlay = campaign_contract.FROZEN_RUNTIME_OVERLAY
+    return {
+        "schema_version": overlay["receipt_schema_version"],
+        "overlay_source_commit": overlay["source_commit"],
+        "container_expected_sha256": campaign_contract.FROZEN_SQSH["sha256"],
+        "base_site_packages": overlay["base_site_packages"],
+        "site_packages": (
+            f"/tmp/oneformer-runtime-overlay.{token}/site-packages"
+        ),
+        "dry_run": False,
+        "path": f"/lustre/results/{token}/runtime_overlay/receipt.json",
+        "sha256": token[0] * 64,
+        "actions": [
+            {
+                "path": f"nvidia_tao_pytorch/file_{index}.py",
+                "action": "replace_base",
+                "base_sha256": "b" * 64,
+                "sha256": f"{index:064x}",
+            }
+            for index in range(overlay["file_count"])
+        ],
+    }
+
+
+def _successful_workflow(checkpoint_id: str) -> dict:
+    stage = json.loads(
+        Path(
+            campaign_contract.FROZEN_V3_QUALIFICATION_CONTRACT[
+                "ptm_stage_manifest_path"
+            ]
+        ).read_text(encoding="utf-8")
+    )
+    source = next(
+        item for item in stage["checkpoints"] if item["id"] == checkpoint_id
+    )
+    value = {
+        "checkpoint_id": checkpoint_id,
+        "status": "success",
+        "terminal": True,
+        "failure_preserved": False,
+        "source_checkpoint": {
+            "path": source["path"],
+            "size_bytes": source["size_bytes"],
+            "sha256": source["sha256"],
+        },
+        "train": {
+            "status": "Complete",
+            "full_dataset": True,
+            "training_epochs": 1,
+            "validation_interval": 1,
+            "validation_record_count": 1,
+            "nodes": 1,
+            "gpus": 8,
+            "PQ": 0.125,
+            "runtime_overlay_receipt": _qualification_receipt("a1"),
+            "terminal_checkpoint": {
+                "path": f"/lustre/results/{checkpoint_id}/terminal.pth",
+                "size_bytes": 123,
+                "sha256": "c" * 64,
+            },
+        },
+        "evaluation": {
+            "status": "Complete",
+            "full_validation_split": True,
+            "nodes": 1,
+            "gpus": 8,
+            "test_PQ": 0.125,
+            "runtime_overlay_receipt": _qualification_receipt("d1"),
+        },
+        "agent_intervention_flags": {
+            name: False for name in campaign_contract.AGENT_FLAGS
+        },
+    }
+    value["workflow_sha256"] = canonical_sha256(value)
+    return value
+
+
+def _failed_workflow(checkpoint_id: str) -> dict:
+    value = {
+        "checkpoint_id": checkpoint_id,
+        "status": "failure",
+        "terminal": True,
+        "failure_preserved": True,
+        "failure_code": "direct_full_training_failed",
+        "failure_reason": "frozen unit-test failure",
+        "replacement_submitted": False,
+        "diagnostics": {},
+        "agent_intervention_flags": {
+            name: False for name in campaign_contract.AGENT_FLAGS
+        },
+    }
+    value["workflow_sha256"] = canonical_sha256(value)
+    return value
+
+
+def _seal_terminal_v3_evidence(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    successful_ids: set[str],
+) -> tuple[dict, Path]:
+    evidence_path = tmp_path / "completion.json"
+    monkeypatch.setitem(
+        campaign_contract.FROZEN_V3_QUALIFICATION_CONTRACT,
+        "qualification_evidence_path",
+        str(evidence_path),
+    )
+    sealed = contract()
+    snapshot = campaign_contract.oneformer_registry_snapshot()
+    workflows = [
+        (
+            _successful_workflow(record["id"])
+            if record["id"] in successful_ids
+            else _failed_workflow(record["id"])
+        )
+        for record in snapshot["records"]
+    ]
+    policy = sealed["runtime"]["runtime_local_eligibility"]
+    evidence = {
+        "schema_version": 1,
+        "campaign_id": policy["qualification_campaign_id"],
+        "model": "oneformer",
+        "task": "panoptic_segmentation",
+        "metric": "PQ",
+        "metric_semantics": (
+            "panoptic_quality_from_native_coco_panoptic_annotations"
+        ),
+        "pq_emitted": True,
+        "pq_claim_authorized": True,
+        "qualification_contract_sha256": policy[
+            "qualification_contract_sha256"
+        ],
+        "qualification_campaign_sha256": policy[
+            "qualification_campaign_sha256"
+        ],
+        "ptm_stage_manifest_sha256": policy[
+            "ptm_stage_manifest_sha256"
+        ],
+        "ptm_stage_content_sha256": policy["ptm_stage_content_sha256"],
+        "registry_sha256": policy["base_registry_sha256"],
+        "sqsh_sha256": campaign_contract.FROZEN_SQSH["sha256"],
+        "runtime_overlay_sha256": (
+            campaign_contract.FROZEN_RUNTIME_OVERLAY["archive_sha256"]
+        ),
+        "runtime_overlay_source_commit": (
+            campaign_contract.FROZEN_RUNTIME_OVERLAY["source_commit"]
+        ),
+        "cpu_model_runs": 0,
+        "smoke_model_runs": 0,
+        "mini_step_runs": 0,
+        "replacement_workflows_submitted": False,
+        "workflows": workflows,
+    }
+    evidence["evidence_sha256"] = canonical_sha256(evidence)
+    evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+    updated_policy = copy.deepcopy(policy)
+    updated_policy["qualification_file_sha256"] = (
+        campaign_contract.sha256_file(evidence_path)
+    )
+    updated_policy["qualification_evidence_sha256"] = evidence[
+        "evidence_sha256"
+    ]
+    sealed.pop("contract_sha256")
+    sealed["runtime"]["runtime_local_eligibility"] = copy.deepcopy(
+        updated_policy
+    )
+    sealed["qualification_policy"]["runtime_local_eligibility"] = (
+        copy.deepcopy(updated_policy)
+    )
+    sealed["contract_sha256"] = canonical_sha256(sealed)
+    return campaign_contract.validate_contract(sealed), evidence_path
 
 
 def test_registry_snapshots_all_four_official_nonordinal_arms():
@@ -323,13 +558,17 @@ def test_manifest_constants_bind_final_coco_stage_and_new_wheel():
     )
     assert (
         manifest_generator.WHEEL_BUILD_COMMIT
-        == "746d8b7a7134f3786c90b87122ddf8421183e871"
+        == "c1a93297032e5978f39ee8daedee2470b16fad59"
     )
     assert manifest_generator.DEFAULT_WHEEL.is_file()
     assert (
         campaign_contract.sha256_file(manifest_generator.DEFAULT_WHEEL)
         == manifest_generator.EXPECTED_WHEEL_SHA256
     )
+    with zipfile.ZipFile(manifest_generator.DEFAULT_WHEEL) as archive:
+        runtime_source = archive.read("tao_automl/ptm_runtime.py")
+    assert b"runtime_registry: PTMRegistry | None" in runtime_source
+    assert b"registry=resolved_inventory.runtime_registry" in runtime_source
     overlay = manifest_generator.runtime_overlay_record(
         manifest_generator.DEFAULT_RUNTIME_OVERLAY
     )
@@ -338,6 +577,59 @@ def test_manifest_constants_bind_final_coco_stage_and_new_wheel():
     )
     assert overlay["source_commit"] == (
         campaign_contract.FROZEN_RUNTIME_OVERLAY["source_commit"]
+    )
+
+
+def test_successor_binds_exact_live_v3_contract_and_will_not_seal_early(
+    tmp_path,
+    monkeypatch,
+):
+    frozen = campaign_contract.FROZEN_V3_QUALIFICATION_CONTRACT
+    source_path = Path(frozen["path"])
+    assert campaign_contract.sha256_file(source_path) == frozen[
+        "file_sha256"
+    ]
+    source = json.loads(source_path.read_text(encoding="utf-8"))
+    source_payload = copy.deepcopy(source)
+    assert source_payload.pop("contract_sha256") == frozen[
+        "contract_sha256"
+    ] == canonical_sha256(source_payload)
+    assert source["runtime"]["source_commit"] == frozen["source_commit"]
+    assert source["ptm_inventory"]["registry_sha256"] == frozen[
+        "registry_sha256"
+    ]
+
+    missing = tmp_path / "not-terminal" / "completion.json"
+    monkeypatch.setitem(
+        frozen,
+        "qualification_evidence_path",
+        str(missing),
+    )
+    with pytest.raises(
+        manifest_generator.ManifestGenerationError,
+        match="terminal OneFormer v3 qualification evidence is unavailable",
+    ):
+        manifest_generator.qualification_evidence_record(
+            missing,
+            source_path,
+        )
+
+
+def test_successor_and_frozen_qualification_cli_defaults_are_decoupled(
+    capsys,
+):
+    assert run_campaign.DEFAULT_CONTRACT.name == "campaign.v4.json"
+    assert run_campaign.DEFAULT_RUNTIME_ROOT.name.endswith("three_mode_v4")
+    assert qualification_campaign.DEFAULT_CONTRACT == Path(
+        campaign_contract.FROZEN_V3_QUALIFICATION_CONTRACT["path"]
+    )
+    assert qualification_campaign.DEFAULT_RUNTIME_ROOT.name.endswith(
+        "ptm_qualification_v3"
+    )
+    assert qualification_campaign.main([]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["campaign_id"] == (
+        qualification_campaign.QUALIFICATION_CAMPAIGN_ID
     )
 
 
@@ -461,6 +753,200 @@ def test_tampered_failed_workflow_is_blocked_instead_of_excluded(tmp_path):
         blocker["code"] == "invalid_failure_evidence"
         for blocker in decision.blockers
     )
+
+
+def test_runtime_local_projection_admits_only_success_and_preserves_failures(
+    tmp_path,
+    monkeypatch,
+):
+    selected = campaign_contract.oneformer_registry_snapshot()["records"][0][
+        "id"
+    ]
+    sealed, evidence_path = _seal_terminal_v3_evidence(
+        tmp_path,
+        monkeypatch,
+        successful_ids={selected},
+    )
+    repository_before = load_ptm_registry()
+    before_sha = repository_before.document_sha256
+
+    decision = audit_qualification(
+        evidence_path,
+        expected_contract=sealed,
+    )
+
+    watcher_status = tmp_path / "automatic_successor_status.json"
+    monkeypatch.setattr(
+        manifest_generator,
+        "qualification_evidence_record",
+        lambda *_args: {
+            "qualification_file_sha256": campaign_contract.sha256_file(
+                evidence_path
+            ),
+            "qualification_evidence_sha256": decision.evidence_sha256,
+        },
+    )
+    watched = manifest_generator.wait_for_terminal_qualification(
+        evidence_path,
+        campaign_contract.FROZEN_V3_QUALIFICATION_CONTRACT["path"],
+        status_path=watcher_status,
+        poll_seconds=0,
+    )
+    assert watched["qualification_evidence_sha256"] == (
+        decision.evidence_sha256
+    )
+    assert json.loads(watcher_status.read_text(encoding="utf-8"))[
+        "state"
+    ] == "terminal_v3_evidence_accepted"
+
+    assert decision.runtime_ready is True
+    assert decision.checkpoint_ids == (selected,)
+    assert len(decision.exclusions) == 3
+    assert decision.blockers == ()
+    assert all(
+        item["code"] == "direct_full_training_failed"
+        for item in decision.exclusions
+    )
+    assert decision.runtime_registry.checkpoint(selected)["status"] == (
+        "supported"
+    )
+    assert decision.runtime_registry.compatibility(
+        "oneformer",
+        tao_version="7.1.0",
+        task="panoptic_segmentation",
+    ).eligible_checkpoint_ids == (selected,)
+    eligibility = decision.runtime_eligibility
+    assert eligibility["qualified_checkpoint_ids"] == [selected]
+    assert eligibility["repository_registry_mutated"] is False
+    assert eligibility["projection_persisted_as_global_registry"] is False
+    assert eligibility["failed_arms_preserved"] is True
+    assert eligibility["transformations"][0]["checkpoint_id"] == selected
+    assert eligibility["transformations"][0]["action"] == (
+        "qualify_exact_unverified_identity"
+    )
+    assert set(eligibility["unchanged_checkpoint_ids"]) == (
+        set(eligibility["base_record_sha256_by_checkpoint_id"])
+        - {selected}
+    )
+    repository_after = load_ptm_registry()
+    assert repository_after.document_sha256 == before_sha
+    assert repository_after.checkpoint(selected)["status"] == "unverified"
+
+    report = SimpleNamespace(
+        ok=True,
+        prepared=(SimpleNamespace(checkpoint_id=selected),),
+        exclusions=tuple(
+            SimpleNamespace(checkpoint_id=item["checkpoint_id"])
+            for item in decision.exclusions
+        ),
+    )
+    run_campaign._validate_live_preflight_cohort(report, decision)
+
+    missing_exclusion = SimpleNamespace(
+        ok=True,
+        prepared=report.prepared,
+        exclusions=report.exclusions[:-1],
+    )
+    with pytest.raises(
+        run_campaign.CampaignExecutionError,
+        match="exact qualified and excluded PTM cohorts",
+    ):
+        run_campaign._validate_live_preflight_cohort(
+            missing_exclusion,
+            decision,
+        )
+
+
+def test_runtime_local_projection_with_zero_successes_fails_closed(
+    tmp_path,
+    monkeypatch,
+):
+    sealed, evidence_path = _seal_terminal_v3_evidence(
+        tmp_path,
+        monkeypatch,
+        successful_ids=set(),
+    )
+
+    decision = audit_qualification(
+        evidence_path,
+        expected_contract=sealed,
+    )
+
+    assert decision.runtime_ready is False
+    assert decision.checkpoint_ids == ()
+    assert len(decision.exclusions) == 4
+    assert decision.runtime_registry.compatibility(
+        "oneformer",
+        tao_version="7.1.0",
+        task="panoptic_segmentation",
+    ).eligible_checkpoint_ids == ()
+    assert decision.runtime_eligibility["transformations"] == []
+    assert any(
+        blocker["code"] == "no_runtime_qualified_ptm"
+        for blocker in decision.blockers
+    )
+    with pytest.raises(QualificationGateError):
+        decision.assert_runtime_ready()
+
+    monkeypatch.setattr(
+        run_campaign,
+        "launch_readiness",
+        lambda _contract: (
+            False,
+            [{"code": "ptm_qualification_not_ready", "reason": "final"}],
+            decision,
+        ),
+    )
+    with pytest.raises(
+        run_campaign.CampaignExecutionError,
+        match="immutable terminal qualification evidence",
+    ):
+        run_campaign.wait_for_launch_authorization(
+            sealed,
+            runtime_root=tmp_path / "automatic_gate",
+            poll_seconds=0,
+        )
+    status = json.loads(
+        (tmp_path / "automatic_gate/automatic_trigger_status.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert status["terminal"] is True
+    assert status["model_jobs_launched"] is False
+
+
+def test_runtime_local_projection_rejects_changed_completion_hash(
+    tmp_path,
+    monkeypatch,
+):
+    selected = campaign_contract.oneformer_registry_snapshot()["records"][0][
+        "id"
+    ]
+    sealed, evidence_path = _seal_terminal_v3_evidence(
+        tmp_path,
+        monkeypatch,
+        successful_ids={selected},
+    )
+    changed = copy.deepcopy(sealed)
+    changed.pop("contract_sha256")
+    for location in (
+        changed["runtime"],
+        changed["qualification_policy"],
+    ):
+        location["runtime_local_eligibility"][
+            "qualification_file_sha256"
+        ] = "f" * 64
+    changed["contract_sha256"] = canonical_sha256(changed)
+    changed = campaign_contract.validate_contract(changed)
+
+    with pytest.raises(
+        QualificationGateError,
+        match="exact v3 completion",
+    ):
+        audit_qualification(
+            evidence_path,
+            expected_contract=changed,
+        )
 
 
 def test_missing_qualification_never_launches_a_model(tmp_path):
@@ -622,6 +1108,8 @@ def test_runner_source_preserves_objective_aware_and_automatic_gates():
     source = Path(run_campaign.__file__).read_text(encoding="utf-8")
     assert "ptm_aware_runtime=True" in source
     assert "resolved_ptm_inventory=inventory" in source
+    assert "expected_contract=contract" in source
+    assert "registry=decision.runtime_registry" in source
     assert "first_candidate_gate" in source
     assert "automatic_trigger" in source
     assert "gpu_count=8" in source

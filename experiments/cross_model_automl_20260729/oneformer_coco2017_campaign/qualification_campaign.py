@@ -32,7 +32,9 @@ from tao_automl.ptm_registry import (
 from . import campaign_contract, ptm_stage, run_campaign
 
 
-DEFAULT_CONTRACT = run_campaign.DEFAULT_CONTRACT
+DEFAULT_CONTRACT = Path(
+    campaign_contract.FROZEN_V3_QUALIFICATION_CONTRACT["path"]
+)
 DEFAULT_RUNTIME_ROOT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
@@ -49,6 +51,36 @@ QUALIFICATION_CAMPAIGN_ID = (
 CampaignExecutionError = run_campaign.CampaignExecutionError
 atomic_json = run_campaign.atomic_json
 utc_timestamp = run_campaign.utc_timestamp
+
+
+def load_frozen_v3_contract(path: str | Path) -> dict[str, Any]:
+    """Load only the exact historical v3 qualification contract."""
+    resolved = Path(path).resolve()
+    frozen = campaign_contract.FROZEN_V3_QUALIFICATION_CONTRACT
+    if (
+        str(resolved) != frozen["path"]
+        or not resolved.is_file()
+        or campaign_contract.sha256_file(resolved) != frozen["file_sha256"]
+    ):
+        raise CampaignExecutionError(
+            "immutable OneFormer v3 qualification contract changed"
+        )
+    try:
+        document = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise CampaignExecutionError(
+            "immutable OneFormer v3 qualification contract is invalid"
+        ) from exc
+    payload = copy.deepcopy(document)
+    supplied = payload.pop("contract_sha256", None)
+    if (
+        supplied != frozen["contract_sha256"]
+        or supplied != canonical_sha256(payload)
+    ):
+        raise CampaignExecutionError(
+            "immutable OneFormer v3 qualification contract integrity failed"
+        )
+    return document
 
 
 def _safe_component(value: str) -> str:
@@ -545,7 +577,7 @@ def _worker(
     workflow_dir = root / "workflows" / _safe_component(checkpoint_id)
     workflow_dir.mkdir(parents=True, exist_ok=True)
     try:
-        contract = run_campaign.load_contract(contract_path)
+        contract = load_frozen_v3_contract(contract_path)
         run_campaign.configure_slurm_runtime(contract)
         staged = load_ptm_stage(stage_path, contract, verify_remote=False)
         workflow = _execute_workflow(
@@ -611,7 +643,7 @@ def launch(
     runtime_root: Path,
     env_path: Path,
 ) -> dict[str, Any]:
-    contract = run_campaign.load_contract(contract_path)
+    contract = load_frozen_v3_contract(contract_path)
     expected_stage = Path(
         contract["qualification_policy"]["ptm_stage_manifest_path"]
     ).resolve()
@@ -725,7 +757,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--launch", action="store_true")
     args = parser.parse_args(argv)
 
-    contract = run_campaign.load_contract(args.contract.resolve())
+    contract = load_frozen_v3_contract(args.contract.resolve())
     if not args.launch:
         print(json.dumps(qualification_plan(contract), indent=2, sort_keys=True))
         return 0

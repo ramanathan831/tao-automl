@@ -14,9 +14,12 @@ no CPU model run, model smoke, mini-step, GPU model run, or SLURM submission.
 PTM identity is a hierarchical nonordinal arm. The four official NGC
 checkpoints remain `unverified`; none is manually selected. Each arm must
 complete one real full-COCO epoch plus standalone validation on one node/eight
-A100s, and its exact registry record must then be independently promoted to
-`supported`. Terminal failures remain preserved exclusions. The automatic
-trigger waits until at least one arm satisfies both gates.
+A100s. The versioned successor projects only exact successful arms to
+`supported` in a validated campaign-local in-memory registry. Terminal
+failures and explicitly unsupported records remain preserved exclusions. The
+repository registry file and ordinary runtime behavior are never mutated. The
+automatic trigger waits until at least one exact arm passes and then needs no
+confirmation.
 
 The read-only [static SQSH audit](static_sqsh_audit.v1.json) records three
 defects in the immutable base image: no full-checkpoint loader, no panoptic PQ
@@ -55,9 +58,19 @@ manifest/receipt schema 2 audits
 separate ephemeral `PYTHONPATH` tree, and groups the complete SDK entrypoint on
 the right side of the fail-closed overlay `&&`. The model, dataset, four PTM
 arms, metric, one-epoch budget, and eight-A100 resource contract remain
-unchanged. No v3 replacement is submitted by preparation or sealing; the
-automatic campaign release remains closed until exact direct-full
-qualification evidence is successful and accepted by the qualification gate.
+unchanged. The live v3 qualification contract remains the immutable source of
+truth. The v4 successor cannot be sealed until all four v3 workflows have
+terminal integrity-checked evidence, and its automatic campaign release
+remains closed unless at least one arm succeeds every gate.
+
+The v4 eligibility policy binds the byte hash and internal hash of both the v3
+contract and terminal completion, the v3 source/wheel/SDK/skills and SQSH
+identities, the PTM-stage hashes, the base registry version/hash, and every
+canonical OneFormer record hash. Only successful records are transformed in
+memory; mixed success/failure evidence therefore retains failures while
+allowing exact successful arms. Zero successful arms fails closed. The
+projected registry is threaded through production preflight, runtime
+resolution, and the hierarchical runtime's second trust-boundary check.
 
 All campaign children use the pinned TAO 7.1 SQSH, one node/eight A100s, and
 the native 133-category panoptic label map. Candidate zero runs independently
@@ -129,24 +142,28 @@ An existing destination is reused only when its size, SHA-256, and read-only
 mode are exact. Changed or writable bytes, unexpected files, registry drift,
 and manifest drift are terminal errors; the stager never overwrites them.
 
-## Seal and launch later
+## Automatic successor handoff
 
-After the exact overlay is staged at its preregistered Lustre path, direct
-full-run PQ qualification evidence exists, and registry support is reviewed:
+Start this single watcher while v3 is still running. It waits while the exact
+completion is absent. Once all four immutable workflows are terminal, it
+validates the evidence, atomically seals v4, and immediately runs the v4
+automatic trigger without a second command or confirmation:
 
 ```bash
 cd /localhome/local-rarunachalam/tao-automl
 python -m experiments.cross_model_automl_20260729.oneformer_coco2017_campaign.manifest_generator \
   --runtime-overlay /localhome/local-rarunachalam/.tao/artifacts/oneformer-runtime-product-fixes-1752ec2c/oneformer-runtime-overlay.v2.tar \
-  --output /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/oneformer_coco2017_three_mode_v3/campaign.v3.json
-
-python -m experiments.cross_model_automl_20260729.oneformer_coco2017_campaign.run_campaign \
-  --contract /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/oneformer_coco2017_three_mode_v3/campaign.v3.json \
-  --runtime-root /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/oneformer_coco2017_three_mode_v3 \
+  --qualification /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/oneformer_coco2017_ptm_qualification_v3/completion.json \
+  --qualification-contract /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/oneformer_coco2017_three_mode_v3/campaign.v3.json \
+  --output /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/oneformer_coco2017_three_mode_v4/campaign.v4.json \
+  --runtime-root /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/oneformer_coco2017_three_mode_v4 \
   --automatic-trigger \
-  --launch
+  --launch \
+  --resume
 ```
 
-No post-gate confirmation is required. The automatic trigger itself performs
-the transition once immutable prerequisites pass. This preparation path does
-not run a CPU model, model smoke, mini-step, GPU model, or SLURM job.
+Invalid or zero-success terminal evidence is a terminal fail-closed outcome;
+the watcher does not poll forever or submit replacements. No post-gate
+confirmation is required. This preparation path does not run a CPU model,
+model smoke, mini-step, GPU model, or SLURM job. All successor SLURM outputs
+and the staged overlay remain under the user's project Lustre base.
