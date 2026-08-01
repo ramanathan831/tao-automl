@@ -68,22 +68,22 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_CONTRACT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "segformer_voc2012_three_mode/campaign.v3.json"
+    "segformer_voc2012_three_mode/campaign.v4.json"
 )
 DEFAULT_RUNTIME_ROOT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "segformer_voc2012_ptm_qualification_v3"
+    "segformer_voc2012_ptm_qualification_v4"
 )
 DEFAULT_STAGE_MANIFEST = DEFAULT_RUNTIME_ROOT / "ptm_stage_manifest.json"
 DEFAULT_LOCAL_CACHE = Path(
     "/localhome/local-rarunachalam/.tao/cache/"
-    "segformer_voc2012_ptm_qualification_v3"
+    "segformer_voc2012_ptm_qualification_v4"
 )
 DEFAULT_LUSTRE_INPUT_ROOT = Path(
     "/lustre/fsw/portfolios/edgeai/users/rarunachalam/"
     "cross_model_automl_20260729/"
-    "segformer_voc2012_ptm_qualification_v3/inputs"
+    "segformer_voc2012_ptm_qualification_v4/inputs"
 )
 QUALIFICATION_CAMPAIGN_ID = campaign_contract.QUALIFICATION_CAMPAIGN_ID
 EVALUATION_CHECKPOINT_SENTINEL = (
@@ -248,7 +248,7 @@ def verify_slurm_preflight(
         != campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
     ):
         raise CampaignExecutionError(
-            "qualification v3 fidelity or runtime overlay changed"
+            "qualification v4 fidelity or runtime overlay changed"
         )
     run_campaign.configure_slurm_runtime(contract)
     sdk_dir = Path(runtime["sdk_dir"]).resolve()
@@ -1071,7 +1071,7 @@ def _runtime_overlay_install_command(
     *,
     action_name: str,
 ) -> str:
-    """Return the fail-closed v3 overlay pre-entrypoint."""
+    """Return the fail-closed v4 overlay pre-entrypoint."""
     overlay = contract["qualification_policy"].get("runtime_overlay")
     if (
         overlay

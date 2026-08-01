@@ -508,7 +508,7 @@ def test_search_profile_remains_frozen_at_v1_fidelity():
     assert train["tensorboard"]["enabled"] is False
 
 
-def test_qualification_v3_uses_official_multiclass_fidelity_uniformly():
+def test_qualification_v4_uses_official_multiclass_fidelity_uniformly():
     profile = campaign_contract.qualification_profile_overrides(
         _dataset()["prepared_root"]
     )
@@ -534,11 +534,12 @@ def test_qualification_v3_uses_official_multiclass_fidelity_uniformly():
     assert train["use_distributed_sampler"] is True
 
 
-def test_qualification_v3_paths_preserve_frozen_v1_and_v2_evidence():
+def test_qualification_v4_paths_preserve_frozen_v1_v2_v3_evidence():
     v1 = campaign_contract.FROZEN_V1_QUALIFICATION_EVIDENCE
     v2 = campaign_contract.FROZEN_V2_QUALIFICATION_EVIDENCE
+    v3 = campaign_contract.FROZEN_V3_QUALIFICATION_EVIDENCE
     prior = campaign_contract.FROZEN_PRIOR_QUALIFICATION_EVIDENCE
-    assert prior == [v1, v2]
+    assert prior == [v1, v2, v3]
     assert v1["campaign_id"].endswith("-v1")
     assert v1["status"] == "terminal_with_failures"
     assert v1["successful_workflows"] == 0
@@ -568,27 +569,48 @@ def test_qualification_v3_paths_preserve_frozen_v1_and_v2_evidence():
     assert campaign_contract.sha256_file(
         v2["automatic_handoff_path"]
     ) == v2["automatic_handoff_whole_file_sha256"]
-    assert qualification_campaign.QUALIFICATION_CAMPAIGN_ID.endswith("-v3")
-    assert qualification_campaign.DEFAULT_CONTRACT.name == "campaign.v3.json"
-    assert run_campaign.DEFAULT_CONTRACT.name == "campaign.v3.json"
-    assert "qualification_v3" in str(
+    assert v3["campaign_id"].endswith("-v3")
+    assert v3["status"] == "terminal_with_failures"
+    assert v3["successful_workflows"] == 0
+    assert v3["failed_workflows"] == 13
+    assert v3["controller_template_failure_workflows"] == 13
+    assert v3["preserve_immutable"] is True
+    assert v3["reuse_for_v4"] is False
+    for path_key, sha_key in (
+        ("contract_path", "contract_whole_file_sha256"),
+        ("completion_path", "completion_whole_file_sha256"),
+        (
+            "ptm_stage_manifest_path",
+            "ptm_stage_manifest_whole_file_sha256",
+        ),
+        ("launch_preflight_path", "launch_preflight_whole_file_sha256"),
+        (
+            "automatic_handoff_path",
+            "automatic_handoff_whole_file_sha256",
+        ),
+    ):
+        assert campaign_contract.sha256_file(v3[path_key]) == v3[sha_key]
+    assert qualification_campaign.QUALIFICATION_CAMPAIGN_ID.endswith("-v4")
+    assert qualification_campaign.DEFAULT_CONTRACT.name == "campaign.v4.json"
+    assert run_campaign.DEFAULT_CONTRACT.name == "campaign.v4.json"
+    assert "qualification_v4" in str(
         qualification_campaign.DEFAULT_RUNTIME_ROOT
     )
-    assert "qualification_v3" in str(
+    assert "qualification_v4" in str(
         qualification_campaign.DEFAULT_LOCAL_CACHE
     )
-    assert "qualification_v3" in str(
+    assert "qualification_v4" in str(
         qualification_campaign.DEFAULT_LUSTRE_INPUT_ROOT
     )
     assert manifest_generator.DEFAULT_QUALIFICATION != Path(
-        v2["completion_path"]
+        v3["completion_path"]
     )
     assert manifest_generator.DEFAULT_PTM_STAGE_MANIFEST != Path(
-        v2["ptm_stage_manifest_path"]
+        v3["ptm_stage_manifest_path"]
     )
 
 
-def test_qualification_v3_binds_combined_runtime_overlay(contract):
+def test_qualification_v4_binds_combined_runtime_overlay(contract):
     overlay = campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
     assert overlay["combined_commit"] == (
         "3b1e073571f3bbf3702b0ae837e9279ad12f4286"
@@ -599,8 +621,8 @@ def test_qualification_v3_binds_combined_runtime_overlay(contract):
     )
     assert overlay["required_actions"] == ["train", "evaluate"]
     policy = contract["qualification_policy"]
-    assert policy["revision"] == 3
-    assert policy["campaign_id"].endswith("-v3")
+    assert policy["revision"] == 4
+    assert policy["campaign_id"].endswith("-v4")
     assert policy["training_epochs"] == 50
     assert policy["recipe_fidelity"] == (
         campaign_contract.FROZEN_QUALIFICATION_FIDELITY
@@ -743,7 +765,7 @@ def test_unverified_full_run_success_cannot_bypass_registry(tmp_path: Path):
             QualificationLoadEvidence(decision)
 
 
-def test_prior_evidence_is_preserved_but_cannot_satisfy_v3_gate(
+def test_prior_evidence_is_preserved_but_cannot_satisfy_v4_gate(
     tmp_path: Path,
 ):
     document = _qualification_document()
@@ -760,6 +782,26 @@ def test_prior_evidence_is_preserved_but_cannot_satisfy_v3_gate(
         }
     )
     path = tmp_path / "qualification.v1.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(
+        QualificationGateError,
+        match="campaign identity or execution policy changed",
+    ):
+        audit_qualification(path)
+
+    document = _qualification_document()
+    document["qualification_revision"] = 3
+    document["campaign_id"] = (
+        campaign_contract.FROZEN_V3_QUALIFICATION_EVIDENCE["campaign_id"]
+    )
+    document["evidence_sha256"] = canonical_sha256(
+        {
+            key: value
+            for key, value in document.items()
+            if key != "evidence_sha256"
+        }
+    )
+    path = tmp_path / "qualification.v3.json"
     path.write_text(json.dumps(document), encoding="utf-8")
     with pytest.raises(
         QualificationGateError,
@@ -970,7 +1012,7 @@ def test_contract_integrity_rejects_mutation(contract):
     )
     with pytest.raises(
         campaign_contract.CampaignContractError,
-        match="qualification v3 fidelity or provenance changed",
+        match="qualification v4 fidelity or provenance changed",
     ):
         campaign_contract.validate_contract(changed)
 
@@ -981,7 +1023,7 @@ def test_qualification_plan_contains_every_official_arm_without_fallback(
     plan = qualification_campaign.qualification_plan(contract)
     assert plan["workflow_count"] == 13
     assert plan["schema_version"] == 2
-    assert plan["qualification_revision"] == 3
+    assert plan["qualification_revision"] == 4
     assert plan["workflow"] == (
         "full_voc2012_50_epoch_train_then_standalone_full_validation"
     )

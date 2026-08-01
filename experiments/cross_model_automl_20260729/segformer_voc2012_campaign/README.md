@@ -51,7 +51,7 @@ complete validation split. Each train and evaluation job uses one node, eight
 hours, so the controller freezes the skill-compliant `4.0`-hour scheduler limit
 and `3.8`-hour SDK timeout.
 
-Qualification v3 also requires the combined TAO PyTorch SegFormer product-fix
+Qualification v4 also requires the combined TAO PyTorch SegFormer product-fix
 overlay from commit
 `3b1e073571f3bbf3702b0ae837e9279ad12f4286`, archive SHA-256
 `b055100d0d3e9e8c5daf94dfd4caf3cccacfb54fbebb423129fb5832066e420b`.
@@ -72,9 +72,17 @@ the exact `model_epoch_049_step_09150.pth`, but the qualification controller
 called the ten-epoch search resolver and looked for epoch 9. The thirteenth
 train failed before optimization when rank zero could not bind a transient
 Lightning rendezvous port. V3 has a qualification-specific epoch-49 resolver
-and exports a deterministic, allocation-derived single-node rendezvous port.
-It uses distinct local, cache, Lustre-input, campaign, stage, completion, and
-handoff identities and never resumes or overwrites v1 or v2.
+and attempted to export a deterministic, allocation-derived single-node
+rendezvous port, but its braced shell variable crossed the SDK runner's Python
+format boundary and all 13 jobs failed before TAO started. Its completion is
+retained at
+`/localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/segformer_voc2012_ptm_qualification_v3/completion.json`,
+with SHA-256
+`b8279dd87df2389c56a02db69dc8038f8bd84dcebe93cd1d3d66d04cb3fdfabc`.
+V4 keeps the epoch-49 and rendezvous fixes but uses an unbraced shell variable
+that survives exact SDK command rendering. It has distinct local, cache,
+Lustre-input, campaign, stage, completion, and handoff identities and never
+resumes or overwrites v1, v2, or v3.
 
 All arms are attempted. A failed arm is retained as a terminal structured
 failure; it is never replaced with a fallback checkpoint. Completion
@@ -110,7 +118,7 @@ First seal the clean integrated source into an external campaign contract:
 cd /localhome/local-rarunachalam/tao-automl
 PYTHONPATH="$PWD/src" \
 python -m experiments.cross_model_automl_20260729.segformer_voc2012_campaign.manifest_generator \
-  --output /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/segformer_voc2012_three_mode/campaign.v3.json
+  --output /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/segformer_voc2012_three_mode/campaign.v4.json
 ```
 
 Stage and independently verify all PTM/spec inputs without reserving GPUs:
@@ -143,7 +151,7 @@ trigger:
 ```bash
 PYTHONPATH="$PWD/src" \
 python -m experiments.cross_model_automl_20260729.segformer_voc2012_campaign.run_campaign \
-  --contract /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/segformer_voc2012_three_mode/campaign.v3.json \
+  --contract /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/segformer_voc2012_three_mode/campaign.v4.json \
   --automatic-trigger \
   --launch
 ```

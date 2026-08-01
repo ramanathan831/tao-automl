@@ -273,7 +273,7 @@ class QualificationDecision:
     def stable_dict(self) -> dict[str, Any]:
         return {
             "schema_version": 2,
-            "gate": "segformer_direct_full_gpu_then_supported_registry_v3",
+            "gate": "segformer_direct_full_gpu_then_supported_registry_v4",
             "evidence_path": self.evidence_path,
             "evidence_sha256": self.evidence_sha256,
             "qualification_campaign_id": self.qualification_campaign_id,
@@ -532,7 +532,7 @@ def audit_qualification(path: str | Path) -> QualificationDecision:
                 != FROZEN_QUALIFICATION_RUNTIME_OVERLAY
             ):
                 raise QualificationGateError(
-                    f"{checkpoint_id} qualification v3 identity changed"
+                    f"{checkpoint_id} qualification v4 identity changed"
                 )
             workflow_sha = _workflow_integrity(
                 workflow,
@@ -700,7 +700,7 @@ class QualificationLoadEvidence:
             reason=(
                 "Exact checkpoint passed full-dataset one-node/eight-GPU "
                 "50-epoch training, validation, terminal reload, and "
-                "standalone eval with the sealed v3 runtime overlay"
+                "standalone eval with the sealed v4 runtime overlay"
             ),
             details={
                 "cpu_or_smoke_model_job_launched": False,
