@@ -434,6 +434,64 @@ FROZEN_V4_QUALIFICATION_EVIDENCE = {
     "preserve_immutable": True,
     "reuse_for_v5": "exact_positive_load_terminal_train_phase_only",
 }
+FROZEN_V5_QUALIFICATION_CONTRACT = {
+    "path": (
+        "/localhome/local-rarunachalam/.tao/artifacts/"
+        "cross_model_automl_20260729/segformer_voc2012_three_mode/"
+        "campaign.v5.json"
+    ),
+    "whole_file_sha256": (
+        "1e5bae36930e5eb50e945fbe8bb0f50af030bd2fea2031f23e8b2a6c27f9b60e"
+    ),
+    "contract_sha256": (
+        "983af104b8eb6ffc4e17378205421107f769e5f1102f5fc2269b1f3ab4d9e762"
+    ),
+    "campaign_id": (
+        "segformer-voc2012-objective-aware-three-mode-20260801-v5"
+    ),
+    "source_commit": "02ee7822c4479f08bbcabaf3a9b7cffd53164c50",
+    "wheel_sha256": (
+        "a5e78903aa7c540a7c13b9b413ed5daf64534df04cc91a21d9480875e7d16f3e"
+    ),
+    "sdk_commit": "a2e50d0930c3e3785b4b39fa8c3da88b39ff89e5",
+    "skills_commit": "2e9c1b25f3c7cb1ae444c75652e36c47eace8229",
+    "registry_version": "1.5.0",
+    "registry_sha256": (
+        "8d40ebde0eec2b7c53f4c698285146c44056d3cc2560ce481cc57b6375b25f74"
+    ),
+    "qualification_campaign_id": QUALIFICATION_CAMPAIGN_ID,
+    "qualification_controller_sha256": (
+        "9457bad3840a252241ca3170a5a84b79d5ca70d2059bcd7be9b4c1561d926f88"
+    ),
+    "qualification_gate_sha256": (
+        "e230b882b3200af237aa40cb84a538d2a3d1b3accad60384c046c8bcef1501a1"
+    ),
+    "qualification_evidence_path": (
+        "/localhome/local-rarunachalam/.tao/artifacts/"
+        "cross_model_automl_20260729/"
+        "segformer_voc2012_ptm_qualification_v5/completion.json"
+    ),
+    "ptm_stage_manifest_path": (
+        "/localhome/local-rarunachalam/.tao/artifacts/"
+        "cross_model_automl_20260729/"
+        "segformer_voc2012_ptm_qualification_v5/ptm_stage_manifest.json"
+    ),
+    "ptm_stage_manifest_whole_file_sha256": (
+        "7c8e70ae256fdb1f4d3d62841724cdee501a2097f20cbd0d5e2a5f8e0e293c07"
+    ),
+    "ptm_stage_manifest_sha256": (
+        "299f92133e024501a34e0744764b7120b6d2f19517907543070695c7d274ad29"
+    ),
+}
+FROZEN_V6_SUCCESSOR_CONTRACT_PATH = (
+    "/localhome/local-rarunachalam/.tao/artifacts/"
+    "cross_model_automl_20260729/segformer_voc2012_three_mode/"
+    "campaign.v6.json"
+)
+FROZEN_V6_SUCCESSOR_RUNTIME_ROOT = (
+    "/localhome/local-rarunachalam/.tao/artifacts/"
+    "cross_model_automl_20260729/segformer_voc2012_three_mode_v6"
+)
 FROZEN_PRIOR_QUALIFICATION_EVIDENCE = [
     copy.deepcopy(FROZEN_V1_QUALIFICATION_EVIDENCE),
     copy.deepcopy(FROZEN_V2_QUALIFICATION_EVIDENCE),
@@ -1196,6 +1254,8 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
             != snapshot["registry_version"]
             or runtime_local.get("base_registry_sha256")
             != snapshot["registry_sha256"]
+            or runtime_local.get("qualification_contract_sha256")
+            != FROZEN_V5_QUALIFICATION_CONTRACT["contract_sha256"]
             or runtime_local.get("qualification_evidence_path")
             != qualification.get("qualification_evidence_path")
             or runtime_local.get("qualification_controller_sha256")
@@ -1239,6 +1299,14 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
             )
             or value.get("runtime", {}).get("runtime_local_eligibility")
             != runtime_local
+            or value.get("runtime", {}).get(
+                "automatic_successor_contract_path"
+            )
+            != FROZEN_V6_SUCCESSOR_CONTRACT_PATH
+            or value.get("runtime", {}).get(
+                "automatic_successor_runtime_root"
+            )
+            != FROZEN_V6_SUCCESSOR_RUNTIME_ROOT
         ):
             raise CampaignContractError(
                 "runtime-local SegFormer eligibility seal is invalid"
@@ -1281,6 +1349,9 @@ __all__ = [
     "FROZEN_V3_QUALIFICATION_EVIDENCE",
     "FROZEN_V4_QUALIFICATION_EVIDENCE",
     "FROZEN_V4_REUSABLE_TRAIN_CHECKPOINT_IDS",
+    "FROZEN_V5_QUALIFICATION_CONTRACT",
+    "FROZEN_V6_SUCCESSOR_CONTRACT_PATH",
+    "FROZEN_V6_SUCCESSOR_RUNTIME_ROOT",
     "FROZEN_V5_FRESH_TRAIN_CHECKPOINT_IDS",
     "LATENCY_PROTOCOL",
     "MODES",

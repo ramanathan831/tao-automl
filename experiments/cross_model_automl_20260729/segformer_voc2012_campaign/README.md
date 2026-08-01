@@ -25,14 +25,13 @@ VOC experiment sanity gate is not an AutoML selection constraint.
 ## Fail-closed PTM state
 
 The repository currently records 13 official SegFormer PTMs, all as
-`unverified`. The campaign does not reinterpret that state. Each arm must first
-complete a real full-dataset, 50-epoch, one-node/eight-GPU train and standalone
-validation workflow. A successful arm becomes eligible only after its exact
-repository registry record is independently promoted to `supported`; terminal
-failures remain exclusions. The runtime never mutates or bypasses the registry.
-
-Consequently, the automatic trigger waits rather than launching an unsupported
-PTM. This is the current intentional blocker, not an agent-selected PTM.
+`unverified`. Each arm must first complete a real full-dataset, 50-epoch,
+one-node/eight-GPU train and standalone validation workflow. The sealed
+successor projects only an exact successful arm with complete existing license
+metadata to `supported` in a campaign-local in-memory registry. Terminal
+failures and metadata-incomplete records remain exclusions. The repository
+registry file and ordinary runtime behavior are never mutated, and no manual
+promotion or candidate choice occurs.
 
 `qualification_campaign.py` implements that missing qualification step. Its
 data-only stage resolves all 13 exact NGC members, verifies their immutable
@@ -92,14 +91,13 @@ whole-file and internal hashes, reuses only those four proven train phases,
 and retrains only the nine failed-load arms with the corrected product loader.
 
 All arms are attempted. A failed arm is retained as a terminal structured
-failure; it is never replaced with a fallback checkpoint. Completion
-automatically writes both the exact `qualification_gate.py` input and an
-independent-registry-review handoff. The controller does not promote registry
-records itself. The gate binds the pre-promotion stage to immutable PTM source,
-size, architecture, backbone, task, target field, and observed checkpoint
-checksum, while reading eligibility from the independently promoted current
-registry. Thus a status/validation promotion cannot invalidate genuine
-qualification evidence or silently change the qualified checkpoint bytes.
+failure; it is never replaced with a fallback checkpoint. Completion writes
+the exact `qualification_gate.py` input and a non-promoting handoff. The gate
+binds the v5 contract and controller, clean source, wheel, PTM stage, source
+checkpoint, architecture, backbone, task, target field, positive-load receipt,
+terminal checkpoint, and metrics. The successor contract also binds both the
+whole-file and internal completion hashes before constructing the in-memory
+projection.
 
 ## Frozen data
 
@@ -150,15 +148,44 @@ python -m experiments.cross_model_automl_20260729.segformer_voc2012_campaign.qua
   --launch
 ```
 
-After successful records have been independently reviewed and promoted in the
-repository registry, rebuild the production wheel and reseal the campaign
-contract against that clean commit. Then start the automatic three-mode
-trigger:
+## Durable automatic successor
+
+The following single watcher command may be started while v5 is still running.
+It waits only while the exact completion is absent. A present invalid or
+zero-success terminal completion is rejected immediately. Once v5 passes the
+gate, the watcher atomically publishes a new read-only `campaign.v6.json`
+without replacing any existing file, constructs the campaign-local eligibility
+projection, and invokes `run_campaign --automatic-trigger --launch`. The fresh
+v6 runtime root and contract path do not overlap the v1-v5 evidence:
+
+```bash
+cd /localhome/local-rarunachalam/.tao/worktrees/tao-automl-segformer-v5-auto-successor
+nohup env PYTHONPATH="$PWD/src" \
+python -m experiments.cross_model_automl_20260729.segformer_voc2012_campaign.manifest_generator \
+  --repository "$PWD" \
+  --qualification /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/segformer_voc2012_ptm_qualification_v5/completion.json \
+  --qualification-contract /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/segformer_voc2012_three_mode/campaign.v5.json \
+  --ptm-stage-manifest /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/segformer_voc2012_ptm_qualification_v5/ptm_stage_manifest.json \
+  --output /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/segformer_voc2012_three_mode/campaign.v6.json \
+  --runtime-root /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/segformer_voc2012_three_mode_v6 \
+  --automatic-trigger \
+  --launch \
+  > /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/segformer_v5_to_v6_automatic_successor.log 2>&1 &
+```
+
+There is no post-gate confirmation. The immutable launch claim prevents a
+second submission. If and only if this claimed v6 runtime was interrupted,
+rerun the same command with `--resume`; a fresh `--resume`, a changed contract,
+or a concurrent watcher fails closed. A completed three-mode runtime is
+restart-idempotent and is not submitted again.
+
+The lower-level invocation performed automatically by the watcher is:
 
 ```bash
 PYTHONPATH="$PWD/src" \
 python -m experiments.cross_model_automl_20260729.segformer_voc2012_campaign.run_campaign \
-  --contract /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/segformer_voc2012_three_mode/campaign.v5.json \
+  --contract /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/segformer_voc2012_three_mode/campaign.v6.json \
+  --runtime-root /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/segformer_voc2012_three_mode_v6 \
   --automatic-trigger \
   --launch
 ```

@@ -471,7 +471,11 @@ def _seal_runtime_local_qualification(
             success=True,
         )
     _refresh_qualification_summary(document)
-    document["automl_contract_sha256"] = contract["contract_sha256"]
+    document["automl_contract_sha256"] = (
+        campaign_contract.FROZEN_V5_QUALIFICATION_CONTRACT[
+            "contract_sha256"
+        ]
+    )
     document["qualification_controller_sha256"] = contract[
         "launcher_integrity"
     ]["qualification_campaign_sha256"]
@@ -502,7 +506,11 @@ def _seal_runtime_local_qualification(
             qualification_path
         ),
         "qualification_evidence_sha256": document["evidence_sha256"],
-        "qualification_contract_sha256": contract["contract_sha256"],
+        "qualification_contract_sha256": (
+            campaign_contract.FROZEN_V5_QUALIFICATION_CONTRACT[
+                "contract_sha256"
+            ]
+        ),
         "qualification_controller_sha256": contract[
             "launcher_integrity"
         ]["qualification_campaign_sha256"],
@@ -529,6 +537,12 @@ def _seal_runtime_local_qualification(
     }
     sealed = copy.deepcopy(contract)
     sealed.pop("contract_sha256")
+    sealed["runtime"]["automatic_successor_contract_path"] = (
+        campaign_contract.FROZEN_V6_SUCCESSOR_CONTRACT_PATH
+    )
+    sealed["runtime"]["automatic_successor_runtime_root"] = (
+        campaign_contract.FROZEN_V6_SUCCESSOR_RUNTIME_ROOT
+    )
     sealed["runtime"]["runtime_local_eligibility"] = copy.deepcopy(policy)
     sealed["qualification_policy"]["runtime_local_eligibility"] = (
         copy.deepcopy(policy)
@@ -1093,7 +1107,13 @@ def test_unverified_full_run_success_cannot_bypass_registry(tmp_path: Path):
 def test_sealed_runtime_local_projection_admits_only_exact_success_with_license(
     contract,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
+    monkeypatch.setattr(
+        qualification_gate,
+        "_validate_sealed_v5_predecessor",
+        lambda **_kwargs: None,
+    )
     snapshot = campaign_contract.segformer_registry_snapshot()
     city_id = next(
         item["id"]
@@ -1150,7 +1170,13 @@ def test_sealed_runtime_local_projection_admits_only_exact_success_with_license(
 def test_runtime_local_projection_fails_closed_on_evidence_hash_change(
     contract,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
+    monkeypatch.setattr(
+        qualification_gate,
+        "_validate_sealed_v5_predecessor",
+        lambda **_kwargs: None,
+    )
     city_id = next(
         item["id"]
         for item in campaign_contract.segformer_registry_snapshot()["records"]
@@ -1181,6 +1207,47 @@ def test_runtime_local_projection_fails_closed_on_evidence_hash_change(
             qualification_path,
             expected_contract=changed,
         )
+
+
+def test_runtime_local_projection_rejects_coherent_predecessor_hash_change(
+    contract,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    checkpoint_id = campaign_contract.segformer_registry_snapshot()[
+        "records"
+    ][0]["id"]
+    sealed, qualification_path = _seal_runtime_local_qualification(
+        contract,
+        tmp_path,
+        (checkpoint_id,),
+    )
+    document = json.loads(qualification_path.read_text(encoding="utf-8"))
+    document["automl_contract_sha256"] = "f" * 64
+    document.pop("evidence_sha256")
+    document["evidence_sha256"] = canonical_sha256(document)
+    qualification_path.write_text(json.dumps(document), encoding="utf-8")
+    changed = copy.deepcopy(sealed)
+    changed.pop("contract_sha256")
+    for location in (changed["runtime"], changed["qualification_policy"]):
+        policy = location["runtime_local_eligibility"]
+        policy["qualification_contract_sha256"] = "f" * 64
+        policy["qualification_evidence_sha256"] = document["evidence_sha256"]
+        policy["qualification_file_sha256"] = campaign_contract.sha256_file(
+            qualification_path
+        )
+    changed["contract_sha256"] = canonical_sha256(changed)
+    monkeypatch.setattr(
+        qualification_gate,
+        "_project_runtime_registry",
+        lambda **_kwargs: pytest.fail("tampered predecessor reached projection"),
+    )
+
+    with pytest.raises(
+        QualificationGateError,
+        match="expected successor campaign contract is invalid",
+    ):
+        audit_qualification(qualification_path, expected_contract=changed)
 
 
 def test_prior_evidence_is_preserved_but_cannot_satisfy_v4_gate(
@@ -1365,6 +1432,626 @@ def test_launch_plan_is_automatic_and_does_not_launch(contract):
         "remaining_candidates_per_mode"
     ] == 29
     assert plan["resources_per_child"]["gpus"] == 8
+
+
+def _automatic_successor_contract(
+    *,
+    contract_path: Path = manifest_generator.DEFAULT_SUCCESSOR_CONTRACT,
+    runtime_root: Path = manifest_generator.DEFAULT_SUCCESSOR_RUNTIME_ROOT,
+) -> dict:
+    source = _automatic_source_seal()
+    return {
+        "contract_sha256": "c" * 64,
+        "runtime": {
+            "source_commit": source["source_commit"],
+            "wheel_sha256": source["wheel_sha256"],
+            "automatic_successor_contract_path": str(contract_path.resolve()),
+            "automatic_successor_runtime_root": str(runtime_root.resolve()),
+        },
+        "launcher_integrity": {
+            name: source[name]
+            for name in (
+                "campaign_contract_sha256",
+                "qualification_gate_sha256",
+                "manifest_generator_sha256",
+                "run_campaign_sha256",
+            )
+        },
+        "qualification_policy": {
+            "runtime_local_eligibility": {
+                "qualification_file_sha256": "d" * 64,
+                "qualification_evidence_sha256": "e" * 64,
+            }
+        },
+    }
+
+
+def _automatic_source_seal() -> dict:
+    return {
+        "source_commit": "f" * 40,
+        "wheel_sha256": "a" * 64,
+        "campaign_contract_sha256": "1" * 64,
+        "qualification_gate_sha256": "2" * 64,
+        "manifest_generator_sha256": "3" * 64,
+        "run_campaign_sha256": "4" * 64,
+    }
+
+
+def _bind_test_automatic_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> tuple[Path, Path]:
+    output = tmp_path / "campaign.v6.json"
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setattr(
+        manifest_generator,
+        "DEFAULT_SUCCESSOR_CONTRACT",
+        output,
+    )
+    monkeypatch.setattr(
+        manifest_generator,
+        "DEFAULT_SUCCESSOR_RUNTIME_ROOT",
+        runtime_root,
+    )
+    return output, runtime_root
+
+
+def test_automatic_successor_waits_without_early_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    completion = tmp_path / "completion.json"
+    status = tmp_path / "runtime/automatic_successor_status.json"
+    observed_states = []
+
+    def finish_after_first_wait(_seconds: float) -> None:
+        observed_states.append(json.loads(status.read_text())["state"])
+        completion.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(manifest_generator.time, "sleep", finish_after_first_wait)
+    monkeypatch.setattr(
+        manifest_generator,
+        "qualification_evidence_record",
+        lambda *_args: {
+            "qualification_file_sha256": "a" * 64,
+            "qualification_evidence_sha256": "b" * 64,
+        },
+    )
+    record = manifest_generator.wait_for_terminal_qualification(
+        completion,
+        tmp_path / "campaign.v5.json",
+        status_path=status,
+        poll_seconds=0,
+    )
+
+    assert observed_states == ["waiting_for_terminal_v5_completion"]
+    assert record["qualification_evidence_sha256"] == "b" * 64
+    final = json.loads(status.read_text(encoding="utf-8"))
+    assert final["state"] == "terminal_v5_evidence_accepted"
+    assert final["successor_contract_sealed"] is False
+    assert final["model_jobs_launched"] is False
+
+
+def test_present_invalid_completion_fails_immediately_without_polling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    completion = tmp_path / "completion.json"
+    completion.write_text("{}", encoding="utf-8")
+    status = tmp_path / "runtime/status.json"
+    monkeypatch.setattr(
+        manifest_generator,
+        "qualification_evidence_record",
+        lambda *_args: (_ for _ in ()).throw(
+            manifest_generator.ManifestGenerationError("invalid completion")
+        ),
+    )
+    monkeypatch.setattr(
+        manifest_generator.time,
+        "sleep",
+        lambda _seconds: pytest.fail("invalid present evidence was polled"),
+    )
+    with pytest.raises(
+        manifest_generator.ManifestGenerationError,
+        match="invalid completion",
+    ):
+        manifest_generator.wait_for_terminal_qualification(
+            completion,
+            tmp_path / "campaign.v5.json",
+            status_path=status,
+            poll_seconds=0,
+        )
+    rejected = json.loads(status.read_text(encoding="utf-8"))
+    assert rejected["state"] == "terminal_v5_evidence_rejected"
+    assert rejected["model_jobs_launched"] is False
+
+
+def test_sealed_successor_retries_transient_remote_blocker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class Decision:
+        def to_dict(self):
+            return {"runtime_ready": True}
+
+    decision = Decision()
+    outcomes = iter(
+        (
+            (False, [{"code": "dataset_not_ready"}], None),
+            (True, [], decision),
+        )
+    )
+    sleeps = []
+    monkeypatch.setattr(run_campaign, "launch_readiness", lambda _contract: next(outcomes))
+    monkeypatch.setattr(run_campaign, "atomic_json", lambda *_args: None)
+    monkeypatch.setattr(run_campaign.time, "sleep", sleeps.append)
+    contract = {
+        "contract_sha256": "a" * 64,
+        "qualification_policy": {"runtime_local_eligibility": {}},
+    }
+
+    assert run_campaign.wait_for_launch_authorization(
+        contract,
+        runtime_root=tmp_path,
+        poll_seconds=0.25,
+    ) is decision
+    assert sleeps == [0.25]
+
+
+def test_sealed_successor_rejects_tampered_terminal_evidence_without_polling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        run_campaign,
+        "launch_readiness",
+        lambda _contract: (
+            False,
+            [{"code": "ptm_qualification_not_ready"}],
+            None,
+        ),
+    )
+    monkeypatch.setattr(run_campaign, "atomic_json", lambda *_args: None)
+    monkeypatch.setattr(
+        run_campaign.time,
+        "sleep",
+        lambda _seconds: pytest.fail("tampered terminal evidence was polled"),
+    )
+    contract = {
+        "contract_sha256": "a" * 64,
+        "qualification_policy": {"runtime_local_eligibility": {}},
+    }
+
+    with pytest.raises(
+        run_campaign.CampaignExecutionError,
+        match="sealed immutable terminal qualification evidence",
+    ):
+        run_campaign.wait_for_launch_authorization(
+            contract,
+            runtime_root=tmp_path,
+            poll_seconds=0,
+        )
+
+
+def test_zero_success_terminal_completion_is_rejected():
+    completion = {"terminal": True, "successful_workflows": 0}
+    completion["evidence_sha256"] = canonical_sha256(completion)
+    with pytest.raises(
+        manifest_generator.ManifestGenerationError,
+        match="zero successes",
+    ):
+        manifest_generator._terminal_completion_sha(completion)
+
+
+def test_automatic_successor_orders_wait_seal_then_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    order = []
+    output, runtime_root = _bind_test_automatic_paths(monkeypatch, tmp_path)
+    contract = _automatic_successor_contract(
+        contract_path=output,
+        runtime_root=runtime_root,
+    )
+    monkeypatch.setattr(
+        manifest_generator,
+        "_source_seal_identity",
+        lambda *_args: order.append("bind") or _automatic_source_seal(),
+    )
+    monkeypatch.setattr(
+        manifest_generator,
+        "wait_for_terminal_qualification",
+        lambda *_args, **_kwargs: order.append("wait"),
+    )
+    monkeypatch.setattr(
+        manifest_generator,
+        "build_contract",
+        lambda **_kwargs: order.append("build") or contract,
+    )
+    monkeypatch.setattr(
+        manifest_generator,
+        "seal_contract_no_overwrite",
+        lambda *_args: order.append("seal") or True,
+    )
+
+    def launch(**kwargs):
+        order.append("launch")
+        assert kwargs["resume"] is False
+        assert kwargs["runtime_root"] == runtime_root.resolve()
+        return 0
+
+    monkeypatch.setattr(manifest_generator, "launch_successor_once", launch)
+    assert manifest_generator.main(
+        [
+            "--qualification",
+            str(tmp_path / "completion.json"),
+            "--qualification-contract",
+            str(tmp_path / "campaign.v5.json"),
+            "--output",
+            str(output),
+            "--runtime-root",
+            str(runtime_root),
+            "--automatic-trigger",
+            "--launch",
+        ]
+    ) == 0
+    assert order == ["bind", "wait", "bind", "build", "seal", "launch"]
+
+
+def test_automatic_successor_wait_failure_prevents_seal_and_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output, runtime_root = _bind_test_automatic_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        manifest_generator,
+        "_source_seal_identity",
+        lambda *_args: _automatic_source_seal(),
+    )
+    monkeypatch.setattr(
+        manifest_generator,
+        "wait_for_terminal_qualification",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            manifest_generator.ManifestGenerationError("invalid terminal v5")
+        ),
+    )
+    monkeypatch.setattr(
+        manifest_generator,
+        "build_contract",
+        lambda **_kwargs: pytest.fail("built before the terminal gate"),
+    )
+    monkeypatch.setattr(
+        manifest_generator,
+        "launch_successor_once",
+        lambda **_kwargs: pytest.fail("launched before the terminal gate"),
+    )
+    with pytest.raises(
+        manifest_generator.ManifestGenerationError,
+        match="invalid terminal v5",
+    ):
+        manifest_generator.main(
+            [
+                "--output",
+                str(output),
+                "--runtime-root",
+                str(runtime_root),
+                "--automatic-trigger",
+                "--launch",
+            ]
+        )
+
+
+def test_watcher_source_change_blocks_before_contract_or_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output, runtime_root = _bind_test_automatic_paths(monkeypatch, tmp_path)
+    first = _automatic_source_seal()
+    second = {**first, "source_commit": "0" * 40}
+    identities = iter((first, second))
+    monkeypatch.setattr(
+        manifest_generator,
+        "_source_seal_identity",
+        lambda *_args: next(identities),
+    )
+    monkeypatch.setattr(
+        manifest_generator,
+        "wait_for_terminal_qualification",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        manifest_generator,
+        "build_contract",
+        lambda **_kwargs: pytest.fail("built after source changed"),
+    )
+    with pytest.raises(
+        manifest_generator.ManifestGenerationError,
+        match="source changed while waiting",
+    ):
+        manifest_generator.main(
+            [
+                "--output",
+                str(output),
+                "--runtime-root",
+                str(runtime_root),
+                "--automatic-trigger",
+                "--launch",
+            ]
+        )
+    assert not output.exists()
+    assert not (
+        runtime_root / "automatic_successor_launch_claim.json"
+    ).exists()
+
+
+def test_successor_contract_seal_is_atomic_and_never_overwrites(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    contract = {"contract_sha256": "a" * 64, "value": 1}
+    output = tmp_path / "campaign.v6.json"
+    monkeypatch.setattr(
+        campaign_contract,
+        "validate_contract",
+        lambda value: value,
+    )
+
+    assert manifest_generator.seal_contract_no_overwrite(output, contract)
+    original = output.read_bytes()
+    assert output.stat().st_mode & 0o222 == 0
+    assert not manifest_generator.seal_contract_no_overwrite(output, contract)
+    output.chmod(0o644)
+    with pytest.raises(
+        manifest_generator.ManifestGenerationError,
+        match="refusing overwrite",
+    ):
+        manifest_generator.seal_contract_no_overwrite(output, contract)
+    output.chmod(0o444)
+    with pytest.raises(
+        manifest_generator.ManifestGenerationError,
+        match="refusing overwrite",
+    ):
+        manifest_generator.seal_contract_no_overwrite(
+            output,
+            {"contract_sha256": "b" * 64, "value": 2},
+        )
+    assert output.read_bytes() == original
+
+
+def test_concurrent_identical_writable_seal_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output = tmp_path / "claim.json"
+
+    def publish_writable_then_race(source: Path, destination: Path) -> None:
+        destination.write_bytes(Path(source).read_bytes())
+        destination.chmod(0o644)
+        raise FileExistsError
+
+    monkeypatch.setattr(manifest_generator.os, "link", publish_writable_then_race)
+    with pytest.raises(
+        manifest_generator.ManifestGenerationError,
+        match="concurrent seal differs",
+    ):
+        manifest_generator._seal_json_no_overwrite(output, {"value": 1})
+    assert output.stat().st_mode & 0o222
+
+
+def test_automatic_paths_reject_before_any_side_effect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output, runtime_root = _bind_test_automatic_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        manifest_generator,
+        "_source_seal_identity",
+        lambda *_args: pytest.fail("source checked before path binding"),
+    )
+    cases = (
+        (tmp_path / "alternate.json", runtime_root),
+        (output, tmp_path / "alternate-runtime"),
+    )
+    for candidate_output, candidate_root in cases:
+        with pytest.raises(
+            manifest_generator.ManifestGenerationError,
+            match="exact sealed v6 contract and fresh runtime paths",
+        ):
+            manifest_generator.main(
+                [
+                    "--output",
+                    str(candidate_output),
+                    "--runtime-root",
+                    str(candidate_root),
+                    "--automatic-trigger",
+                    "--launch",
+                ]
+            )
+        assert not candidate_output.exists()
+        assert not candidate_root.exists()
+
+
+def test_campaign_runner_rejects_alternate_successor_root_before_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    contract_path = tmp_path / "campaign.v6.json"
+    expected_root = tmp_path / "runtime"
+    alternate_root = tmp_path / "alternate-runtime"
+    contract = _automatic_successor_contract(
+        contract_path=contract_path,
+        runtime_root=expected_root,
+    )
+    monkeypatch.setattr(run_campaign, "load_contract", lambda _path: contract)
+    monkeypatch.setattr(
+        run_campaign,
+        "load_env_file",
+        lambda _path: pytest.fail("environment loaded before path binding"),
+    )
+    with pytest.raises(
+        run_campaign.CampaignExecutionError,
+        match="differs from its sealed path",
+    ):
+        run_campaign.main(
+            [
+                "--contract",
+                str(contract_path),
+                "--runtime-root",
+                str(alternate_root),
+                "--automatic-trigger",
+            ]
+        )
+    assert not alternate_root.exists()
+
+
+def test_successor_launch_claim_prevents_duplicate_submission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls = []
+
+    def successful_run(arguments):
+        calls.append(arguments)
+        (tmp_path / "runtime/mode_process_status.json").write_text(
+            json.dumps({mode: 0 for mode in campaign_contract.MODES}),
+            encoding="utf-8",
+        )
+        return 0
+
+    monkeypatch.setattr(
+        run_campaign,
+        "main",
+        successful_run,
+    )
+    contract_path = tmp_path / "campaign.v6.json"
+    runtime_root = tmp_path / "runtime"
+    arguments = {
+        "contract": _automatic_successor_contract(
+            contract_path=contract_path,
+            runtime_root=runtime_root,
+        ),
+        "contract_path": contract_path,
+        "runtime_root": runtime_root,
+        "env_file": tmp_path / "config.env",
+        "poll_seconds": 1.0,
+        "resume": False,
+    }
+    assert manifest_generator.launch_successor_once(**arguments) == 0
+    assert manifest_generator.launch_successor_once(**arguments) == 0
+    assert len(calls) == 1
+    assert "--automatic-trigger" in calls[0]
+    assert "--launch" in calls[0]
+    assert "--resume" not in calls[0]
+    result = runtime_root / "automatic_successor_launch_result.json"
+    assert result.stat().st_mode & 0o222 == 0
+
+
+def test_partial_launch_claim_requires_explicit_supported_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls = []
+    monkeypatch.setattr(
+        run_campaign,
+        "main",
+        lambda arguments: calls.append(arguments) or 1,
+    )
+    contract_path = tmp_path / "campaign.v6.json"
+    runtime_root = tmp_path / "runtime"
+    contract = _automatic_successor_contract(
+        contract_path=contract_path,
+        runtime_root=runtime_root,
+    )
+    contract["search"] = {"candidate_budget_per_mode": 30}
+    before = copy.deepcopy(contract)
+    arguments = {
+        "contract": contract,
+        "contract_path": contract_path,
+        "runtime_root": runtime_root,
+        "env_file": tmp_path / "config.env",
+        "poll_seconds": 1.0,
+        "resume": False,
+    }
+    assert manifest_generator.launch_successor_once(**arguments) == 1
+    with pytest.raises(
+        manifest_generator.ManifestGenerationError,
+        match="use --resume",
+    ):
+        manifest_generator.launch_successor_once(**arguments)
+    assert len(calls) == 1
+    arguments["resume"] = True
+    assert manifest_generator.launch_successor_once(**arguments) == 1
+    assert len(calls) == 2
+    assert "--resume" in calls[-1]
+    assert contract == before
+
+
+def test_resume_does_not_resubmit_completed_modes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls = []
+    monkeypatch.setattr(
+        run_campaign,
+        "main",
+        lambda arguments: calls.append(arguments) or 1,
+    )
+    contract_path = tmp_path / "campaign.v6.json"
+    runtime_root = tmp_path / "runtime"
+    arguments = {
+        "contract": _automatic_successor_contract(
+            contract_path=contract_path,
+            runtime_root=runtime_root,
+        ),
+        "contract_path": contract_path,
+        "runtime_root": runtime_root,
+        "env_file": tmp_path / "config.env",
+        "poll_seconds": 1.0,
+        "resume": False,
+    }
+    assert manifest_generator.launch_successor_once(**arguments) == 1
+    (runtime_root / "mode_process_status.json").write_text(
+        json.dumps({mode: 0 for mode in campaign_contract.MODES}),
+        encoding="utf-8",
+    )
+    arguments["resume"] = True
+    assert manifest_generator.launch_successor_once(**arguments) == 0
+    result = runtime_root / "automatic_successor_launch_result.json"
+    assert result.is_file()
+    assert result.stat().st_mode & 0o222 == 0
+    arguments["resume"] = False
+    assert manifest_generator.launch_successor_once(**arguments) == 0
+    assert len(calls) == 1
+
+
+def test_launch_lock_prevents_concurrent_submission(
+    tmp_path: Path,
+):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    lock_path = runtime / "automatic_successor_launch.lock"
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        manifest_generator.fcntl.flock(
+            lock.fileno(),
+            manifest_generator.fcntl.LOCK_EX
+            | manifest_generator.fcntl.LOCK_NB,
+        )
+        with pytest.raises(
+            manifest_generator.ManifestGenerationError,
+            match="already active",
+        ):
+            manifest_generator.launch_successor_once(
+                contract=_automatic_successor_contract(
+                    contract_path=tmp_path / "campaign.v6.json",
+                    runtime_root=runtime,
+                ),
+                contract_path=tmp_path / "campaign.v6.json",
+                runtime_root=runtime,
+                env_file=tmp_path / "config.env",
+                poll_seconds=1.0,
+                resume=False,
+            )
+    assert not (runtime / "automatic_successor_launch_claim.json").exists()
 
 
 def test_local_seal_is_revalidated_before_launch(
