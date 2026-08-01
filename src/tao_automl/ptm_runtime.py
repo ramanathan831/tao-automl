@@ -37,6 +37,7 @@ from tao_automl.ptm_preflight import (
 )
 from tao_automl.ptm_registry import (
     PTMCompatibilityResult,
+    PTMRegistry,
     canonical_sha256,
     load_ptm_registry,
     merge_ptm_spec_precedence,
@@ -151,6 +152,7 @@ def _validate_runtime_report(
     report: PTMPreflightReport,
     *,
     model: str,
+    registry: PTMRegistry | None = None,
 ) -> Any:
     if not isinstance(report, PTMPreflightReport):
         raise TypeError(
@@ -193,13 +195,16 @@ def _validate_runtime_report(
             "PTM preflight prepared a checkpoint outside its runtime inventory"
         )
 
-    registry = load_ptm_registry()
+    if registry is None:
+        registry = load_ptm_registry()
+    elif not isinstance(registry, PTMRegistry):
+        raise TypeError("registry must be a PTMRegistry when provided")
     if (
         report.registry_version != registry.registry_version
         or report.registry_sha256 != registry.document_sha256
     ):
         raise ValueError(
-            "PTM preflight registry identity does not match the repository "
+            "PTM preflight registry identity does not match the bound "
             "runtime registry"
         )
     for prepared in report.prepared:
@@ -445,6 +450,7 @@ def resolve_ptm_runtime_inventory(
     per_checkpoint_profile_overrides: (
         Mapping[str, Mapping[str, Any]] | None
     ) = None,
+    registry: PTMRegistry | None = None,
     model: str,
     algorithm: str = "bayesian",
 ) -> ResolvedPTMRuntimeInventory:
@@ -463,11 +469,22 @@ def resolve_ptm_runtime_inventory(
     It must contain exactly the selected checkpoint IDs.  These values are
     merged after the shared profile and before user overrides, preserving the
     documented precedence while keeping heterogeneous PTM arms comparable.
+
+    ``registry`` may bind an explicit, already validated in-memory registry
+    projection to the typed preflight report.  This is intentionally opt-in:
+    omitting it preserves the packaged-registry trust boundary.  Supplying it
+    never changes the repository registry; the report and every prepared arm
+    must instead match the explicit registry's version, document digest, and
+    canonical record digests exactly.
     """
     algorithm = _validate_algorithm(algorithm)
     model = _nonempty_string(model, "model")
     mode = _objective_mode(objective_config)
-    registry = _validate_runtime_report(report, model=model)
+    registry = _validate_runtime_report(
+        report,
+        model=model,
+        registry=registry,
+    )
     if not report.prepared:
         raise ValueError("Runtime preflight has no prepared PTMs")
     prepared_by_id = {
