@@ -92,6 +92,17 @@ FROZEN_LATENCY_RETENTION = 0.90
 FROZEN_LATENCY_TOLERANCE_MS = 0.73553775
 FROZEN_VALIDATION_SANITY_MIN_PQ = 0.01
 FROZEN_SLURM_RETRY_CAP = 10
+FROZEN_CHECKPOINT_INTERVAL_STEPS = 100
+CHECKPOINT_RESUME_POLICY = {
+    "kind": "same_job_exact_epoch_step_max_with_history_v1",
+    "checkpoint_interval": FROZEN_CHECKPOINT_INTERVAL_STEPS,
+    "checkpoint_interval_unit": "step",
+    "resume_field": "train.resume_training_checkpoint_path",
+    "same_job_only": True,
+    "symlinks_eligible": False,
+    "post_requeue_missing_checkpoint_behavior": "fail_closed",
+    "selection_key": ["epoch", "step", "filename"],
+}
 FROZEN_BATCH_SIZE_PER_REPLICA = 1
 FROZEN_HARDWARE = {
     "gpu_name": "NVIDIA A100-SXM4-80GB",
@@ -634,8 +645,8 @@ def profile_overrides(dataset_root: str) -> dict[str, Any]:
             "num_nodes": 1,
             "seed": FROZEN_TRAINING_SEED,
             "num_epochs": FROZEN_TRAINING_EPOCHS,
-            "checkpoint_interval": FROZEN_TRAINING_EPOCHS,
-            "checkpoint_interval_unit": "epoch",
+            "checkpoint_interval": FROZEN_CHECKPOINT_INTERVAL_STEPS,
+            "checkpoint_interval_unit": "step",
             "validation_interval": 1,
             "resume_training_checkpoint_path": "",
             "results_dir": "",

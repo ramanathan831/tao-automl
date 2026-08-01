@@ -707,20 +707,9 @@ def _status_values(
     action: str,
     names: tuple[str, ...],
 ) -> list[float]:
-    root = run_campaign._local_lustre_path(
-        sdk.get_job_results_dir(job_id)
-    )
-    path = f"{root}/results_dir/{action}/status.json"
-    output = run_campaign.remote_output(
-        f"(test -f {shlex.quote(path)} && "
-        f"cat {shlex.quote(path)}) || true"
-    )
+    records = _status_records(sdk, job_id, action=action)
     values: list[float] = []
-    for line in output.splitlines():
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    for record in records:
         kpi = record.get("kpi")
         if not isinstance(kpi, Mapping):
             continue
@@ -732,6 +721,81 @@ def _status_values(
             if math.isfinite(value):
                 values.append(value)
                 break
+    return values
+
+
+def _status_records(
+    sdk: Any,
+    job_id: str,
+    *,
+    action: str,
+) -> list[dict[str, Any]]:
+    root = run_campaign._local_lustre_path(
+        sdk.get_job_results_dir(job_id)
+    )
+    path = f"{root}/results_dir/{action}/status.json"
+    output = run_campaign.remote_output(
+        f"(test -f {shlex.quote(path)} && "
+        f"cat {shlex.quote(path)}) || true"
+    )
+    records: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def _status_epoch_values(
+    sdk: Any,
+    job_id: str,
+    *,
+    action: str,
+    names: tuple[str, ...],
+) -> list[float]:
+    """Return one deterministic metric value per explicit training epoch.
+
+    TAO emits the same validation KPI twice: a generic ``Eval metrics`` event
+    and a training-progress event carrying ``epoch`` and ``step``.  DDP ranks
+    may also repeat the structured event.  Only structured epoch records are
+    eligible; exact repeats are collapsed by epoch, while conflicting finite
+    values for the same epoch fail closed.
+    """
+    by_epoch: dict[int, list[tuple[int, float]]] = {}
+    for record in _status_records(sdk, job_id, action=action):
+        epoch = record.get("epoch")
+        step = record.get("step")
+        kpi = record.get("kpi")
+        if (
+            isinstance(epoch, bool)
+            or not isinstance(epoch, int)
+            or epoch < 0
+            or isinstance(step, bool)
+            or not isinstance(step, int)
+            or step < 0
+            or not isinstance(kpi, Mapping)
+        ):
+            continue
+        for name in names:
+            try:
+                value = float(kpi[name])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(value):
+                by_epoch.setdefault(epoch, []).append((step, value))
+                break
+    values: list[float] = []
+    for epoch in sorted(by_epoch):
+        records = by_epoch[epoch]
+        distinct = {value for _, value in records}
+        if len(distinct) != 1:
+            raise CampaignExecutionError(
+                f"conflicting task metric values for training epoch {epoch}"
+            )
+        values.append(max(records, key=lambda item: item[0])[1])
     return values
 
 
@@ -751,6 +815,9 @@ def _failure_workflow(
         "failure_reason": reason,
         "replacement_submitted": False,
         "diagnostics": copy.deepcopy(dict(diagnostics or {})),
+        "agent_intervention_flags": {
+            name: False for name in campaign_contract.AGENT_FLAGS
+        },
     }
     value["workflow_sha256"] = canonical_sha256(value)
     return value
@@ -816,13 +883,16 @@ def _run_one(
             )
         terminal = run_campaign._terminal_checkpoint(sdk, train_job.id)
         diagnostics["train_job"]["terminal_checkpoint"] = terminal
-        mask_values = _status_values(
+        mask_values = _status_epoch_values(
             sdk,
             train_job.id,
             action="train",
             names=(VALIDATION_MASK_AP_METRIC,),
         )
         diagnostics["train_job"]["mask_ap_values"] = mask_values
+        diagnostics["train_job"]["metric_deduplication"] = (
+            "explicit_epoch_then_exact_rank_value_v1"
+        )
         diagnostics["train_job"]["semantic_miou_diagnostic_values"] = (
             _status_values(
                 sdk,

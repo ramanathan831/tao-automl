@@ -521,8 +521,12 @@ def audit_qualification(
         ) from exc
     if expected_contract is not None:
         runtime = expected_contract.get("runtime", {})
+        expected_revision = policy.get(
+            "qualification_contract_revision", "qualification_runtime_v3"
+        )
         if (
-            document.get("contract_revision") != "qualification_runtime_v3"
+            document.get("contract_revision")
+            != expected_revision
             or document.get("walltime_policy")
             != policy["qualification_walltime_policy"]
             or document["qualification_campaign_sha256"]

@@ -27,7 +27,8 @@ DEFAULT_WHEEL = Path(
     "nvidia_tao_automl-0.1.0-py3-none-any.whl"
 )
 DEFAULT_SDK = Path(
-    "/localhome/local-rarunachalam/.tao/worktrees/tao-sdk-slurm-a2e50d0"
+    "/localhome/local-rarunachalam/.tao/worktrees/"
+    "tao-sdk-bounded-self-requeue"
 )
 DEFAULT_SKILLS = Path(
     "/localhome/local-rarunachalam/.tao/worktrees/tao-skills-release-7.1.0"
@@ -78,7 +79,7 @@ EXPECTED_WHEEL_REGISTRY_FILE_SHA256 = (
 EXPECTED_WHEEL_ONEFORMER_REGISTRY_SHA256 = (
     "3872bec8c0e58f79cd2f941d18bcc1bcb5660ed90c9a4500f8ab5cf3004bde2a"
 )
-EXPECTED_SDK_COMMIT = "a2e50d0930c3e3785b4b39fa8c3da88b39ff89e5"
+EXPECTED_SDK_COMMIT = "ff64be3a277ff277f1f6823717dedc7b48f74c45"
 EXPECTED_SKILLS_COMMIT = "2e9c1b25f3c7cb1ae444c75652e36c47eace8229"
 
 
@@ -730,6 +731,9 @@ def build_contract(
         ),
         "oneformer_latency_worker_sha256": campaign_contract.sha256_file(
             HERE / "oneformer_latency_worker.py"
+        ),
+        "checkpoint_resume_sha256": campaign_contract.sha256_file(
+            HERE.parent / "checkpoint_resume.py"
         ),
         "static_sqsh_audit_sha256": campaign_contract.sha256_file(
             HERE / "static_sqsh_audit.v1.json"

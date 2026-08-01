@@ -89,6 +89,17 @@ FROZEN_VALIDATION_SANITY_MIN_MASK_AP = 0.05
 FROZEN_SLURM_RETRY_CAP = 10
 FROZEN_BATCH_SIZE_PER_REPLICA = 4
 FROZEN_QUALIFICATION_VERSION = 2
+FROZEN_CHECKPOINT_INTERVAL_EPOCHS = 1
+CHECKPOINT_RESUME_POLICY = {
+    "kind": "same_job_exact_epoch_step_max_with_history_v1",
+    "checkpoint_interval": FROZEN_CHECKPOINT_INTERVAL_EPOCHS,
+    "checkpoint_interval_unit": "epoch",
+    "resume_field": "train.resume_training_checkpoint_path",
+    "same_job_only": True,
+    "symlinks_eligible": False,
+    "post_requeue_missing_checkpoint_behavior": "fail_closed",
+    "selection_key": ["epoch", "step", "filename"],
+}
 
 # The pinned TAO 7.1 SQSH does not accept Lightning's strategy alias as the
 # value of ``train.distributed_strategy``: that field is restricted to
@@ -562,7 +573,7 @@ def profile_overrides(
             "num_nodes": 1,
             "seed": FROZEN_TRAINING_SEED,
             "num_epochs": FROZEN_TRAINING_EPOCHS,
-            "checkpoint_interval": FROZEN_TRAINING_EPOCHS,
+            "checkpoint_interval": FROZEN_CHECKPOINT_INTERVAL_EPOCHS,
             "checkpoint_interval_unit": "epoch",
             "validation_interval": 1,
             "resume_training_checkpoint_path": "",

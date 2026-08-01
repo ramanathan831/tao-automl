@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from tao_automl.ptm_registry import canonical_sha256, load_ptm_registry
 
@@ -412,6 +413,43 @@ def test_direct_qualification_completion_matches_gate_identity():
     assert supplied == canonical_sha256(payload)
 
 
+def test_v4_qualification_plan_and_completion_recover_only_failed_arm():
+    value = contract()
+    checkpoint_ids = [
+        record["id"] for record in value["ptm_inventory"]["records"]
+    ]
+    recovery = "oneformer.its.commercial.dinat_large.trainable"
+    reused = sorted(set(checkpoint_ids) - {recovery})
+    value["qualification_policy"].update(
+        {
+            "version": 4,
+            "qualification_campaign_id": (
+                "oneformer-coco2017-direct-full-ptm-qualification-v4-20260801"
+            ),
+            "recovery_checkpoint_ids": [recovery],
+            "reused_checkpoint_ids": reused,
+            "checkpoint_resume_policy": copy.deepcopy(
+                campaign_contract.CHECKPOINT_RESUME_POLICY
+            ),
+            "predecessor_evidence": {"file_sha256": "a" * 64},
+        }
+    )
+    value["launcher_integrity"] = {
+        "qualification_campaign_sha256": "1" * 64,
+    }
+    plan = qualification_campaign.qualification_plan(value)
+    assert plan["checkpoint_ids"] == [recovery]
+    assert plan["workflow_count"] == 1
+    assert plan["reused_predecessor_workflow_count"] == 3
+    assert plan["replacement_workflows_allowed"] is True
+
+    completion = qualification_campaign.build_completion(value, [])
+    assert completion["replacement_workflows_submitted"] is True
+    assert completion["replacement_workflow_count"] == 1
+    assert completion["reused_predecessor_workflow_count"] == 3
+    assert completion["recovery_checkpoint_ids"] == [recovery]
+
+
 def test_packaged_schema_owns_every_frozen_search_parameter():
     evidence = campaign_contract.validate_packaged_train_schema(SKILL_DIR)
     assert evidence["explicit_search_parameters"] == list(
@@ -441,6 +479,12 @@ def test_profile_uses_native_panoptic_contract_and_correct_label_map():
     assert profile["train"]["num_gpus"] == 8
     assert profile["train"]["num_nodes"] == 1
     assert profile["train"]["precision"] == "32"
+    assert profile["train"]["checkpoint_interval"] == 100
+    assert profile["train"]["checkpoint_interval_unit"] == "step"
+    assert profile["train"]["resume_training_checkpoint_path"] == ""
+    assert campaign_contract.CHECKPOINT_RESUME_POLICY[
+        "post_requeue_missing_checkpoint_behavior"
+    ] == "fail_closed"
     assert profile["evaluate"]["task"] == "panoptic"
 
 
@@ -620,13 +664,26 @@ def test_successor_and_frozen_qualification_cli_defaults_are_decoupled(
 ):
     assert run_campaign.DEFAULT_CONTRACT.name == "campaign.v4.json"
     assert run_campaign.DEFAULT_RUNTIME_ROOT.name.endswith("three_mode_v4")
-    assert qualification_campaign.DEFAULT_CONTRACT == Path(
-        campaign_contract.FROZEN_V3_QUALIFICATION_CONTRACT["path"]
+    assert qualification_campaign.DEFAULT_CONTRACT.name == (
+        "qualification.v4.json"
     )
     assert qualification_campaign.DEFAULT_RUNTIME_ROOT.name.endswith(
-        "ptm_qualification_v3"
+        "ptm_qualification_v4"
     )
-    assert qualification_campaign.main([]) == 0
+    assert qualification_campaign.main(
+        [
+            "--contract",
+            campaign_contract.FROZEN_V3_QUALIFICATION_CONTRACT["path"],
+            "--runtime-root",
+            str(
+                Path(
+                    campaign_contract.FROZEN_V3_QUALIFICATION_CONTRACT[
+                        "qualification_evidence_path"
+                    ]
+                ).parent
+            ),
+        ]
+    ) == 0
     plan = json.loads(capsys.readouterr().out)
     assert plan["campaign_id"] == (
         qualification_campaign.QUALIFICATION_CAMPAIGN_ID
@@ -1138,3 +1195,97 @@ def test_registry_remains_unverified_until_real_direct_runs():
     assert {record["status"] for record in model["checkpoints"]} == {
         "unverified"
     }
+
+
+def test_shared_checkpoint_resume_selects_exact_max_independent_of_order(
+    tmp_path: Path,
+):
+    helper = qualification_campaign.checkpoint_resume
+    train_dir = tmp_path / "train"
+    train_dir.mkdir()
+    paths = [
+        train_dir / "model_epoch_000_step_00100.pth",
+        train_dir / "model_epoch_000_step_00200.pth",
+        train_dir / "model_epoch_001_step_00001.pth",
+    ]
+    for path in paths:
+        path.write_bytes(b"checkpoint")
+    forward, count = helper.select_latest_checkpoint(
+        train_dir, entries=paths
+    )
+    reverse, reverse_count = helper.select_latest_checkpoint(
+        train_dir, entries=reversed(paths)
+    )
+    assert count == reverse_count == 3
+    assert forward == reverse
+    assert forward["filename"] == "model_epoch_001_step_00001.pth"
+
+
+def test_shared_checkpoint_resume_injects_same_job_path_and_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    helper = qualification_campaign.checkpoint_resume
+    runtime_root = tmp_path / "runtime"
+    results_dir = runtime_root / "job-id" / "results_dir"
+    train_dir = results_dir / "train"
+    train_dir.mkdir(parents=True)
+    checkpoint = train_dir / "model_epoch_000_step_00200.pth"
+    checkpoint.write_bytes(b"checkpoint")
+    spec = tmp_path / "spec.yaml"
+    spec.write_text(
+        yaml.safe_dump(
+            {
+                "results_dir": str(results_dir),
+                "train": {"resume_training_checkpoint_path": ""},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TAO_RESULTS_ROOT", str(runtime_root))
+    monkeypatch.setenv("TAO_JOB_ID", "job-id")
+    monkeypatch.setenv("SLURM_JOB_ID", "123")
+    monkeypatch.setenv("SLURM_RESTART_COUNT", "1")
+    decision = helper.inject_resume_checkpoint(
+        spec,
+        model_slug="oneformer",
+        decision_filename="decision.json",
+        history_directory="history",
+    )
+    loaded = yaml.safe_load(spec.read_text(encoding="utf-8"))
+    assert loaded["train"]["resume_training_checkpoint_path"] == str(
+        checkpoint
+    )
+    assert decision["resume_enabled"] is True
+    assert Path(decision["history_path"]).is_file()
+
+
+def test_shared_checkpoint_resume_fails_closed_after_requeue_without_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    helper = qualification_campaign.checkpoint_resume
+    results_dir = tmp_path / "job" / "results_dir"
+    (results_dir / "train").mkdir(parents=True)
+    spec = tmp_path / "spec.yaml"
+    spec.write_text(
+        yaml.safe_dump(
+            {
+                "results_dir": str(results_dir),
+                "train": {"resume_training_checkpoint_path": ""},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SLURM_RESTART_COUNT", "1")
+    with pytest.raises(
+        helper.CheckpointResumeError,
+        match="no eligible same-job checkpoint",
+    ):
+        helper.inject_resume_checkpoint(
+            spec,
+            model_slug="oneformer",
+            decision_filename="decision.json",
+            history_directory="history",
+        )

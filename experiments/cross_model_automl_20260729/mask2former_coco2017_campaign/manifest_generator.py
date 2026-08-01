@@ -45,7 +45,7 @@ DEFAULT_STAGE_MANIFEST = (
 DEFAULT_QUALIFICATION = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "mask2former_coco2017_ptm_qualification_v3/completion.json"
+    "mask2former_coco2017_ptm_qualification_v3_replay_v1/completion.json"
 )
 DEFAULT_QUALIFICATION_CONTRACT = Path(
     campaign_contract.FROZEN_V3_QUALIFICATION_CONTRACT["path"]
@@ -93,10 +93,10 @@ def qualification_evidence_record(
     evidence_path = Path(path).resolve()
     contract_path = Path(qualification_contract).resolve()
     frozen = campaign_contract.FROZEN_V3_QUALIFICATION_CONTRACT
-    if (
-        str(evidence_path) != frozen["qualification_evidence_path"]
-        or not evidence_path.is_file()
-    ):
+    original_evidence = (
+        str(evidence_path) == frozen["qualification_evidence_path"]
+    )
+    if not evidence_path.is_file():
         raise ManifestGenerationError(
             "terminal Mask2Former v3 qualification evidence is unavailable"
         )
@@ -172,13 +172,50 @@ def qualification_evidence_record(
     evidence_internal = evidence_payload.pop("evidence_sha256", None)
     workflows = evidence.get("workflows")
     expected_ids = tuple(sorted(snapshot_records))
+    derivation: dict[str, Any] | None = None
+    if original_evidence:
+        expected_campaign_id = frozen["qualification_campaign_id"]
+        expected_revision = "qualification_runtime_v3"
+    else:
+        replay = evidence.get("evidence_replay")
+        parent = campaign_contract.FROZEN_V3_FAILURE_EVIDENCE
+        if (
+            not isinstance(replay, dict)
+            or replay.get("kind")
+            != "immutable_status_metric_deduplication_replay_v1"
+            or replay.get("parent_path") != parent["path"]
+            or replay.get("parent_file_sha256") != parent["file_sha256"]
+            or replay.get("parent_evidence_sha256")
+            != parent["evidence_sha256"]
+            or replay.get("retraining_jobs_submitted") != 0
+            or replay.get("evaluation_jobs_submitted") != 0
+            or replay.get("selection_invoked") is not False
+            or replay.get("original_evidence_overwritten") is not False
+            or not Path(parent["path"]).is_file()
+            or campaign_contract.sha256_file(parent["path"])
+            != parent["file_sha256"]
+        ):
+            raise ManifestGenerationError(
+                "Mask2Former qualification replay derivation is invalid"
+            )
+        parent_document = json.loads(
+            Path(parent["path"]).read_text(encoding="utf-8")
+        )
+        if parent_document.get("evidence_sha256") != parent["evidence_sha256"]:
+            raise ManifestGenerationError(
+                "sealed Mask2Former parent evidence changed"
+            )
+        expected_campaign_id = (
+            "mask2former-coco2017-direct-full-qualification-"
+            "v3-replay-v1-20260801"
+        )
+        expected_revision = "qualification_runtime_v3_evidence_replay_v1"
+        derivation = copy.deepcopy(replay)
     if (
         evidence_internal != canonical_sha256(evidence_payload)
         or evidence.get("schema_version") != 1
-        or evidence.get("campaign_id")
-        != frozen["qualification_campaign_id"]
-        or evidence.get("contract_revision")
-        != "qualification_runtime_v3"
+        or evidence.get("campaign_id") != expected_campaign_id
+        or evidence.get("contract_revision") != expected_revision
         or evidence.get("model") != "mask2former"
         or evidence.get("task") != "instance_segmentation"
         or evidence.get("primary_metric") != "segm_val_mAP"
@@ -257,7 +294,9 @@ def qualification_evidence_record(
         "qualification_campaign_sha256": frozen[
             "qualification_campaign_sha256"
         ],
-        "qualification_campaign_id": frozen["qualification_campaign_id"],
+        "qualification_campaign_id": expected_campaign_id,
+        "qualification_contract_revision": expected_revision,
+        "qualification_derivation": derivation,
         "ptm_stage_manifest_path": frozen["ptm_stage_manifest_path"],
         "ptm_stage_manifest_sha256": frozen[
             "ptm_stage_manifest_sha256"
@@ -672,7 +711,7 @@ def build_contract(
     repository_path = Path(repository).resolve()
     value = campaign_contract.build_preregistered_contract(
         campaign_id=(
-            "mask2former-coco2017-objective-aware-three-mode-v4-20260801"
+            "mask2former-coco2017-objective-aware-three-mode-v5-20260801"
         ),
         dataset=dataset_record(dataset_manifest, stage_manifest),
         skill_dir=(
@@ -763,7 +802,7 @@ def main(argv: list[str] | None = None) -> int:
         default=Path(
             "/localhome/local-rarunachalam/.tao/artifacts/"
             "cross_model_automl_20260729/"
-            "mask2former_coco2017_three_mode_v4"
+            "mask2former_coco2017_three_mode_v5"
         ),
     )
     parser.add_argument(

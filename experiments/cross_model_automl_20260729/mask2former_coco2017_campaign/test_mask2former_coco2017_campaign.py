@@ -481,6 +481,72 @@ def test_standalone_metric_is_bound_without_mislabeling(
     ) == [pytest.approx(0.99)]
 
 
+def test_qualification_epoch_metrics_deduplicate_generic_and_rank_records(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    records = []
+    for epoch, value in enumerate((0.20, 0.25, 0.31)):
+        kpi = {"segm_val_mAP": value}
+        records.extend(
+            [
+                {"message": "Eval metrics generated.", "kpi": kpi},
+                {
+                    "epoch": epoch,
+                    "step": (epoch + 1) * 100,
+                    "rank": 0,
+                    "kpi": kpi,
+                },
+                {
+                    "epoch": epoch,
+                    "step": (epoch + 1) * 100,
+                    "rank": 1,
+                    "kpi": kpi,
+                },
+            ]
+        )
+    monkeypatch.setattr(
+        run_campaign,
+        "remote_output",
+        lambda _: "\n".join(json.dumps(item) for item in records),
+    )
+    sdk = SimpleNamespace(
+        get_job_results_dir=lambda _: "lustre:///lustre/results/job"
+    )
+    assert qualification_campaign._status_epoch_values(
+        sdk,
+        "job",
+        action="train",
+        names=("segm_val_mAP",),
+    ) == [pytest.approx(0.20), pytest.approx(0.25), pytest.approx(0.31)]
+
+
+def test_qualification_epoch_metric_conflicts_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    records = [
+        {"epoch": 0, "step": 100, "kpi": {"segm_val_mAP": 0.20}},
+        {"epoch": 0, "step": 100, "kpi": {"segm_val_mAP": 0.21}},
+    ]
+    monkeypatch.setattr(
+        run_campaign,
+        "remote_output",
+        lambda _: "\n".join(json.dumps(item) for item in records),
+    )
+    sdk = SimpleNamespace(
+        get_job_results_dir=lambda _: "lustre:///lustre/results/job"
+    )
+    with pytest.raises(
+        run_campaign.CampaignExecutionError,
+        match="conflicting task metric values",
+    ):
+        qualification_campaign._status_epoch_values(
+            sdk,
+            "job",
+            action="train",
+            names=("segm_val_mAP",),
+        )
+
+
 def test_search_parameters_are_packaged_train_parameters():
     evidence = campaign_contract.validate_packaged_train_schema(SKILL_DIR)
     assert tuple(evidence["explicit_search_parameters"]) == (
@@ -686,7 +752,7 @@ def test_v4_requeue_resume_is_bounded_without_scientific_budget_change(
     assert contract["search"]["space"] == campaign_contract.SEARCH_SPACE
 
 
-def test_v4_runtime_paths_do_not_overwrite_v1_v2_or_v3_evidence():
+def test_v5_runtime_paths_preserve_v1_v2_v3_and_replay_evidence():
     assert str(qualification_campaign.DEFAULT_RUNTIME_ROOT).endswith(
         "mask2former_coco2017_ptm_qualification_v3"
     )
@@ -695,9 +761,13 @@ def test_v4_runtime_paths_do_not_overwrite_v1_v2_or_v3_evidence():
         "ptm_stage_manifest.json"
     )
     assert str(run_campaign.DEFAULT_RUNTIME_ROOT).endswith(
-        "mask2former_coco2017_three_mode_v4"
+        "mask2former_coco2017_three_mode_v5"
     )
-    assert run_campaign.DEFAULT_CONTRACT.name == "campaign.v4.json"
+    assert run_campaign.DEFAULT_CONTRACT.name == "campaign.v5.json"
+    assert str(manifest_generator.DEFAULT_QUALIFICATION).endswith(
+        "mask2former_coco2017_ptm_qualification_v3_replay_v1/"
+        "completion.json"
+    )
     assert qualification_campaign.DEFAULT_CONTRACT == Path(
         campaign_contract.FROZEN_V3_QUALIFICATION_CONTRACT["path"]
     )
@@ -1122,6 +1192,10 @@ def test_qualification_missing_mask_ap_is_terminal_and_not_replaced():
     assert failure["terminal"] is True
     assert failure["failure_preserved"] is True
     assert failure["replacement_submitted"] is False
+    assert all(
+        value is False
+        for value in failure["agent_intervention_flags"].values()
+    )
     payload = copy.deepcopy(failure)
     supplied = payload.pop("workflow_sha256")
     assert supplied == canonical_sha256(payload)

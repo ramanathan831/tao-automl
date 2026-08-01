@@ -25,7 +25,7 @@ DEFAULT_WHEEL = Path(
 )
 DEFAULT_SDK = Path(
     "/localhome/local-rarunachalam/.tao/worktrees/"
-    "tao-sdk-slurm-a2e50d0"
+    "tao-sdk-bounded-self-requeue"
 )
 DEFAULT_SKILLS = Path(
     "/localhome/local-rarunachalam/.tao/worktrees/"
@@ -79,7 +79,7 @@ EXPECTED_TEXT_ENCODER_STAGE_SHA256 = (
 EXPECTED_WHEEL_SHA256 = (
     "1fa7e75066bf8a58432e1b2672f86a88a2bf4d7a6b37331ee3ac02e87369275f"
 )
-EXPECTED_SDK_COMMIT = "a2e50d0930c3e3785b4b39fa8c3da88b39ff89e5"
+EXPECTED_SDK_COMMIT = "ff64be3a277ff277f1f6823717dedc7b48f74c45"
 EXPECTED_SKILLS_COMMIT = "2e9c1b25f3c7cb1ae444c75652e36c47eace8229"
 EXPECTED_PREDECESSOR_QUALIFICATION_SHA256 = (
     "a48d8d8d2a5c65e35c9d39bd5ed1362be54e2be0b89dcda5471812da331a6996"
@@ -700,6 +700,9 @@ def build_contract(
             campaign_contract.sha256_file(
                 HERE / "mask_grounding_dino_latency_worker.py"
             )
+        ),
+        "checkpoint_resume_sha256": campaign_contract.sha256_file(
+            HERE.parent / "checkpoint_resume.py"
         ),
         "manifest_generator_sha256": campaign_contract.sha256_file(
             HERE / "manifest_generator.py"

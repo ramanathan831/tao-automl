@@ -198,6 +198,15 @@ FROZEN_V3_QUALIFICATION_CONTRACT = {
     "runtime_overlay": runtime_overlay.contract_record(),
     "walltime_policy": copy.deepcopy(FROZEN_WALLTIME_POLICY),
 }
+FROZEN_V3_FAILURE_EVIDENCE = {
+    "path": FROZEN_V3_QUALIFICATION_CONTRACT["qualification_evidence_path"],
+    "file_sha256": (
+        "0bb59c56a5c7214ccfc2a2a817ce4c3808620b84a4649f4e0ebbd86c7ef0f41c"
+    ),
+    "evidence_sha256": (
+        "ebc769f9bdb42f7cec35d7a8ea42d4d020e50e7ea520d0ec244e4f7cf92f0811"
+    ),
+}
 SUCCESSOR_WALLTIME_POLICY = {
     **copy.deepcopy(FROZEN_WALLTIME_POLICY),
     "contract_revision": "automl_runtime_v4",
@@ -307,6 +316,40 @@ def validate_runtime_local_eligibility(
         )
     policy = copy.deepcopy(dict(value))
     frozen = FROZEN_V3_QUALIFICATION_CONTRACT
+    derivation = policy.get("qualification_derivation")
+    if derivation is None:
+        expected_path = frozen["qualification_evidence_path"]
+        expected_campaign_id = frozen["qualification_campaign_id"]
+        expected_revision = "qualification_runtime_v3"
+    elif (
+        isinstance(derivation, Mapping)
+        and derivation.get("kind")
+        == "immutable_status_metric_deduplication_replay_v1"
+        and derivation.get("parent_path")
+        == FROZEN_V3_FAILURE_EVIDENCE["path"]
+        and derivation.get("parent_file_sha256")
+        == FROZEN_V3_FAILURE_EVIDENCE["file_sha256"]
+        and derivation.get("parent_evidence_sha256")
+        == FROZEN_V3_FAILURE_EVIDENCE["evidence_sha256"]
+        and derivation.get("retraining_jobs_submitted") == 0
+        and derivation.get("evaluation_jobs_submitted") == 0
+        and derivation.get("selection_invoked") is False
+        and derivation.get("original_evidence_overwritten") is False
+    ):
+        expected_path = runtime.get("qualification_evidence_path")
+        expected_campaign_id = (
+            "mask2former-coco2017-direct-full-qualification-"
+            "v3-replay-v1-20260801"
+        )
+        expected_revision = "qualification_runtime_v3_evidence_replay_v1"
+    else:
+        raise CampaignContractError(
+            "runtime-local qualification derivation is invalid"
+        )
+    observed_revision = policy.get(
+        "qualification_contract_revision",
+        expected_revision if derivation is None else None,
+    )
     expected_records = {
         record["id"]: record["registry_record_sha256"]
         for record in snapshot["records"]
@@ -334,8 +377,7 @@ def validate_runtime_local_eligibility(
         != snapshot["registry_sha256"]
         or policy.get("base_record_sha256_by_checkpoint_id")
         != expected_records
-        or policy.get("qualification_path")
-        != frozen["qualification_evidence_path"]
+        or policy.get("qualification_path") != expected_path
         or policy.get("qualification_path")
         != runtime.get("qualification_evidence_path")
         or policy.get("qualification_contract_path") != frozen["path"]
@@ -353,8 +395,8 @@ def validate_runtime_local_eligibility(
         != frozen["skills_commit"]
         or policy.get("qualification_campaign_sha256")
         != frozen["qualification_campaign_sha256"]
-        or policy.get("qualification_campaign_id")
-        != frozen["qualification_campaign_id"]
+        or policy.get("qualification_campaign_id") != expected_campaign_id
+        or observed_revision != expected_revision
         or policy.get("ptm_stage_manifest_path")
         != frozen["ptm_stage_manifest_path"]
         or policy.get("ptm_stage_manifest_sha256")

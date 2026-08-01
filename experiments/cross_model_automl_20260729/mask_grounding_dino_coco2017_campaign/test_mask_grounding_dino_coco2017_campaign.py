@@ -492,10 +492,16 @@ def test_profile_is_instance_coco_eight_gpu_not_smoke():
     assert train["gpu_ids"] == list(range(8))
     assert train["num_nodes"] == 1
     assert train["num_epochs"] == 3
+    assert train["checkpoint_interval"] == 1
+    assert train["checkpoint_interval_unit"] == "epoch"
+    assert train["resume_training_checkpoint_path"] == ""
     assert train["validation_interval"] == 1
     assert train["distributed_strategy"] == "ddp"
     assert train["activation_checkpoint"] is False
     assert train["precision"] == "fp32"
+    assert campaign_contract.CHECKPOINT_RESUME_POLICY[
+        "post_requeue_missing_checkpoint_behavior"
+    ] == "fail_closed"
     evaluate = profile["evaluate"]
     assert evaluate["num_gpus"] == 8
     assert evaluate["gpu_ids"] == list(range(8))
@@ -915,6 +921,29 @@ def test_direct_full_qualification_plan_is_plan_only(contract):
     assert plan["smoke_model_runs"] == 0
     assert plan["mini_step_runs"] == 0
     assert plan["replacement_workflows_allowed"] is False
+
+
+def test_v3_qualification_records_exact_four_arm_recovery(contract):
+    changed = copy.deepcopy(contract)
+    changed["qualification_policy"].update(
+        {
+            "version": 3,
+            "replacement_scope": "all_four_v2_timeout_loops",
+            "checkpoint_resume_policy": copy.deepcopy(
+                campaign_contract.CHECKPOINT_RESUME_POLICY
+            ),
+        }
+    )
+    plan = qualification_campaign.qualification_plan(changed)
+    assert plan["replacement_workflows_allowed"] is True
+    assert plan["replacement_scope"] == "all_four_v2_timeout_loops"
+    workflows = [
+        {"checkpoint_id": item["id"], "status": "success"}
+        for item in changed["ptm_inventory"]["records"]
+    ]
+    completion = qualification_campaign.build_completion(changed, workflows)
+    assert completion["replacement_workflows_submitted"] is True
+    assert completion["replacement_workflow_count"] == 4
 
 
 def test_direct_full_qualifications_run_all_four_arms_concurrently(

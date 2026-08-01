@@ -37,6 +37,10 @@ from tao_automl.ptm_registry import canonical_sha256
 from tao_automl.recommendation_audit import validate_recommendation_audit
 from tao_automl.selection import canonical_spec_fingerprint
 
+try:
+    from experiments.cross_model_automl_20260729 import checkpoint_resume
+except ModuleNotFoundError:  # pragma: no cover - pytest direct-path import
+    import checkpoint_resume
 from . import campaign_contract
 from .qualification_gate import (
     QualificationDecision,
@@ -265,9 +269,7 @@ def configure_slurm_runtime(contract: Mapping[str, Any]) -> None:
             "SLURM_ACCOUNT": runtime["account"],
             "SLURM_BASE_RESULTS_DIR": runtime["base_results_dir"],
             "SLURM_CONTAINER_MOUNTS": runtime["container_mounts"],
-            "MAX_JOB_RETRIES": str(
-                campaign_contract.FROZEN_SLURM_RETRY_CAP
-            ),
+            "SLURM_MAX_JOB_RETRIES": str(runtime["max_job_retries"]),
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONNOUSERSITE": "1",
         }
@@ -472,6 +474,10 @@ def verify_local_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
             contract["launcher_integrity"][
                 "oneformer_latency_worker_sha256"
             ],
+        ),
+        "checkpoint_resume": (
+            HERE.parent / "checkpoint_resume.py",
+            contract["launcher_integrity"]["checkpoint_resume_sha256"],
         ),
         "static_sqsh_audit": (
             STATIC_SQSH_AUDIT,
@@ -1619,6 +1625,15 @@ def _run_mode(
         action="train",
         poll_interval=10,
     )
+    train_action = copy.deepcopy(runner.skill_ctx.action_cfg)
+    train_action["command"] = checkpoint_resume.wrap_train_command(
+        train_action["command"],
+        model_slug="oneformer",
+        decision_filename="oneformer_checkpoint_resume_decision.json",
+        history_directory="oneformer_checkpoint_resume_decisions",
+        trust_checkpoint_on_fresh_start=True,
+    )
+    runner.skill_ctx.action_cfg = train_action
 
     def persist() -> None:
         atomic_json(

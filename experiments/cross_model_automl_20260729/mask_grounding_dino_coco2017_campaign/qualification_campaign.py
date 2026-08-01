@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 
-"""Run the v2 direct full-COCO Mask Grounding DINO PTM qualification.
+"""Run the checkpoint-resumable Mask Grounding DINO PTM qualification.
 
 The default invocation is plan-only. ``--launch`` is the only path that
 constructs a scheduler client or submits jobs. It runs no CPU/model smoke and
 no mini-step: the official PTM receives a real three-epoch, one-node/eight-A100
 full-dataset train followed by standalone full validation. Missing task-correct
-COCO mask AP50-95 is retained as a terminal failure, never replaced by the VG
-``overall_IoU`` metric and never retried with a different PTM or specification.
+COCO mask AP50-95 is retained as a terminal failure and never replaced by the
+VG ``overall_IoU`` metric. The v3 successor preserves the exact v2 timeout
+evidence and reruns the same arms with per-epoch same-job resume.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import json
 import math
 import re
 import shlex
+import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Callable
@@ -31,19 +33,144 @@ from tao_automl.ptm_registry import (
     merge_ptm_spec_precedence,
 )
 
+try:
+    from experiments.cross_model_automl_20260729 import checkpoint_resume
+except ModuleNotFoundError:  # pragma: no cover - pytest direct-path import
+    import checkpoint_resume
 from . import campaign_contract, run_campaign
 
 
-DEFAULT_CONTRACT = run_campaign.DEFAULT_CONTRACT
+DEFAULT_CONTRACT = Path(
+    "/localhome/local-rarunachalam/.tao/artifacts/"
+    "cross_model_automl_20260729/"
+    "mask_grounding_dino_coco2017_ptm_qualification_v3/"
+    "qualification.v3.json"
+)
 DEFAULT_RUNTIME_ROOT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "mask_grounding_dino_coco2017_ptm_qualification_v2"
+    "mask_grounding_dino_coco2017_ptm_qualification_v3"
 )
 ENV_PATH = run_campaign.ENV_PATH
 CampaignExecutionError = run_campaign.CampaignExecutionError
 atomic_json = run_campaign.atomic_json
 utc_timestamp = run_campaign.utc_timestamp
+
+
+def _git(repository: Path, *arguments: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repository), *arguments],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    ).stdout.strip()
+
+
+def load_qualification_contract(path: str | Path) -> dict[str, Any]:
+    """Validate the v3 qualification-only successor contract."""
+    document = json.loads(Path(path).read_text(encoding="utf-8"))
+    payload = copy.deepcopy(document)
+    supplied = payload.pop("contract_sha256", None)
+    policy = document.get("qualification_policy", {})
+    runtime = document.get("runtime", {})
+    if (
+        supplied != canonical_sha256(payload)
+        or document.get("campaign_id")
+        != "mask_grounding_dino-coco2017-direct-full-qualification-v3-20260801"
+        or document.get("model") != "mask_grounding_dino"
+        or document.get("task")
+        != "category_prompted_grounded_instance_segmentation"
+        or document.get("sqsh") != campaign_contract.FROZEN_SQSH
+        or document.get("search", {}).get("space")
+        != campaign_contract.SEARCH_SPACE
+        or policy.get("version") != 3
+        or policy.get("qualification_campaign_id")
+        != document.get("campaign_id")
+        or policy.get("checkpoint_resume_policy")
+        != campaign_contract.CHECKPOINT_RESUME_POLICY
+        or policy.get("runtime_local_eligibility") is not None
+        or runtime.get("runtime_local_eligibility") is not None
+        or policy.get("qualification_evidence_path")
+        != runtime.get("qualification_evidence_path")
+        or runtime.get("max_job_retries")
+        != campaign_contract.FROZEN_SLURM_RETRY_CAP
+        or any(document.get("agent_intervention_flags", {}).values())
+    ):
+        raise CampaignExecutionError(
+            "Mask Grounding DINO v3 qualification contract changed"
+        )
+    campaign_contract.validate_dataset_record(document["dataset"])
+    return document
+
+
+def verify_qualification_local_contract(
+    contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    runtime = contract["runtime"]
+    repository = Path(runtime["repository"]).resolve()
+    if (
+        _git(repository, "rev-parse", "HEAD") != runtime["source_commit"]
+        or _git(repository, "status", "--porcelain")
+    ):
+        raise CampaignExecutionError("sealed AutoML source changed")
+    if (
+        _git(Path(runtime["sdk_dir"]), "rev-parse", "HEAD")
+        != runtime["sdk_commit"]
+        or _git(Path(runtime["skills_repository"]), "rev-parse", "HEAD")
+        != runtime["skills_commit"]
+    ):
+        raise CampaignExecutionError("sealed SDK or skills commit changed")
+    identities = {
+        "wheel": (runtime["wheel_path"], runtime["wheel_sha256"]),
+        "ptm_stage": (
+            runtime["ptm_stage_manifest_path"],
+            runtime["ptm_stage_manifest_sha256"],
+        ),
+        "predecessor": (
+            runtime["qualification_predecessor"]["path"],
+            runtime["qualification_predecessor"]["file_sha256"],
+        ),
+        "campaign_contract": (
+            Path(__file__).with_name("campaign_contract.py"),
+            contract["launcher_integrity"]["campaign_contract_sha256"],
+        ),
+        "qualification_campaign": (
+            Path(__file__),
+            contract["launcher_integrity"]["qualification_campaign_sha256"],
+        ),
+        "qualification_successor": (
+            Path(__file__).with_name("qualification_successor.py"),
+            contract["launcher_integrity"][
+                "qualification_successor_sha256"
+            ],
+        ),
+        "run_campaign": (
+            Path(__file__).with_name("run_campaign.py"),
+            contract["launcher_integrity"]["run_campaign_sha256"],
+        ),
+        "checkpoint_resume": (
+            Path(__file__).parent.parent / "checkpoint_resume.py",
+            contract["launcher_integrity"]["checkpoint_resume_sha256"],
+        ),
+    }
+    evidence = {}
+    for name, (path_value, expected) in identities.items():
+        artifact = Path(path_value).resolve()
+        if (
+            not artifact.is_file()
+            or campaign_contract.sha256_file(artifact) != expected
+        ):
+            raise CampaignExecutionError(
+                f"sealed qualification artifact changed: {name}"
+            )
+        evidence[name] = {"path": str(artifact), "sha256": expected}
+    return {
+        "source_commit": runtime["source_commit"],
+        "sdk_commit": runtime["sdk_commit"],
+        "skills_commit": runtime["skills_commit"],
+        "artifacts": evidence,
+    }
 
 
 def _lower_sha(value: Any, name: str) -> str:
@@ -60,8 +187,9 @@ def qualification_plan(contract: Mapping[str, Any]) -> dict[str, Any]:
     inventory = contract["ptm_inventory"]
     return {
         "schema_version": 1,
-        "campaign_id": (
-            "mask_grounding_dino-coco2017-direct-full-qualification-v2-20260801"
+        "campaign_id": contract["qualification_policy"].get(
+            "qualification_campaign_id",
+            "mask_grounding_dino-coco2017-direct-full-qualification-v2-20260801",
         ),
         "contract_sha256": contract["contract_sha256"],
         "model": "mask_grounding_dino",
@@ -84,7 +212,12 @@ def qualification_plan(contract: Mapping[str, Any]) -> dict[str, Any]:
         "cpu_model_runs": 0,
         "smoke_model_runs": 0,
         "mini_step_runs": 0,
-        "replacement_workflows_allowed": False,
+        "replacement_workflows_allowed": (
+            contract["qualification_policy"].get("version") == 3
+        ),
+        "replacement_scope": contract["qualification_policy"].get(
+            "replacement_scope"
+        ),
         "registry_bypass_allowed": False,
         "distributed_strategy_resolution": copy.deepcopy(
             campaign_contract.FROZEN_DDP_STRATEGY_RESOLUTION
@@ -289,8 +422,20 @@ def _entrypoint(
         ).read_text(encoding="utf-8")
     )
     action = metadata["actions"][action_name]
+    action_command = action["command"]
+    if action_name == "train":
+        action_command = checkpoint_resume.wrap_train_command(
+            action_command,
+            model_slug="mask_grounding_dino",
+            decision_filename=(
+                "mask_grounding_dino_checkpoint_resume_decision.json"
+            ),
+            history_directory=(
+                "mask_grounding_dino_checkpoint_resume_decisions"
+            ),
+        )
     entrypoint = build_entrypoint(
-        command=_gpu_guard(action["command"]),
+        command=_gpu_guard(action_command),
         specs=specification,
         inputs=action["inputs"],
         outputs=action["outputs"],
@@ -368,6 +513,9 @@ def _failure_workflow(
         "failure_reason": reason,
         "replacement_submitted": False,
         "diagnostics": copy.deepcopy(dict(diagnostics or {})),
+        "agent_intervention_flags": {
+            name: False for name in campaign_contract.AGENT_FLAGS
+        },
     }
     value["workflow_sha256"] = canonical_sha256(value)
     return value
@@ -393,6 +541,9 @@ def _run_one(
             contract["qualification_policy"][
                 "distributed_strategy_resolution"
             ]
+        ),
+        "checkpoint_resume_policy": copy.deepcopy(
+            campaign_contract.CHECKPOINT_RESUME_POLICY
         ),
         "agent_intervention_flags": {
             name: False for name in campaign_contract.AGENT_FLAGS
@@ -566,8 +717,9 @@ def build_completion(
 ) -> dict[str, Any]:
     value = {
         "schema_version": 1,
-        "campaign_id": (
-            "mask_grounding_dino-coco2017-direct-full-qualification-v2-20260801"
+        "campaign_id": contract["qualification_policy"].get(
+            "qualification_campaign_id",
+            "mask_grounding_dino-coco2017-direct-full-qualification-v2-20260801",
         ),
         "model": "mask_grounding_dino",
         "task": "category_prompted_grounded_instance_segmentation",
@@ -588,14 +740,29 @@ def build_completion(
         "cpu_model_runs": 0,
         "smoke_model_runs": 0,
         "mini_step_runs": 0,
-        "replacement_workflows_submitted": False,
+        "replacement_workflows_submitted": (
+            contract["qualification_policy"].get("version") == 3
+        ),
+        "replacement_workflow_count": (
+            len(workflows)
+            if contract["qualification_policy"].get("version") == 3
+            else 0
+        ),
+        "checkpoint_resume_policy": copy.deepcopy(
+            contract["qualification_policy"].get(
+                "checkpoint_resume_policy",
+                campaign_contract.CHECKPOINT_RESUME_POLICY,
+            )
+        ),
         "distributed_strategy_resolution": copy.deepcopy(
             contract["qualification_policy"][
                 "distributed_strategy_resolution"
             ]
         ),
         "predecessor_failure_evidence": copy.deepcopy(
-            contract["qualification_policy"]["predecessor_failure_evidence"]
+            contract["qualification_policy"].get(
+                "predecessor_failure_evidence"
+            )
         ),
         "workflows": [copy.deepcopy(dict(item)) for item in workflows],
     }
@@ -669,11 +836,11 @@ def launch(
     env_path: Path = ENV_PATH,
 ) -> dict[str, Any]:
     """Submit the one frozen direct-full workflow; no replacement is made."""
-    contract = run_campaign.load_contract(contract_path)
+    contract = load_qualification_contract(contract_path)
     runtime_root.mkdir(parents=True, exist_ok=True)
     loaded_names = run_campaign.load_env_file(env_path)
     run_campaign.configure_slurm_runtime(contract)
-    local = run_campaign.verify_local_contract(contract)
+    local = verify_qualification_local_contract(contract)
     dataset = run_campaign._verify_dataset_remote(contract)
     sqsh = run_campaign._remote_file_identity(contract["sqsh"]["path"])
     if sqsh["sha256"] != contract["sqsh"]["sha256"]:
@@ -754,7 +921,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--env-file", type=Path, default=ENV_PATH)
     parser.add_argument("--launch", action="store_true")
     arguments = parser.parse_args(argv)
-    contract = run_campaign.load_contract(arguments.contract)
+    contract = load_qualification_contract(arguments.contract)
     plan = qualification_plan(contract)
     if not arguments.launch:
         print(json.dumps(plan, indent=2, sort_keys=True))

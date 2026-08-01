@@ -62,11 +62,11 @@ ENV_PATH = Path("/localhome/local-rarunachalam/.tao/config.env")
 DEFAULT_CONTRACT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "mask2former_coco2017_three_mode_v4/campaign.v4.json"
+    "mask2former_coco2017_three_mode_v5/campaign.v5.json"
 )
 DEFAULT_RUNTIME_ROOT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
-    "cross_model_automl_20260729/mask2former_coco2017_three_mode_v4"
+    "cross_model_automl_20260729/mask2former_coco2017_three_mode_v5"
 )
 TERMINAL_JOB_STATUSES = frozenset({"Complete", "Error", "Canceled"})
 SUCCESS_RECOMMENDATION_STATUSES = frozenset({"success", "done"})

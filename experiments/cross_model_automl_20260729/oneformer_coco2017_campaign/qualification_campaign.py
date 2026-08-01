@@ -17,6 +17,7 @@ import math
 import multiprocessing as mp
 import re
 import shlex
+import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -29,16 +30,22 @@ from tao_automl.ptm_registry import (
     merge_ptm_spec_precedence,
 )
 
+try:
+    from experiments.cross_model_automl_20260729 import checkpoint_resume
+except ModuleNotFoundError:  # pragma: no cover - pytest direct-path import
+    import checkpoint_resume
 from . import campaign_contract, ptm_stage, run_campaign
 
 
 DEFAULT_CONTRACT = Path(
-    campaign_contract.FROZEN_V3_QUALIFICATION_CONTRACT["path"]
+    "/localhome/local-rarunachalam/.tao/artifacts/"
+    "cross_model_automl_20260729/"
+    "oneformer_coco2017_ptm_qualification_v4/qualification.v4.json"
 )
 DEFAULT_RUNTIME_ROOT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "oneformer_coco2017_ptm_qualification_v3"
+    "oneformer_coco2017_ptm_qualification_v4"
 )
 DEFAULT_STAGE_MANIFEST = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
@@ -83,6 +90,138 @@ def load_frozen_v3_contract(path: str | Path) -> dict[str, Any]:
     return document
 
 
+def _git(repository: Path, *arguments: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repository), *arguments],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    ).stdout.strip()
+
+
+def load_qualification_contract(path: str | Path) -> dict[str, Any]:
+    """Load either the immutable v3 source or its selective v4 successor."""
+    resolved = Path(path).resolve()
+    frozen = campaign_contract.FROZEN_V3_QUALIFICATION_CONTRACT
+    if str(resolved) == frozen["path"]:
+        return load_frozen_v3_contract(resolved)
+    try:
+        document = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise CampaignExecutionError(
+            "OneFormer qualification successor is unavailable or invalid"
+        ) from exc
+    payload = copy.deepcopy(document)
+    supplied = payload.pop("contract_sha256", None)
+    policy = document.get("qualification_policy", {})
+    runtime = document.get("runtime", {})
+    if (
+        supplied != canonical_sha256(payload)
+        or document.get("campaign_id")
+        != "oneformer-coco2017-direct-full-ptm-qualification-v4-20260801"
+        or document.get("model") != "oneformer"
+        or document.get("task") != "panoptic_segmentation"
+        or document.get("sqsh") != campaign_contract.FROZEN_SQSH
+        or document.get("search", {}).get("space")
+        != campaign_contract.SEARCH_SPACE
+        or policy.get("version") != 4
+        or policy.get("qualification_campaign_id")
+        != document.get("campaign_id")
+        or policy.get("checkpoint_resume_policy")
+        != campaign_contract.CHECKPOINT_RESUME_POLICY
+        or policy.get("runtime_local_eligibility") is not None
+        or runtime.get("runtime_local_eligibility") is not None
+        or policy.get("qualification_evidence_path")
+        != runtime.get("qualification_evidence_path")
+        or runtime.get("max_job_retries")
+        != campaign_contract.FROZEN_SLURM_RETRY_CAP
+        or policy.get("recovery_checkpoint_ids")
+        != ["oneformer.its.commercial.dinat_large.trainable"]
+        or set(policy.get("reused_checkpoint_ids", []))
+        != {
+            "oneformer.ade20k.research.swin_large.trainable.v1.0",
+            "oneformer.coco.research.swin_large.trainable",
+            "oneformer.its.commercial.swin_large.trainable.v1.0",
+        }
+        or any(document.get("agent_intervention_flags", {}).values())
+    ):
+        raise CampaignExecutionError(
+            "OneFormer v4 qualification successor changed"
+        )
+    campaign_contract.validate_dataset_record(document["dataset"])
+    return document
+
+
+def verify_qualification_local_contract(
+    contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Verify the clean source and every local v4 launcher dependency."""
+    runtime = contract["runtime"]
+    repository = Path(runtime["repository"]).resolve()
+    if (
+        _git(repository, "rev-parse", "HEAD") != runtime["source_commit"]
+        or _git(repository, "status", "--porcelain")
+    ):
+        raise CampaignExecutionError("sealed AutoML source changed")
+    if (
+        _git(Path(runtime["sdk_dir"]), "rev-parse", "HEAD")
+        != runtime["sdk_commit"]
+        or _git(Path(runtime["skills_repository"]), "rev-parse", "HEAD")
+        != runtime["skills_commit"]
+    ):
+        raise CampaignExecutionError("sealed SDK or skills commit changed")
+    here = Path(__file__).resolve().parent
+    identities = {
+        "wheel": (runtime["wheel_path"], runtime["wheel_sha256"]),
+        "ptm_stage": (
+            runtime["ptm_stage_manifest_path"],
+            runtime["ptm_stage_manifest_sha256"],
+        ),
+        "predecessor": (
+            runtime["qualification_predecessor"]["path"],
+            runtime["qualification_predecessor"]["file_sha256"],
+        ),
+        "campaign_contract": (
+            here / "campaign_contract.py",
+            contract["launcher_integrity"]["campaign_contract_sha256"],
+        ),
+        "qualification_campaign": (
+            Path(__file__),
+            contract["launcher_integrity"]["qualification_campaign_sha256"],
+        ),
+        "qualification_successor": (
+            here / "qualification_successor.py",
+            contract["launcher_integrity"]["qualification_successor_sha256"],
+        ),
+        "run_campaign": (
+            here / "run_campaign.py",
+            contract["launcher_integrity"]["run_campaign_sha256"],
+        ),
+        "checkpoint_resume": (
+            here.parent / "checkpoint_resume.py",
+            contract["launcher_integrity"]["checkpoint_resume_sha256"],
+        ),
+    }
+    evidence = {}
+    for name, (path_value, expected_sha) in identities.items():
+        artifact = Path(path_value).resolve()
+        if (
+            not artifact.is_file()
+            or campaign_contract.sha256_file(artifact) != expected_sha
+        ):
+            raise CampaignExecutionError(
+                f"sealed qualification artifact changed: {name}"
+            )
+        evidence[name] = {"path": str(artifact), "sha256": expected_sha}
+    return {
+        "source_commit": runtime["source_commit"],
+        "sdk_commit": runtime["sdk_commit"],
+        "skills_commit": runtime["skills_commit"],
+        "artifacts": evidence,
+    }
+
+
 def _safe_component(value: str) -> str:
     result = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._")
     if not result:
@@ -92,18 +231,24 @@ def _safe_component(value: str) -> str:
 
 def qualification_plan(contract: Mapping[str, Any]) -> dict[str, Any]:
     """Describe the exact GPU-only qualification without submitting it."""
-    checkpoint_ids = [
+    policy = contract["qualification_policy"]
+    checkpoint_ids = policy.get("recovery_checkpoint_ids") or [
         item["id"] for item in contract["ptm_inventory"]["records"]
     ]
+    reused_ids = policy.get("reused_checkpoint_ids", [])
     return {
         "schema_version": 1,
-        "campaign_id": QUALIFICATION_CAMPAIGN_ID,
+        "campaign_id": policy.get(
+            "qualification_campaign_id", QUALIFICATION_CAMPAIGN_ID
+        ),
         "contract_sha256": contract["contract_sha256"],
         "model": "oneformer",
         "task": "panoptic_segmentation",
         "metric": "PQ",
         "checkpoint_ids": checkpoint_ids,
-        "workflow_count": 4,
+        "workflow_count": len(checkpoint_ids),
+        "reused_predecessor_workflow_count": len(reused_ids),
+        "reused_predecessor_checkpoint_ids": sorted(reused_ids),
         "all_workflows_independent": True,
         "all_workflows_concurrent": True,
         "workflow": "full_coco_one_epoch_train_then_standalone_evaluation",
@@ -120,7 +265,12 @@ def qualification_plan(contract: Mapping[str, Any]) -> dict[str, Any]:
         "cpu_model_runs": 0,
         "smoke_model_runs": 0,
         "mini_step_runs": 0,
-        "replacement_workflows_allowed": False,
+        "recovery_scope": (
+            "all_four_original_arms"
+            if not reused_ids
+            else "only_terminal_failed_arm_from_exact_v3_cohort"
+        ),
+        "replacement_workflows_allowed": bool(reused_ids),
         "scheduler_client_constructed": False,
         "jobs_submitted": 0,
         "agent_intervention_flags": {
@@ -299,8 +449,17 @@ def _entrypoint(
         ).read_text(encoding="utf-8")
     )
     action = metadata["actions"][action_name]
+    action_command = action["command"]
+    if action_name == "train":
+        action_command = checkpoint_resume.wrap_train_command(
+            action_command,
+            model_slug="oneformer",
+            decision_filename="oneformer_checkpoint_resume_decision.json",
+            history_directory="oneformer_checkpoint_resume_decisions",
+            trust_checkpoint_on_fresh_start=True,
+        )
     entrypoint = build_entrypoint(
-        command=_gpu_guard(action["command"]),
+        command=_gpu_guard(action_command),
         specs=copy.deepcopy(dict(specification)),
         inputs=action["inputs"],
         outputs=action["outputs"],
@@ -434,6 +593,9 @@ def _execute_workflow(
         "train_spec_sha256": canonical_sha256(train_spec),
         "evaluate_spec_sha256_before_checkpoint": canonical_sha256(
             evaluate_spec
+        ),
+        "checkpoint_resume_policy": copy.deepcopy(
+            campaign_contract.CHECKPOINT_RESUME_POLICY
         ),
     }
     try:
@@ -577,7 +739,7 @@ def _worker(
     workflow_dir = root / "workflows" / _safe_component(checkpoint_id)
     workflow_dir.mkdir(parents=True, exist_ok=True)
     try:
-        contract = load_frozen_v3_contract(contract_path)
+        contract = load_qualification_contract(contract_path)
         run_campaign.configure_slurm_runtime(contract)
         staged = load_ptm_stage(stage_path, contract, verify_remote=False)
         workflow = _execute_workflow(
@@ -593,13 +755,66 @@ def _worker(
     atomic_json(workflow_dir / "workflow_completion.json", workflow)
 
 
+def _predecessor_successes(
+    contract: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Load exact v3 successes reused by the selective v4 recovery."""
+    policy = contract["qualification_policy"]
+    reused_ids = tuple(policy.get("reused_checkpoint_ids", ()))
+    if not reused_ids:
+        return []
+    record = policy.get("predecessor_evidence")
+    if not isinstance(record, Mapping):
+        raise CampaignExecutionError("v4 predecessor evidence is unavailable")
+    path = Path(str(record.get("path", ""))).resolve()
+    if (
+        not path.is_file()
+        or campaign_contract.sha256_file(path) != record.get("file_sha256")
+    ):
+        raise CampaignExecutionError("v3 predecessor evidence changed")
+    document = json.loads(path.read_text(encoding="utf-8"))
+    payload = copy.deepcopy(document)
+    supplied = payload.pop("evidence_sha256", None)
+    if (
+        supplied != canonical_sha256(payload)
+        or supplied != record.get("evidence_sha256")
+    ):
+        raise CampaignExecutionError("v3 predecessor integrity failed")
+    workflows = document.get("workflows")
+    if not isinstance(workflows, list):
+        raise CampaignExecutionError("v3 predecessor workflows are missing")
+    by_id = {
+        item.get("checkpoint_id"): item
+        for item in workflows
+        if isinstance(item, Mapping)
+    }
+    recovery_ids = set(policy.get("recovery_checkpoint_ids", ()))
+    if (
+        set(by_id) != set(reused_ids) | recovery_ids
+        or any(by_id[item].get("status") != "success" for item in reused_ids)
+        or any(
+            by_id[item].get("status") != "failure"
+            or by_id[item].get("terminal") is not True
+            or by_id[item].get("failure_preserved") is not True
+            for item in recovery_ids
+        )
+    ):
+        raise CampaignExecutionError("v3 predecessor cohort changed")
+    return [copy.deepcopy(dict(by_id[item])) for item in sorted(reused_ids)]
+
+
 def build_completion(
     contract: Mapping[str, Any],
     workflows: list[Mapping[str, Any]],
 ) -> dict[str, Any]:
+    policy = contract["qualification_policy"]
+    reused_ids = list(policy.get("reused_checkpoint_ids", []))
+    recovery_ids = list(policy.get("recovery_checkpoint_ids", []))
     value = {
         "schema_version": 1,
-        "campaign_id": QUALIFICATION_CAMPAIGN_ID,
+        "campaign_id": policy.get(
+            "qualification_campaign_id", QUALIFICATION_CAMPAIGN_ID
+        ),
         "model": "oneformer",
         "task": "panoptic_segmentation",
         "metric": "PQ",
@@ -629,7 +844,20 @@ def build_completion(
         "cpu_model_runs": 0,
         "smoke_model_runs": 0,
         "mini_step_runs": 0,
-        "replacement_workflows_submitted": False,
+        "replacement_workflows_submitted": bool(recovery_ids),
+        "replacement_workflow_count": len(recovery_ids),
+        "reused_predecessor_workflow_count": len(reused_ids),
+        "reused_predecessor_checkpoint_ids": sorted(reused_ids),
+        "recovery_checkpoint_ids": sorted(recovery_ids),
+        "checkpoint_resume_policy": copy.deepcopy(
+            policy.get(
+                "checkpoint_resume_policy",
+                campaign_contract.CHECKPOINT_RESUME_POLICY,
+            )
+        ),
+        "predecessor_evidence": copy.deepcopy(
+            policy.get("predecessor_evidence")
+        ),
         "workflows": [copy.deepcopy(dict(item)) for item in workflows],
     }
     value["evidence_sha256"] = canonical_sha256(value)
@@ -643,7 +871,8 @@ def launch(
     runtime_root: Path,
     env_path: Path,
 ) -> dict[str, Any]:
-    contract = load_frozen_v3_contract(contract_path)
+    contract = load_qualification_contract(contract_path)
+    policy = contract["qualification_policy"]
     expected_stage = Path(
         contract["qualification_policy"]["ptm_stage_manifest_path"]
     ).resolve()
@@ -664,7 +893,11 @@ def launch(
         )
     run_campaign.load_env_file(env_path)
     run_campaign.configure_slurm_runtime(contract)
-    local = run_campaign.verify_local_contract(contract)
+    local = (
+        verify_qualification_local_contract(contract)
+        if policy.get("version") == 4
+        else run_campaign.verify_local_contract(contract)
+    )
     dataset = run_campaign._verify_dataset_remote(contract)
     sqsh = run_campaign._remote_file_identity(contract["sqsh"]["path"])
     if (
@@ -675,6 +908,21 @@ def launch(
     overlay = run_campaign._verify_runtime_overlay_remote(contract)
     staged = load_ptm_stage(stage_path, contract, verify_remote=True)
     runtime_root.mkdir(parents=True, exist_ok=True)
+    recovery_ids = sorted(
+        policy.get("recovery_checkpoint_ids") or staged
+    )
+    if not recovery_ids or not set(recovery_ids).issubset(staged):
+        raise CampaignExecutionError(
+            "sealed recovery checkpoint set is invalid"
+        )
+    predecessor_successes = _predecessor_successes(contract)
+    if (
+        policy.get("version") == 4
+        and len(predecessor_successes) + len(recovery_ids) != len(staged)
+    ):
+        raise CampaignExecutionError(
+            "v4 reused and recovery arms do not cover the exact PTM cohort"
+        )
     atomic_json(
         runtime_root / "submission_provenance.json",
         {
@@ -687,7 +935,11 @@ def launch(
             "dataset": dataset,
             "sqsh": sqsh,
             "runtime_overlay": overlay,
-            "checkpoint_ids": sorted(staged),
+            "staged_checkpoint_ids": sorted(staged),
+            "submitted_checkpoint_ids": recovery_ids,
+            "reused_predecessor_checkpoint_ids": sorted(
+                item["checkpoint_id"] for item in predecessor_successes
+            ),
             "nodes_per_job": 1,
             "gpus_per_job": 8,
             "cpu_model_runs": 0,
@@ -709,18 +961,18 @@ def launch(
             ),
             name=f"oneformer-{_safe_component(checkpoint_id)}",
         )
-        for checkpoint_id in sorted(staged)
+        for checkpoint_id in recovery_ids
     }
-    if len(processes) != 4:
+    if set(processes) != set(recovery_ids):
         raise CampaignExecutionError(
-            "qualification must create exactly four independent workers"
+            "qualification workers differ from the sealed recovery set"
         )
     for process in processes.values():
         process.start()
     for process in processes.values():
         process.join()
 
-    workflows = []
+    workflows = list(predecessor_successes)
     for checkpoint_id, process in processes.items():
         path = (
             runtime_root
@@ -739,7 +991,19 @@ def launch(
                     diagnostics={"worker_exit_code": process.exitcode},
                 )
             )
-    completion = build_completion(contract, workflows)
+    by_id = {
+        item.get("checkpoint_id"): item
+        for item in workflows
+        if isinstance(item, Mapping)
+    }
+    if set(by_id) != set(staged) or len(workflows) != len(staged):
+        raise CampaignExecutionError(
+            "completion does not preserve exactly one workflow per PTM"
+        )
+    completion = build_completion(
+        contract,
+        [by_id[checkpoint_id] for checkpoint_id in sorted(by_id)],
+    )
     atomic_json(expected_completion, completion)
     return completion
 
@@ -757,7 +1021,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--launch", action="store_true")
     args = parser.parse_args(argv)
 
-    contract = load_frozen_v3_contract(args.contract.resolve())
+    contract = load_qualification_contract(args.contract.resolve())
     if not args.launch:
         print(json.dumps(qualification_plan(contract), indent=2, sort_keys=True))
         return 0
