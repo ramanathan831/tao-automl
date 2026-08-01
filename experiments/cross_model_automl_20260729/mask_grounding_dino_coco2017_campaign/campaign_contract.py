@@ -736,7 +736,10 @@ def build_preregistered_contract(
         },
         "qualification_policy": {
             "version": FROZEN_QUALIFICATION_VERSION,
-            "kind": "direct_full_gpu_train_eval_then_supported_registry",
+            "kind": (
+                "direct_full_gpu_train_eval_then_evidence_bound_runtime_"
+                "eligibility"
+            ),
             "cpu_model_runs": 0,
             "smoke_model_runs": 0,
             "mini_step_runs": 0,
@@ -747,6 +750,9 @@ def build_preregistered_contract(
             "standalone_evaluation": True,
             "required_metric": "segm_val_mAP50_95",
             "registry_bypass_allowed": False,
+            "runtime_local_eligibility": copy.deepcopy(
+                runtime["runtime_local_eligibility"]
+            ),
             "qualification_evidence_path": runtime[
                 "qualification_evidence_path"
             ],
@@ -797,9 +803,9 @@ def build_preregistered_contract(
             "ptm_representation": "hierarchical_nonordinal_arms",
             "single_arm_is_not_ordinal_encoding": True,
             "ptm_policy_by_mode": {
-                "accuracy": "all_runtime_supported",
-                "latency": "all_runtime_supported",
-                "multi_objective": "all_runtime_supported",
+                "accuracy": "all_runtime_eligible",
+                "latency": "all_runtime_eligible",
+                "multi_objective": "all_runtime_eligible",
             },
         },
         "validation_sanity_gate": {
@@ -892,6 +898,10 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
             "predecessor_failure_evidence"
         )
         != value.get("runtime", {}).get("predecessor_failure_evidence")
+        or value.get("qualification_policy", {}).get(
+            "runtime_local_eligibility"
+        )
+        != value.get("runtime", {}).get("runtime_local_eligibility")
     ):
         raise CampaignContractError("campaign execution policy changed")
     validate_dataset_record(value["dataset"])
@@ -900,6 +910,7 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
     runtime = value.get("runtime", {})
     search = value.get("search", {})
     predecessor = runtime.get("predecessor_failure_evidence", {})
+    runtime_eligibility = runtime.get("runtime_local_eligibility", {})
     if (
         not isinstance(predecessor, Mapping)
         or not isinstance(predecessor.get("path"), str)
@@ -912,6 +923,80 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
     ):
         raise CampaignContractError(
             "preserved v1 qualification evidence contract changed"
+        )
+    if (
+        not isinstance(runtime_eligibility, Mapping)
+        or runtime_eligibility.get("schema_version") != 2
+        or runtime_eligibility.get("kind")
+        != "direct_full_gpu_qualification_runtime_local_v2"
+        or runtime_eligibility.get("enabled") is not True
+        or runtime_eligibility.get("scope")
+        != "campaign_local_in_memory_projection"
+        or runtime_eligibility.get("model") != "mask_grounding_dino"
+        or runtime_eligibility.get("task")
+        != "category_prompted_grounded_instance_segmentation"
+        or runtime_eligibility.get("tao_version") != "7.1.0"
+        or runtime_eligibility.get("container_sha256")
+        != FROZEN_SQSH["sha256"]
+        or runtime_eligibility.get("base_registry_sha256")
+        != value.get("ptm_inventory", {}).get("registry_sha256")
+        or runtime_eligibility.get("base_registry_version")
+        != value.get("ptm_inventory", {}).get("registry_version")
+        or runtime_eligibility.get("eligibility_source_commit")
+        != runtime.get("source_commit")
+        or runtime_eligibility.get("wheel_sha256")
+        != runtime.get("wheel_sha256")
+        or runtime_eligibility.get("sdk_commit")
+        != runtime.get("sdk_commit")
+        or runtime_eligibility.get("skills_commit")
+        != runtime.get("skills_commit")
+        or any(
+            runtime_eligibility.get(name) is not False
+            for name in (
+                "repository_registry_mutation_allowed",
+                "failed_arm_promotion_allowed",
+                "unsupported_arm_promotion_allowed",
+                "agent_override_allowed",
+            )
+        )
+        or any(
+            not isinstance(runtime_eligibility.get(name), str)
+            or len(runtime_eligibility[name]) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in runtime_eligibility[name]
+            )
+            for name in (
+                "base_registry_sha256",
+                "qualification_file_sha256",
+                "qualification_evidence_sha256",
+                "qualification_contract_sha256",
+                "qualification_campaign_sha256",
+                "wheel_sha256",
+            )
+        )
+        or not isinstance(
+            runtime_eligibility.get("eligibility_source_commit"), str
+        )
+        or len(runtime_eligibility["eligibility_source_commit"]) != 40
+        or any(
+            character not in "0123456789abcdef"
+            for character in runtime_eligibility[
+                "eligibility_source_commit"
+            ]
+        )
+        or any(
+            not isinstance(runtime_eligibility.get(name), str)
+            or len(runtime_eligibility[name]) != 40
+            or any(
+                character not in "0123456789abcdef"
+                for character in runtime_eligibility[name]
+            )
+            for name in ("sdk_commit", "skills_commit")
+        )
+    ):
+        raise CampaignContractError(
+            "runtime-local PTM eligibility contract changed"
         )
     if (
         value.get("ptm_inventory") != mask_grounding_dino_registry_snapshot()

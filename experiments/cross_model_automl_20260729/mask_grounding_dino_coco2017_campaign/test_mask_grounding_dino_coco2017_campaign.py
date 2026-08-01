@@ -56,6 +56,7 @@ def _dataset() -> dict:
 
 
 def _runtime(tmp_path: Path) -> dict:
+    registry = campaign_contract.mask_grounding_dino_registry_snapshot()
     return {
         "repository": str(Path(__file__).resolve().parents[3]),
         "source_commit": "c" * 40,
@@ -70,6 +71,30 @@ def _runtime(tmp_path: Path) -> dict:
         "qualification_evidence_path": str(
             tmp_path / "qualification.json"
         ),
+        "runtime_local_eligibility": {
+            "schema_version": 2,
+            "kind": "direct_full_gpu_qualification_runtime_local_v2",
+            "enabled": True,
+            "scope": "campaign_local_in_memory_projection",
+            "model": "mask_grounding_dino",
+            "task": "category_prompted_grounded_instance_segmentation",
+            "tao_version": "7.1.0",
+            "container_sha256": campaign_contract.FROZEN_SQSH["sha256"],
+            "base_registry_version": registry["registry_version"],
+            "base_registry_sha256": registry["registry_sha256"],
+            "qualification_file_sha256": "1" * 64,
+            "qualification_evidence_sha256": "2" * 64,
+            "qualification_contract_sha256": "3" * 64,
+            "qualification_campaign_sha256": "4" * 64,
+            "eligibility_source_commit": "c" * 40,
+            "wheel_sha256": manifest_generator.EXPECTED_WHEEL_SHA256,
+            "sdk_commit": manifest_generator.EXPECTED_SDK_COMMIT,
+            "skills_commit": manifest_generator.EXPECTED_SKILLS_COMMIT,
+            "repository_registry_mutation_allowed": False,
+            "failed_arm_promotion_allowed": False,
+            "unsupported_arm_promotion_allowed": False,
+            "agent_override_allowed": False,
+        },
         "predecessor_failure_evidence": {
             "path": str(tmp_path / "qualification_v1.json"),
             "sha256": "9" * 64,
@@ -258,6 +283,86 @@ def _qualification_document(
     }
     value["evidence_sha256"] = canonical_sha256(value)
     return value
+
+
+def _seal_runtime_local_qualification(
+    contract: dict,
+    tmp_path: Path,
+    checkpoint_id: str,
+) -> tuple[dict, Path]:
+    snapshot = campaign_contract.mask_grounding_dino_registry_snapshot()
+    stage_path = tmp_path / "ptms.json"
+    stage_path.write_text(
+        json.dumps(
+            {
+                "checkpoints": [
+                    {
+                        "id": item["id"],
+                        "path": f"/lustre/ptms/{item['id']}.pth",
+                        "size_bytes": item["expected_size_bytes"],
+                        "sha256": (
+                            "a" * 64
+                            if item["id"] == checkpoint_id
+                            else (item.get("sha256") or "e" * 64)
+                        ),
+                    }
+                    for item in snapshot["records"]
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    stage_sha = campaign_contract.sha256_file(stage_path)
+    document = _qualification_document(checkpoint_id)
+    document["ptm_stage_manifest_path"] = str(stage_path)
+    document["ptm_stage_manifest_sha256"] = stage_sha
+    document["predecessor_failure_evidence"] = copy.deepcopy(
+        contract["runtime"]["predecessor_failure_evidence"]
+    )
+    document["evidence_sha256"] = canonical_sha256(
+        {
+            key: value
+            for key, value in document.items()
+            if key != "evidence_sha256"
+        }
+    )
+    qualification_path = tmp_path / "qualification.json"
+    qualification_path.write_text(json.dumps(document), encoding="utf-8")
+
+    sealed = copy.deepcopy(contract)
+    sealed.pop("contract_sha256")
+    sealed["runtime"]["ptm_stage_manifest_path"] = str(stage_path)
+    sealed["runtime"]["ptm_stage_manifest_sha256"] = stage_sha
+    sealed["qualification_policy"]["ptm_stage_manifest_path"] = str(
+        stage_path
+    )
+    policy = copy.deepcopy(
+        sealed["runtime"]["runtime_local_eligibility"]
+    )
+    policy.update(
+        {
+            "base_registry_version": snapshot["registry_version"],
+            "base_registry_sha256": snapshot["registry_sha256"],
+            "qualification_file_sha256": (
+                campaign_contract.sha256_file(qualification_path)
+            ),
+            "qualification_evidence_sha256": document[
+                "evidence_sha256"
+            ],
+            "qualification_contract_sha256": document[
+                "qualification_contract_sha256"
+            ],
+            "qualification_campaign_sha256": document[
+                "qualification_campaign_sha256"
+            ],
+        }
+    )
+    sealed["runtime"]["runtime_local_eligibility"] = copy.deepcopy(policy)
+    sealed["qualification_policy"]["runtime_local_eligibility"] = (
+        copy.deepcopy(policy)
+    )
+    sealed["contract_sha256"] = canonical_sha256(sealed)
+    return campaign_contract.validate_contract(sealed), qualification_path
 
 
 def test_exact_tao_identifier_actions_and_task_correct_metric():
@@ -704,6 +809,93 @@ def test_qualification_can_precede_registry_promotion_without_bypass(
         and item["code"] == "registry_not_supported"
         for item in decision.blockers
     )
+
+
+def test_sealed_runtime_local_eligibility_projects_only_exact_success(
+    contract,
+    tmp_path: Path,
+):
+    checkpoint_id = (
+        "mask_grounding_dino.commercial.swin_tiny.trainable.v1.0"
+    )
+    sealed, qualification_path = _seal_runtime_local_qualification(
+        contract,
+        tmp_path,
+        checkpoint_id,
+    )
+    base = load_ptm_registry()
+    assert base.checkpoint(checkpoint_id)["status"] == "unverified"
+
+    decision = audit_qualification(
+        qualification_path,
+        expected_contract=sealed,
+    )
+
+    assert decision.runtime_ready is True
+    assert decision.checkpoint_ids == (checkpoint_id,)
+    assert len(decision.exclusions) == 3
+    assert decision.blockers == ()
+    assert decision.runtime_registry.checkpoint(checkpoint_id)["status"] == (
+        "supported"
+    )
+    assert load_ptm_registry().checkpoint(checkpoint_id)["status"] == (
+        "unverified"
+    )
+    eligibility = decision.runtime_eligibility
+    assert eligibility["schema_version"] == 2
+    assert eligibility["scope"] == "campaign_local_in_memory_projection"
+    assert eligibility["repository_registry_mutated"] is False
+    assert eligibility["failed_arms_preserved"] is True
+    assert eligibility["qualified_checkpoint_ids"] == [checkpoint_id]
+    transformation = eligibility["transformations"][0]
+    assert transformation["checkpoint_id"] == checkpoint_id
+    assert transformation["action"] == "qualify_exact_unverified_identity"
+    assert transformation["base_status"] == "unverified"
+    assert transformation["projected_status"] == "supported"
+    assert transformation["base_record_sha256"] == eligibility[
+        "base_record_sha256_by_checkpoint_id"
+    ][checkpoint_id]
+    assert set(eligibility["unchanged_checkpoint_ids"]) == (
+        set(eligibility["base_record_sha256_by_checkpoint_id"])
+        - {checkpoint_id}
+    )
+    assert decision.runtime_registry.document_sha256 == eligibility[
+        "projected_registry_sha256"
+    ]
+
+
+def test_runtime_local_eligibility_fails_closed_on_evidence_hash_change(
+    contract,
+    tmp_path: Path,
+):
+    checkpoint_id = (
+        "mask_grounding_dino.commercial.swin_tiny.trainable.v1.0"
+    )
+    sealed, qualification_path = _seal_runtime_local_qualification(
+        contract,
+        tmp_path,
+        checkpoint_id,
+    )
+    changed = copy.deepcopy(sealed)
+    changed.pop("contract_sha256")
+    for location in (
+        changed["runtime"],
+        changed["qualification_policy"],
+    ):
+        location["runtime_local_eligibility"][
+            "qualification_file_sha256"
+        ] = "f" * 64
+    changed["contract_sha256"] = canonical_sha256(changed)
+    changed = campaign_contract.validate_contract(changed)
+
+    with pytest.raises(
+        QualificationGateError,
+        match="exact base registry and qualification evidence",
+    ):
+        audit_qualification(
+            qualification_path,
+            expected_contract=changed,
+        )
 
 
 def test_direct_full_qualification_plan_is_plan_only(contract):
