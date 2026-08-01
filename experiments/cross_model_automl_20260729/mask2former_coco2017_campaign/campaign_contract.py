@@ -151,6 +151,76 @@ FROZEN_WALLTIME_POLICY = {
         "8-hour request was rejected because polar3 has a 4-hour limit"
     ),
 }
+FROZEN_V3_QUALIFICATION_CONTRACT = {
+    "path": (
+        "/localhome/local-rarunachalam/.tao/artifacts/"
+        "cross_model_automl_20260729/"
+        "mask2former_coco2017_three_mode_v3/campaign.v3.json"
+    ),
+    "file_sha256": (
+        "e14545fb0b8ff2d0553e2e04192280f0c381476387056edfa6578c3aad1022c0"
+    ),
+    "contract_sha256": (
+        "5c13acc93ab1fa1e88511ff053a963a023b4d59ded17951fa3af86b0a9efa1e4"
+    ),
+    "source_commit": "67670fd9727bd06e99d0c651f249f8ba65c051a4",
+    "wheel_sha256": (
+        "3463187cb76ec3d07c64a21eaf34140e56bf251b46e56ce3c89c33728ee22784"
+    ),
+    "sdk_commit": "a2e50d0930c3e3785b4b39fa8c3da88b39ff89e5",
+    "skills_commit": "2e9c1b25f3c7cb1ae444c75652e36c47eace8229",
+    "registry_version": "1.5.0",
+    "registry_sha256": (
+        "8d40ebde0eec2b7c53f4c698285146c44056d3cc2560ce481cc57b6375b25f74"
+    ),
+    "qualification_campaign_sha256": (
+        "465eb7f496a17696fb9eca43d59095d394ef7dcf59c6563bf268dbd8063a653a"
+    ),
+    "qualification_campaign_id": (
+        "mask2former-coco2017-direct-full-qualification-v3-20260801"
+    ),
+    "qualification_evidence_path": (
+        "/localhome/local-rarunachalam/.tao/artifacts/"
+        "cross_model_automl_20260729/"
+        "mask2former_coco2017_ptm_qualification_v3/completion.json"
+    ),
+    "ptm_stage_manifest_path": (
+        "/localhome/local-rarunachalam/.tao/artifacts/"
+        "cross_model_automl_20260729/"
+        "mask2former_coco2017_ptm_qualification_v1/ptm_stage_manifest.json"
+    ),
+    "ptm_stage_manifest_sha256": (
+        "3d51ad23d237b8472ebff629dc9ceb7909123c462683f899f4eabb6f4cc3166e"
+    ),
+    "ptm_stage_content_sha256": (
+        "141d14f9b11e3cf81c087d7d05f4e054c885ced1be18554f9832e0cbc9b28bcc"
+    ),
+    "runtime_overlay": runtime_overlay.contract_record(),
+    "walltime_policy": copy.deepcopy(FROZEN_WALLTIME_POLICY),
+}
+SUCCESSOR_WALLTIME_POLICY = {
+    **copy.deepcopy(FROZEN_WALLTIME_POLICY),
+    "contract_revision": "automl_runtime_v4",
+    "supersedes": "qualification_runtime_v3",
+    "checkpoint_resume_policy": (
+        "same_job_exact_epoch_step_max_with_history_v2"
+    ),
+    "resume_decision_history_directory": (
+        "mask2former_checkpoint_resume_decisions"
+    ),
+    "resume_decision_history_pattern": (
+        "slurm_job_{slurm_job_id}_restart_{restart_count:04d}.json"
+    ),
+    "slurm_restart_count_environment": "SLURM_RESTART_COUNT",
+    "timeout_requeue_cap_environment": "SLURM_MAX_JOB_RETRIES",
+    "max_timeout_requeues": FROZEN_SLURM_RETRY_CAP,
+    "post_requeue_missing_checkpoint_behavior": "fail_closed",
+    "first_post_requeue_decision_recorded": True,
+    "resume_history_overwrite_allowed": False,
+    "retry_policy_changed": False,
+    "retry_policy_implementation_corrected": True,
+    "qualification_runtime_v3_evidence_preserved": True,
+}
 LATENCY_PROTOCOL = {
     "warmup_iterations": 50,
     "timed_iterations": 100,
@@ -214,6 +284,133 @@ def _finite_fraction(value: Any, name: str) -> float:
     if not math.isfinite(number) or not 0.0 < number <= 1.0:
         raise CampaignContractError(f"{name} must be finite in (0, 1]")
     return number
+
+
+def _is_lower_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def validate_runtime_local_eligibility(
+    value: Any,
+    *,
+    runtime: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the exact v3-evidence-bound in-memory registry policy."""
+    if not isinstance(value, Mapping):
+        raise CampaignContractError(
+            "runtime-local PTM eligibility policy is unavailable"
+        )
+    policy = copy.deepcopy(dict(value))
+    frozen = FROZEN_V3_QUALIFICATION_CONTRACT
+    expected_records = {
+        record["id"]: record["registry_record_sha256"]
+        for record in snapshot["records"]
+    }
+    required_false = (
+        "repository_registry_mutation_allowed",
+        "projection_persisted_as_global_registry",
+        "failed_arm_promotion_allowed",
+        "unsupported_arm_promotion_allowed",
+        "agent_override_allowed",
+    )
+    if (
+        policy.get("schema_version") != 2
+        or policy.get("kind")
+        != "direct_full_gpu_qualification_runtime_local_v2"
+        or policy.get("enabled") is not True
+        or policy.get("scope") != "campaign_local_in_memory_projection"
+        or policy.get("model") != "mask2former"
+        or policy.get("task") != "instance_segmentation"
+        or policy.get("tao_version") != "7.1.0"
+        or policy.get("container_sha256") != FROZEN_SQSH["sha256"]
+        or policy.get("base_registry_version")
+        != snapshot["registry_version"]
+        or policy.get("base_registry_sha256")
+        != snapshot["registry_sha256"]
+        or policy.get("base_record_sha256_by_checkpoint_id")
+        != expected_records
+        or policy.get("qualification_path")
+        != frozen["qualification_evidence_path"]
+        or policy.get("qualification_path")
+        != runtime.get("qualification_evidence_path")
+        or policy.get("qualification_contract_path") != frozen["path"]
+        or policy.get("qualification_contract_file_sha256")
+        != frozen["file_sha256"]
+        or policy.get("qualification_contract_sha256")
+        != frozen["contract_sha256"]
+        or policy.get("qualification_source_commit")
+        != frozen["source_commit"]
+        or policy.get("qualification_source_wheel_sha256")
+        != frozen["wheel_sha256"]
+        or policy.get("qualification_source_sdk_commit")
+        != frozen["sdk_commit"]
+        or policy.get("qualification_source_skills_commit")
+        != frozen["skills_commit"]
+        or policy.get("qualification_campaign_sha256")
+        != frozen["qualification_campaign_sha256"]
+        or policy.get("qualification_campaign_id")
+        != frozen["qualification_campaign_id"]
+        or policy.get("ptm_stage_manifest_path")
+        != frozen["ptm_stage_manifest_path"]
+        or policy.get("ptm_stage_manifest_sha256")
+        != frozen["ptm_stage_manifest_sha256"]
+        or policy.get("ptm_stage_content_sha256")
+        != frozen["ptm_stage_content_sha256"]
+        or policy.get("qualification_runtime_overlay")
+        != frozen["runtime_overlay"]
+        or policy.get("qualification_walltime_policy")
+        != frozen["walltime_policy"]
+        or policy.get("eligibility_source_commit")
+        != runtime.get("source_commit")
+        or policy.get("wheel_sha256") != runtime.get("wheel_sha256")
+        or policy.get("sdk_commit") != runtime.get("sdk_commit")
+        or policy.get("skills_commit") != runtime.get("skills_commit")
+        or any(policy.get(name) is not False for name in required_false)
+        or any(
+            not _is_lower_sha256(policy.get(name))
+            for name in (
+                "base_registry_sha256",
+                "qualification_file_sha256",
+                "qualification_evidence_sha256",
+                "qualification_contract_file_sha256",
+                "qualification_contract_sha256",
+                "qualification_source_wheel_sha256",
+                "qualification_campaign_sha256",
+                "ptm_stage_manifest_sha256",
+                "ptm_stage_content_sha256",
+                "wheel_sha256",
+            )
+        )
+    ):
+        raise CampaignContractError(
+            "runtime-local PTM eligibility contract changed"
+        )
+    for name in (
+        "qualification_source_commit",
+        "qualification_source_sdk_commit",
+        "qualification_source_skills_commit",
+        "eligibility_source_commit",
+        "sdk_commit",
+        "skills_commit",
+    ):
+        commit = policy.get(name)
+        if (
+            not isinstance(commit, str)
+            or len(commit) != 40
+            or any(
+                character not in "0123456789abcdef"
+                for character in commit
+            )
+        ):
+            raise CampaignContractError(
+                f"runtime-local eligibility {name} is not a Git commit"
+            )
+    return policy
 
 
 def mask2former_registry_snapshot() -> dict[str, Any]:
@@ -560,6 +757,18 @@ def build_preregistered_contract(
         runtime_record.get("tao_pytorch_overlay", {})
     )
     if (
+        runtime_record.get("tao_pytorch_overlay")
+        != runtime_overlay.successor_contract_record()
+    ):
+        raise CampaignContractError(
+            "successor must use the project-Lustre runtime overlay"
+        )
+    runtime_local_eligibility = validate_runtime_local_eligibility(
+        runtime_record.get("runtime_local_eligibility"),
+        runtime=runtime_record,
+        snapshot=ptm_inventory,
+    )
+    if (
         runtime_record.get("partition") != FROZEN_SLURM_PARTITION
         or runtime_record.get("time_hours") != FROZEN_SLURM_TIME_HOURS
         or runtime_record.get("timeout_hours")
@@ -567,13 +776,15 @@ def build_preregistered_contract(
         or runtime_record.get("use_requeue")
         is not FROZEN_SLURM_USE_REQUEUE
         or runtime_record.get("walltime_policy")
-        != FROZEN_WALLTIME_POLICY
+        != SUCCESSOR_WALLTIME_POLICY
+        or runtime_record.get("max_job_retries")
+        != FROZEN_SLURM_RETRY_CAP
     ):
         raise CampaignContractError(
-            "runtime must use the frozen v3 requeue/resume policy"
+            "runtime must use the bounded v4 requeue/resume policy"
         )
     value = {
-        "schema_version": 1,
+        "schema_version": 2,
         "campaign_id": campaign_id,
         "model": "mask2former",
         "network_arch": "mask2former",
@@ -600,7 +811,10 @@ def build_preregistered_contract(
             "failure_policy": "fail_closed_without_coco_mask_ap",
         },
         "qualification_policy": {
-            "kind": "direct_full_gpu_train_eval_then_supported_registry",
+            "kind": (
+                "direct_full_gpu_train_eval_then_evidence_bound_runtime_"
+                "eligibility"
+            ),
             "cpu_model_runs": 0,
             "smoke_model_runs": 0,
             "mini_step_runs": 0,
@@ -616,6 +830,9 @@ def build_preregistered_contract(
                 "canonical_metric": "segm_val_mAP",
             },
             "registry_bypass_allowed": False,
+            "runtime_local_eligibility": copy.deepcopy(
+                runtime_local_eligibility
+            ),
             "qualification_evidence_path": runtime[
                 "qualification_evidence_path"
             ],
@@ -641,8 +858,11 @@ def build_preregistered_contract(
                 FROZEN_CHECKPOINT_INTERVAL_EPOCHS
             ),
             "checkpoint_resume_policy": (
-                "same_job_exact_epoch_step_max_v1"
+                "same_job_exact_epoch_step_max_with_history_v2"
             ),
+            "timeout_requeue_cap": FROZEN_SLURM_RETRY_CAP,
+            "timeout_requeue_cap_environment": "SLURM_MAX_JOB_RETRIES",
+            "resume_decision_history": True,
         },
         "search": {
             "algorithm": "bayesian",
@@ -727,7 +947,8 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
         for mode in MODES
     ]
     if (
-        not isinstance(campaign_id, str)
+        value.get("schema_version") != 2
+        or not isinstance(campaign_id, str)
         or not campaign_id
         or value.get("model") != "mask2former"
         or value.get("network_arch") != "mask2former"
@@ -755,7 +976,15 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
         or value.get("execution", {}).get(
             "checkpoint_resume_policy"
         )
-        != "same_job_exact_epoch_step_max_v1"
+        != "same_job_exact_epoch_step_max_with_history_v2"
+        or value.get("execution", {}).get("timeout_requeue_cap")
+        != FROZEN_SLURM_RETRY_CAP
+        or value.get("execution", {}).get(
+            "timeout_requeue_cap_environment"
+        )
+        != "SLURM_MAX_JOB_RETRIES"
+        or value.get("execution", {}).get("resume_decision_history")
+        is not True
         or value.get("search", {}).get("space") != SEARCH_SPACE
         or value.get("modes") != expected_modes
         or value.get("metric_contract", {}).get(
@@ -793,6 +1022,10 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
             "ptm_stage_manifest_path"
         )
         != value.get("runtime", {}).get("ptm_stage_manifest_path")
+        or value.get("qualification_policy", {}).get(
+            "runtime_local_eligibility"
+        )
+        != value.get("runtime", {}).get("runtime_local_eligibility")
     ):
         raise CampaignContractError("campaign execution policy changed")
     validate_dataset_record(value["dataset"])
@@ -803,18 +1036,32 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
         runtime.get("tao_pytorch_overlay", {})
     )
     if (
+        runtime.get("tao_pytorch_overlay")
+        != runtime_overlay.successor_contract_record()
+    ):
+        raise CampaignContractError(
+            "successor must use the project-Lustre runtime overlay"
+        )
+    snapshot = mask2former_registry_snapshot()
+    validate_runtime_local_eligibility(
+        runtime.get("runtime_local_eligibility"),
+        runtime=runtime,
+        snapshot=snapshot,
+    )
+    if (
         runtime.get("partition") != FROZEN_SLURM_PARTITION
         or runtime.get("time_hours") != FROZEN_SLURM_TIME_HOURS
         or runtime.get("timeout_hours") != FROZEN_SLURM_TIMEOUT_HOURS
         or runtime.get("use_requeue") is not FROZEN_SLURM_USE_REQUEUE
-        or runtime.get("walltime_policy") != FROZEN_WALLTIME_POLICY
+        or runtime.get("walltime_policy") != SUCCESSOR_WALLTIME_POLICY
+        or runtime.get("max_job_retries") != FROZEN_SLURM_RETRY_CAP
     ):
         raise CampaignContractError(
-            "runtime must use the frozen v3 requeue/resume policy"
+            "runtime must use the bounded v4 requeue/resume policy"
         )
     search = value.get("search", {})
     if (
-        value.get("ptm_inventory") != mask2former_registry_snapshot()
+        value.get("ptm_inventory") != snapshot
         or value.get("latency_protocol") != LATENCY_PROTOCOL
         or search.get("algorithm") != "bayesian"
         or search.get("implementation")
@@ -899,7 +1146,9 @@ __all__ = [
     "FROZEN_TEST_MAX_SIZE",
     "FROZEN_TRAINING_EPOCHS",
     "FROZEN_VALIDATION_SANITY_MIN_MASK_AP",
+    "FROZEN_V3_QUALIFICATION_CONTRACT",
     "FROZEN_WALLTIME_POLICY",
+    "SUCCESSOR_WALLTIME_POLICY",
     "LATENCY_PROTOCOL",
     "MODES",
     "SEARCH_PARAMETERS",
@@ -915,4 +1164,5 @@ __all__ = [
     "validate_contract",
     "validate_dataset_record",
     "validate_packaged_train_schema",
+    "validate_runtime_local_eligibility",
 ]

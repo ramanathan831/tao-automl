@@ -18,6 +18,12 @@ OVERLAY_DIRECTORY = (
     "tao-pytorch-overlays/mask2former-instance-ap/"
     "c2e86fe1646ebe89fc280083797dcc544ce88322"
 )
+SUCCESSOR_OVERLAY_DIRECTORY = (
+    "/lustre/fsw/portfolios/edgeai/projects/"
+    "edgeai_tao-ptm_image-foundation-model-clip/users/rarunachalam/"
+    "tao-pytorch-overlays/mask2former-instance-ap/"
+    "c2e86fe1646ebe89fc280083797dcc544ce88322"
+)
 ARCHIVE_NAME = "tao-pytorch-mask2former-instance-ap-c2e86fe1646e.tar"
 ARCHIVE_SHA256 = (
     "c395474592d557e0179066c1f99d5cb8f352e10e501621d57043782440dea8c2"
@@ -87,12 +93,25 @@ def contract_record() -> dict[str, Any]:
     }
 
 
+def successor_contract_record() -> dict[str, Any]:
+    """Return the identical overlay staged in the user's project namespace."""
+    value = contract_record()
+    value["directory"] = SUCCESSOR_OVERLAY_DIRECTORY
+    value["archive"]["path"] = (
+        f"{SUCCESSOR_OVERLAY_DIRECTORY}/{ARCHIVE_NAME}"
+    )
+    value["installer"]["path"] = (
+        f"{SUCCESSOR_OVERLAY_DIRECTORY}/{INSTALLER_NAME}"
+    )
+    return value
+
+
 def validate_contract_record(record: Mapping[str, Any]) -> dict[str, Any]:
     """Reject any unsealed archive, installer, commit, or injection policy."""
     if not isinstance(record, Mapping):
         raise RuntimeOverlayError("runtime overlay must be a mapping")
     value = copy.deepcopy(dict(record))
-    if value != contract_record():
+    if value not in (contract_record(), successor_contract_record()):
         raise RuntimeOverlayError(
             "Mask2Former runtime overlay differs from the sealed contract"
         )

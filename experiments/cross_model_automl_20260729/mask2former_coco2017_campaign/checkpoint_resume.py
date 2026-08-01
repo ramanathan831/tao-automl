@@ -29,6 +29,7 @@ CHECKPOINT_PATTERN = re.compile(
     r"^model_epoch_(?P<epoch>[0-9]+)_step_(?P<step>[0-9]+)[.]pth$"
 )
 DECISION_FILENAME = "mask2former_checkpoint_resume_decision.json"
+DECISION_HISTORY_DIRECTORY = "mask2former_checkpoint_resume_decisions"
 TRUSTED_CHECKPOINT_ENV = "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"
 
 
@@ -63,6 +64,63 @@ def _checkpoint_identity(path: Path) -> dict[str, Any] | None:
         "step": int(match.group("step")),
         "size_bytes": size,
     }
+
+
+def _slurm_restart_count() -> int:
+    raw = os.environ.get("SLURM_RESTART_COUNT", "0")
+    if not raw or not raw.isdecimal():
+        raise CheckpointResumeError(
+            "SLURM_RESTART_COUNT must be a non-negative decimal integer"
+        )
+    value = int(raw, 10)
+    if value < 0:
+        raise CheckpointResumeError(
+            "SLURM_RESTART_COUNT must be a non-negative decimal integer"
+        )
+    return value
+
+
+def _safe_history_component(value: str, name: str) -> str:
+    if not value or re.fullmatch(r"[A-Za-z0-9._-]+", value) is None:
+        raise CheckpointResumeError(f"{name} is invalid")
+    return value
+
+
+def _write_immutable_json(path: Path, value: Mapping[str, Any]) -> None:
+    """Create an immutable record, permitting only exact idempotent replay."""
+    encoded = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o444,
+        )
+    except FileExistsError:
+        try:
+            existing = path.read_bytes()
+        except OSError as exc:
+            raise CheckpointResumeError(
+                f"resume decision history is unreadable: {path}"
+            ) from exc
+        if existing != encoded:
+            raise CheckpointResumeError(
+                f"resume decision history would be overwritten: {path}"
+            )
+        return
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except Exception:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def select_latest_checkpoint(
@@ -141,6 +199,12 @@ def inject_resume_checkpoint(spec_path: str | Path) -> dict[str, Any]:
 
     train_dir = Path(results_dir) / "train"
     selected, eligible_count = select_latest_checkpoint(train_dir)
+    restart_count = _slurm_restart_count()
+    if restart_count > 0 and selected is None:
+        raise CheckpointResumeError(
+            "post-requeue Mask2Former slice has no eligible same-job "
+            "epoch/step checkpoint"
+        )
     selected_path = selected["path"] if selected is not None else ""
     train["resume_training_checkpoint_path"] = selected_path
 
@@ -157,21 +221,38 @@ def inject_resume_checkpoint(spec_path: str | Path) -> dict[str, Any]:
         except FileNotFoundError:
             pass
 
+    slurm_job_id = _safe_history_component(
+        os.environ.get("SLURM_JOB_ID", "local"),
+        "SLURM_JOB_ID",
+    )
+    history_path = (
+        Path(results_dir)
+        / DECISION_HISTORY_DIRECTORY
+        / f"slurm_job_{slurm_job_id}_restart_{restart_count:04d}.json"
+    )
     decision = {
-        "schema_version": 1,
-        "policy": "same_job_exact_epoch_step_max_v1",
+        "schema_version": 2,
+        "policy": "same_job_exact_epoch_step_max_with_history_v2",
         "checkpoint_directory": str(train_dir),
         "checkpoint_pattern": CHECKPOINT_PATTERN.pattern,
         "tao_job_id": runtime_job_id or None,
+        "slurm_job_id": None if slurm_job_id == "local" else slurm_job_id,
+        "slurm_restart_count": restart_count,
+        "post_requeue_slice": restart_count > 0,
         "eligible_checkpoint_count": eligible_count,
         "selected_checkpoint": selected,
         "resume_enabled": selected is not None,
         "trusted_own_checkpoint_load": selected is not None,
-        "missing_checkpoint_behavior": "blank_and_start_fresh",
+        "initial_missing_checkpoint_behavior": "blank_and_start_fresh",
+        "post_requeue_missing_checkpoint_behavior": "fail_closed",
         "symlinks_eligible": False,
         "selection_key": ["epoch", "step", "filename"],
+        "resume_field": "train.resume_training_checkpoint_path",
+        "history_path": str(history_path),
+        "history_overwrite_allowed": False,
     }
     decision["decision_sha256"] = _canonical_sha256(decision)
+    _write_immutable_json(history_path, decision)
     decision_path = path.parent / DECISION_FILENAME
     decision_tmp = decision_path.with_name(
         f".{decision_path.name}.{os.getpid()}.tmp"
@@ -237,6 +318,7 @@ __all__ = [
     "CHECKPOINT_PATTERN",
     "CheckpointResumeError",
     "DECISION_FILENAME",
+    "DECISION_HISTORY_DIRECTORY",
     "TRUSTED_CHECKPOINT_ENV",
     "inject_resume_checkpoint",
     "select_latest_checkpoint",

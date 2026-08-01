@@ -48,7 +48,9 @@ from . import (
 )
 
 
-DEFAULT_CONTRACT = run_campaign.DEFAULT_CONTRACT
+DEFAULT_CONTRACT = Path(
+    campaign_contract.FROZEN_V3_QUALIFICATION_CONTRACT["path"]
+)
 DEFAULT_RUNTIME_ROOT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
@@ -77,6 +79,36 @@ ENV_PATH = run_campaign.ENV_PATH
 CampaignExecutionError = run_campaign.CampaignExecutionError
 atomic_json = run_campaign.atomic_json
 utc_timestamp = run_campaign.utc_timestamp
+
+
+def load_frozen_v3_contract(path: str | Path) -> dict[str, Any]:
+    """Load only the exact historical v3 qualification contract."""
+    resolved = Path(path).resolve()
+    frozen = campaign_contract.FROZEN_V3_QUALIFICATION_CONTRACT
+    if (
+        str(resolved) != frozen["path"]
+        or not resolved.is_file()
+        or campaign_contract.sha256_file(resolved) != frozen["file_sha256"]
+    ):
+        raise CampaignExecutionError(
+            "immutable Mask2Former v3 qualification contract changed"
+        )
+    try:
+        document = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise CampaignExecutionError(
+            "immutable Mask2Former v3 qualification contract is invalid"
+        ) from exc
+    payload = copy.deepcopy(document)
+    supplied = payload.pop("contract_sha256", None)
+    if (
+        supplied != frozen["contract_sha256"]
+        or supplied != canonical_sha256(payload)
+    ):
+        raise CampaignExecutionError(
+            "immutable Mask2Former v3 qualification contract integrity failed"
+        )
+    return document
 
 VALIDATION_MASK_AP_METRIC = "segm_val_mAP"
 STANDALONE_MASK_AP_METRIC = "segm_test_mAP"
@@ -984,7 +1016,7 @@ def launch(
     env_path: Path = ENV_PATH,
 ) -> dict[str, Any]:
     """Submit the one frozen direct-full workflow; no replacement is made."""
-    contract = run_campaign.load_contract(contract_path)
+    contract = load_frozen_v3_contract(contract_path)
     runtime_root.mkdir(parents=True, exist_ok=True)
     loaded_names = run_campaign.load_env_file(env_path)
     run_campaign.configure_slurm_runtime(contract)
@@ -1123,7 +1155,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    contract = run_campaign.load_contract(arguments.contract)
+    contract = load_frozen_v3_contract(arguments.contract)
     plan = qualification_plan(contract)
     if not arguments.launch:
         print(json.dumps(plan, indent=2, sort_keys=True))

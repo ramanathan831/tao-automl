@@ -32,7 +32,9 @@ from typing import Any
 
 import yaml
 
-from tao_automl.ptm_registry import canonical_sha256, load_ptm_registry
+import tao_automl
+
+from tao_automl.ptm_registry import canonical_sha256
 from tao_automl.recommendation_audit import validate_recommendation_audit
 from tao_automl.selection import canonical_spec_fingerprint
 
@@ -60,11 +62,11 @@ ENV_PATH = Path("/localhome/local-rarunachalam/.tao/config.env")
 DEFAULT_CONTRACT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "mask2former_coco2017_three_mode_v3/campaign.v3.json"
+    "mask2former_coco2017_three_mode_v4/campaign.v4.json"
 )
 DEFAULT_RUNTIME_ROOT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
-    "cross_model_automl_20260729/mask2former_coco2017_three_mode_v3"
+    "cross_model_automl_20260729/mask2former_coco2017_three_mode_v4"
 )
 TERMINAL_JOB_STATUSES = frozenset({"Complete", "Error", "Canceled"})
 SUCCESS_RECOMMENDATION_STATUSES = frozenset({"success", "done"})
@@ -126,7 +128,7 @@ def configure_slurm_runtime(contract: Mapping[str, Any]) -> None:
             "SLURM_ACCOUNT": runtime["account"],
             "SLURM_BASE_RESULTS_DIR": runtime["base_results_dir"],
             "SLURM_CONTAINER_MOUNTS": runtime["container_mounts"],
-            "MAX_JOB_RETRIES": str(
+            "SLURM_MAX_JOB_RETRIES": str(
                 campaign_contract.FROZEN_SLURM_RETRY_CAP
             ),
             "PYTHONDONTWRITEBYTECODE": "1",
@@ -314,6 +316,8 @@ def verify_local_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
     """Revalidate sealed code, wheel, skills, SDK, and dataset metadata."""
     runtime = contract["runtime"]
     repository = Path(runtime["repository"]).resolve()
+    package_path = Path(tao_automl.__file__).resolve()
+    package_root = (repository / "src/tao_automl").resolve()
     if (
         _git(repository, "rev-parse", "HEAD")
         != runtime["source_commit"]
@@ -321,6 +325,10 @@ def verify_local_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
     ):
         raise CampaignExecutionError(
             "sealed AutoML source commit or clean state changed"
+        )
+    if not package_path.is_relative_to(package_root):
+        raise CampaignExecutionError(
+            "tao_automl imported from outside the sealed repository"
         )
     if (
         _git(Path(runtime["sdk_dir"]), "rev-parse", "HEAD")
@@ -347,6 +355,14 @@ def verify_local_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
         "ptm_stage_manifest": (
             runtime["ptm_stage_manifest_path"],
             runtime["ptm_stage_manifest_sha256"],
+        ),
+        "qualification_contract": (
+            runtime["runtime_local_eligibility"][
+                "qualification_contract_path"
+            ],
+            runtime["runtime_local_eligibility"][
+                "qualification_contract_file_sha256"
+            ],
         ),
         "campaign_contract": (
             HERE / "campaign_contract.py",
@@ -399,8 +415,36 @@ def verify_local_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
             "path": str(path),
             "sha256": expected_sha,
         }
+    qualification_contract_path = Path(
+        runtime["runtime_local_eligibility"][
+            "qualification_contract_path"
+        ]
+    ).resolve()
+    try:
+        qualification_contract = json.loads(
+            qualification_contract_path.read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError) as exc:
+        raise CampaignExecutionError(
+            "sealed v3 qualification contract JSON is invalid"
+        ) from exc
+    qualification_payload = copy.deepcopy(qualification_contract)
+    qualification_internal_sha = qualification_payload.pop(
+        "contract_sha256", None
+    )
+    if (
+        qualification_internal_sha != canonical_sha256(qualification_payload)
+        or qualification_internal_sha
+        != runtime["runtime_local_eligibility"][
+            "qualification_contract_sha256"
+        ]
+    ):
+        raise CampaignExecutionError(
+            "sealed v3 qualification contract integrity failed"
+        )
     return {
         "source_commit": runtime["source_commit"],
+        "tao_automl_import_path": str(package_path),
         "sdk_commit": runtime["sdk_commit"],
         "skills_commit": runtime["skills_commit"],
         "artifacts": evidence,
@@ -499,6 +543,20 @@ def wait_for_launch_authorization(
                 decision.to_dict(),
             )
             return decision
+        if decision is not None and not decision.runtime_ready:
+            status["terminal"] = True
+            status["terminal_outcome"] = "qualification_failed_closed"
+            atomic_json(
+                runtime_root / "automatic_trigger_status.json", status
+            )
+            atomic_json(
+                runtime_root / "qualification_decision.json",
+                decision.to_dict(),
+            )
+            raise CampaignExecutionError(
+                "automatic Mask2Former trigger reached immutable terminal "
+                "qualification evidence with no runtime-eligible cohort"
+            )
         if (
             timeout_seconds is not None
             and time.monotonic() - started >= timeout_seconds
@@ -526,7 +584,7 @@ def _execution_artifacts(
 def _per_checkpoint_profiles(
     decision: QualificationDecision,
 ) -> dict[str, dict[str, Any]]:
-    registry = load_ptm_registry()
+    registry = decision.runtime_registry
     return {
         checkpoint_id: {
             "model": {
@@ -539,6 +597,33 @@ def _per_checkpoint_profiles(
         }
         for checkpoint_id in decision.checkpoint_ids
     }
+
+
+def _validate_live_preflight_cohort(
+    report: Any,
+    decision: QualificationDecision,
+) -> None:
+    """Require exact qualified/prepared and preserved/excluded cohorts."""
+    qualified_ids = tuple(sorted(decision.checkpoint_ids))
+    prepared_ids = tuple(
+        sorted(item.checkpoint_id for item in report.prepared)
+    )
+    preserved_ids = tuple(
+        sorted(str(item["checkpoint_id"]) for item in decision.exclusions)
+    )
+    excluded_ids = tuple(
+        sorted(item.checkpoint_id for item in report.exclusions)
+    )
+    if (
+        not report.ok
+        or prepared_ids != qualified_ids
+        or excluded_ids != preserved_ids
+        or set(prepared_ids) & set(excluded_ids)
+    ):
+        raise CampaignExecutionError(
+            "live PTM preflight did not preserve the exact qualified and "
+            "excluded PTM cohorts"
+        )
 
 
 def build_live_runtime_inventory(
@@ -562,7 +647,7 @@ def build_live_runtime_inventory(
         campaign_contract.mode_settings(str(contract["campaign_id"]), mode)
     )
     report = PTMCheckpointPreflight(
-        registry=load_ptm_registry(),
+        registry=decision.runtime_registry,
         cache=AtomicArtifactCache(cache_root),
         ngc_client=NGCHTTPSClient(NGCCredential.from_environment()),
         load_smoke=QualificationLoadEvidence(decision),
@@ -571,15 +656,7 @@ def build_live_runtime_inventory(
         task="instance_segmentation",
         tao_version="7.1.0",
     )
-    if (
-        not report.ok
-        or tuple(item.checkpoint_id for item in report.prepared)
-        != decision.checkpoint_ids
-        or report.exclusions
-    ):
-        raise CampaignExecutionError(
-            "live PTM preflight did not preserve exactly the qualified arms"
-        )
+    _validate_live_preflight_cohort(report, decision)
     template = (
         Path(contract["runtime"]["skill_dir"])
         / "references/spec_template_train.yaml"
@@ -598,6 +675,7 @@ def build_live_runtime_inventory(
         algorithm="bayesian",
         execution_checkpoint_artifacts=_execution_artifacts(decision),
         per_checkpoint_profile_overrides=_per_checkpoint_profiles(decision),
+        registry=decision.runtime_registry,
     )
     if resolved.checkpoint_ids != decision.checkpoint_ids:
         raise CampaignExecutionError(
@@ -1715,9 +1793,16 @@ def verify_live_runtime_preflight(
             "checkpoint_ids": list(inventory.checkpoint_ids),
         }
     value = {
-        "schema_version": 1,
+        "schema_version": 2,
         "contract_sha256": contract["contract_sha256"],
         "qualification_evidence_sha256": decision.evidence_sha256,
+        "runtime_eligibility_sha256": decision.runtime_eligibility[
+            "eligibility_sha256"
+        ],
+        "projected_registry_sha256": (
+            decision.runtime_registry.document_sha256
+        ),
+        "repository_registry_mutated": False,
         "status": "success",
         "model_jobs_launched": False,
         "cpu_or_smoke_model_jobs_launched": False,
@@ -1745,7 +1830,7 @@ def launch_plan(
         "automatic_trigger": True,
         "cpu_or_smoke_model_jobs": 0,
         "ptm_qualification": (
-            "direct_full_dataset_one_node_eight_gpu_only"
+            "direct_full_dataset_one_node_eight_gpu_runtime_local_v2"
         ),
         "three_independent_modes": list(campaign_contract.MODES),
         "first_candidate_gate": {
@@ -1818,6 +1903,13 @@ def main(argv: list[str] | None = None) -> int:
             "loaded_secret_keys": list(loaded_names),
             "secret_values_recorded": False,
             "qualification_evidence_sha256": decision.evidence_sha256,
+            "runtime_eligibility_sha256": decision.runtime_eligibility[
+                "eligibility_sha256"
+            ],
+            "projected_registry_sha256": (
+                decision.runtime_registry.document_sha256
+            ),
+            "repository_registry_mutated": False,
             "live_runtime_preflight_sha256": live["record_sha256"],
             "tao_pytorch_overlay": copy.deepcopy(
                 live["tao_pytorch_overlay"]

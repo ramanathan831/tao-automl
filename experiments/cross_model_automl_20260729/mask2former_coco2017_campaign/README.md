@@ -4,9 +4,9 @@ This directory prepares a production three-mode AutoML campaign for the exact
 TAO network identifier `mask2former` on the complete official COCO 2017
 instance-segmentation train and validation splits.
 
-It contains no CPU model execution, model smoke test, mini-step, synthetic
-input benchmark, or SLURM submission. Every eventual model job uses the pinned
-TAO 7.1 SQSH on one node with eight A100 GPUs.
+It contains no CPU model execution, model smoke test, mini-step, or synthetic
+input benchmark. Every qualification and AutoML model job uses the pinned TAO
+7.1 SQSH on one node with eight A100 GPUs.
 
 ## Scientific metric contract and qualification status
 
@@ -27,7 +27,7 @@ The deterministic source overlay has SHA-256
 and is staged at:
 
 ```text
-/lustre/fsw/portfolios/edgeai/users/rarunachalam/tao-pytorch-overlays/mask2former-instance-ap/c2e86fe1646ebe89fc280083797dcc544ce88322
+/lustre/fsw/portfolios/edgeai/projects/edgeai_tao-ptm_image-foundation-model-clip/users/rarunachalam/tao-pytorch-overlays/mask2former-instance-ap/c2e86fe1646ebe89fc280083797dcc544ce88322
 ```
 
 The directory and every file are read-only. Every qualification, AutoML
@@ -37,9 +37,12 @@ package mirror, and prepends it through `PYTHONPATH`. The package installed in
 the pinned SQSH is never mutated. A changed archive, installer, source commit,
 or writable remote stage fails before the TAO action starts.
 
-The implementation blocker is fixed and bound into the campaign, but the
-model remains fail-closed until direct full-GPU qualification succeeds and the
-PTM registry record is independently promoted to `supported`.
+The implementation blocker is fixed and bound into the campaign. The v4
+successor remains fail-closed until the exact v3 direct full-GPU workflow is
+terminal and successful. That evidence may qualify the exact `unverified`
+record only inside the sealed campaign's in-memory registry projection; the
+repository registry is never mutated, and an explicitly `unsupported` record
+can never be promoted by evidence.
 
 ## Frozen dataset
 
@@ -75,21 +78,15 @@ Mask2Former arm:
 mask2former.coco.swin_tiny.trainable.v1.0
 ```
 
-It remains `unverified`; runtime does not mutate or bypass that status. Direct
-full-dataset, three-epoch training and standalone evaluation must succeed on
-one node/eight GPUs, emit `segm_val_mAP` and `segm_test_mAP` respectively,
-produce mask AP above the frozen experiment sanity gate, and then the exact
-registry record must be independently reviewed and marked `supported`.
-Terminal failures are retained as exclusions.
-
-Qualification is expected to precede the reviewed registry promotion. The
-gate therefore permits the evidence envelope to name the earlier registry
-digest, while binding the immutable NGC identity, observed checkpoint digest,
-size, and workflow digest. After promotion it also requires the current
-repository record to be `supported` and, when the promoted record carries a
-checkpoint checksum, requires an exact checksum match. This avoids a
-qualification/promotion sealing cycle without allowing evidence to bypass the
-repository status.
+It remains `unverified` in the repository. Direct full-dataset, three-epoch
+training and standalone evaluation must succeed on one node/eight GPUs, emit
+`segm_val_mAP` and `segm_test_mAP` respectively, and pass the frozen experiment
+sanity gate. The v4 gate binds the immutable v3 contract, registry and record
+digests, NGC identity, staged checkpoint digest and size, workflow digest,
+container, overlay, SDK, skills, and source identities. A successful exact arm
+is projected to `supported` only in memory for this campaign. Terminal failures
+remain exclusions, explicit `unsupported` status remains authoritative, and
+zero successful arms terminate the automatic trigger without launching AutoML.
 
 Manifest sealing also requires the repository preflight/downloader to stage
 the exact immutable NGC member on Lustre and write
@@ -112,7 +109,7 @@ remote mode: 0444
 The staging operation performed zero CPU/GPU model runs and submitted zero
 scheduler jobs.
 
-## Qualification/runtime v3 slice-safe continuation
+## Qualification/runtime v3 and bounded v4 continuation
 
 The frozen v1 qualification correctly used the SLURM skill's four-hour
 allocation, 3.8-hour inner timeout, and automatic self-requeue. The direct
@@ -142,7 +139,7 @@ candidate budget per mode: 20 (unchanged)
 search space, seeds, metrics, PTM, retry cap: unchanged
 ```
 
-Every invocation writes
+Every v3 invocation writes
 `mask2former_checkpoint_resume_decision.json` beside the generated spec. It
 records the exact search directory, eligible count, selected epoch/step/path,
 policy, and trust decision in an integrity-hashed decision record without
@@ -150,14 +147,33 @@ credentials. It does not rehash the large checkpoint on every slice. The same
 wrapper is bound to direct qualification and every AutoML candidate training
 command.
 
+The v4 successor keeps the same four-hour allocation and 3.8-hour inner
+timeout, and pins TAO SDK commit
+`ff64be3a277ff277f1f6823717dedc7b48f74c45` (SDK MR !33). The generated sbatch
+script receives `SLURM_MAX_JOB_RETRIES=10`; timeout-driven `scontrol requeue`
+uses decimal-safe `SLURM_RESTART_COUNT` and stops at that cap. Non-timeout
+failures retain their original status.
+
+Before every v4 training slice, the wrapper again selects numeric maximum
+`(epoch, step, filename)` from the exact same-job checkpoint directory and
+injects `train.resume_training_checkpoint_path`. A post-requeue slice with no
+eligible checkpoint fails closed instead of silently starting at epoch zero.
+In addition to the latest summary, every slice creates a read-only immutable
+record under `results_dir/mask2former_checkpoint_resume_decisions/`, keyed by
+SLURM job ID and restart count. This preserves the first post-requeue decision
+and proves the selected epoch, step, and path without overwriting prior slices.
+
 The v1 and v2 runtime trees remain immutable at
 `mask2former_coco2017_ptm_qualification_v1` and
 `mask2former_coco2017_ptm_qualification_v2`. The completed data-only v1 PTM
 stage is reused by exact hash; no v1/v2 progress or incomplete evidence can
 satisfy the v3 gate. New qualification evidence is written under
 `mask2former_coco2017_ptm_qualification_v3`, and the later AutoML campaign
-uses `mask2former_coco2017_three_mode_v3`. This is a checkpoint-continuation
-correction, not a training-fidelity or search-policy change.
+used `mask2former_coco2017_three_mode_v3`. The evidence-bound automatic
+successor uses the separate `mask2former_coco2017_three_mode_v4` root and the
+project-specific Lustre base requested by the user. This is a bounded
+checkpoint-continuation and eligibility correction, not a training-fidelity,
+search, selector, or scientific-policy change.
 
 PTM identity is represented as a hierarchical non-ordinal outer arm. The one
 current arm is not encoded as an ordinal scalar. The common inner search is
@@ -203,20 +219,21 @@ accumulation. Every candidate uses:
 
 ## Automatic gating
 
-After a sealed manifest exists, `--automatic-trigger --launch` waits for all
-immutable data, SQSH, PTM evidence, and supported-registry gates. It does not
-ask for confirmation. Once ready, the three independently seeded mode
+One `manifest_generator --automatic-trigger --launch` process waits for the
+exact terminal v3 completion, validates it, atomically seals the v4 contract,
+and invokes the launch gate. It does not ask for confirmation. Once ready, the
+three independently seeded mode
 controllers start together. Candidate zero in each mode performs the real
 full train, standalone evaluation, and stabilized latency workflow. The
 remaining 19 recommendations per mode are released automatically only after
 all three candidate-zero workflows pass.
 
 The automatic trigger remains blocked until the v3 full-GPU qualification
-completes and the PTM-support requirements described above are satisfied.
+completes and the exact evidence-bound eligibility requirements above pass.
 The incomplete v1 and scheduler-rejected v2 qualifications are retained as
 historical evidence and are not reused as successful gate results.
 
-## Exact v3 qualification and automatic-launch commands
+## Exact automatic v3-evidence to v4-launch command
 
 ```bash
 cd /localhome/local-rarunachalam/tao-automl
@@ -224,42 +241,20 @@ cd /localhome/local-rarunachalam/tao-automl
 export PATH=/localhome/local-rarunachalam/.tao/venvs/dino-multiobjective-py314/bin:$PATH
 export PYTHONDONTWRITEBYTECODE=1
 
-# Seal v3 from a clean source commit. The immutable v1 PTM-stage manifest is
-# consumed by hash and is not regenerated.
+# The existing v3 qualification is not resubmitted. This one process waits for
+# its immutable terminal completion, seals v4 exactly once, then launches the
+# three independent AutoML controllers. --resume preserves any compatible v4
+# controller evidence if the watcher itself is restarted.
 python -m \
   experiments.cross_model_automl_20260729.mask2former_coco2017_campaign.manifest_generator \
   --output \
-  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask2former_coco2017_three_mode_v3/campaign.v3.json
-
-# This is plan-only and constructs no scheduler client.
-python -m \
-  experiments.cross_model_automl_20260729.mask2former_coco2017_campaign.qualification_campaign \
-  --contract \
-  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask2former_coco2017_three_mode_v3/campaign.v3.json
-
-# One direct full three-epoch train followed by standalone full validation,
-# on one node/eight A100s in the pinned SQSH. No CPU/smoke/mini-step path.
-python -m \
-  experiments.cross_model_automl_20260729.mask2former_coco2017_campaign.qualification_campaign \
-  --contract \
-  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask2former_coco2017_three_mode_v3/campaign.v3.json \
+  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask2former_coco2017_three_mode_v4/campaign.v4.json \
   --runtime-root \
-  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask2former_coco2017_ptm_qualification_v3 \
-  --launch
-
-# After successful qualification and independent registry promotion, reseal
-# the same v3 contract path from the promoted clean source commit, then start
-# the automatic three-mode trigger.
-python -m \
-  experiments.cross_model_automl_20260729.mask2former_coco2017_campaign.run_campaign \
-  --contract \
-  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask2former_coco2017_three_mode_v3/campaign.v3.json \
-  --runtime-root \
-  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask2former_coco2017_three_mode_v3 \
+  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask2former_coco2017_three_mode_v4 \
   --automatic-trigger \
-  --launch
+  --launch \
+  --resume
 ```
 
-The command above is intentionally not runnable past the gate while the
-repository registry remains unverified or the exact runtime fails to emit
-`segm_val_mAP` for validation and `segm_test_mAP` for standalone evaluation.
+The command cannot pass the gate if v3 terminates without exact task-correct
+success. It never launches a replacement qualification workflow.

@@ -25,9 +25,12 @@ the stage content SHA-256 is
 and its raw manifest-file SHA-256 is
 `3d51ad23d237b8472ebff629dc9ceb7909123c462683f899f4eabb6f4cc3166e`.
 
-The launch gate still fails closed because the exact runtime has not completed
-the direct full-GPU qualification and the one official Mask2Former PTM remains
-`unverified` pending that qualification and independent registry promotion.
+The v4 launch gate fails closed until the exact v3 direct full-GPU workflow
+reaches terminal, task-correct success. The repository PTM remains
+`unverified`; successful immutable v3 evidence may make that exact identity
+eligible only in the sealed campaign's in-memory registry projection. The
+repository registry is not mutated, and explicit `unsupported` status remains
+authoritative.
 
 ## 2026-08-01 qualification/runtime v3 amendment
 
@@ -50,6 +53,16 @@ selects the maximum numeric epoch/step from an exact
 for that own-job artifact. With no eligible checkpoint it explicitly leaves
 the resume field blank. An integrity-hashed decision record is written beside
 the generated spec on every execution.
+
+The v4 successor pins TAO SDK commit
+`ff64be3a277ff277f1f6823717dedc7b48f74c45` and the exact environment name
+`SLURM_MAX_JOB_RETRIES`. Timeout self-requeue is now bounded with
+`SLURM_RESTART_COUNT`; invalid counts fail closed, the configured cap is ten,
+and non-timeout exit status is preserved. The initial slice may start fresh
+only when no checkpoint exists. Every post-requeue slice must select the
+latest exact numeric epoch/step checkpoint or fail closed. Each decision is
+preserved in a read-only per-SLURM-job/per-restart history file, so the first
+post-requeue resume is auditable instead of being overwritten by later slices.
 
 Training remains three complete epochs; the search space, 20-candidate budget,
 seeds, PTM, metrics, mode policies, and retry cap are unchanged. V1 and v2
@@ -131,18 +144,17 @@ the remaining 19 recommendations per mode only after candidate zero in all
 three modes passes full training, standalone validation, stabilized latency,
 audit, and provenance checks.
 
-## Required next sequence
+## Automatic successor sequence
 
-1. Review the task-correct TAO PyTorch commit and sealed PYTHONPATH overlay
-   contract.
-2. Seal the pre-promotion direct-full qualification contract using the
-   completed read-only PTM stage.
-3. Run the one real three-epoch, one-node/eight-A100 qualification workflow
-   and retain success or terminal failure unchanged.
-4. If and only if it succeeds, independently promote the exact registry
-   record to `supported`, binding the evidence and observed checkpoint digest.
-5. Seal the final AutoML campaign on the promoted source and start the
-   automatic trigger.
+1. Preserve the already-running v3 qualification and its immutable input
+   contract; do not submit a replacement workflow.
+2. Wait automatically for its terminal completion.
+3. Validate the exact contract, source PTM, stage, runtime, metric, checkpoint,
+   workflow, and intervention identities.
+4. On exact success, create a campaign-local in-memory supported projection;
+   on failure or zero successes, stop without launching AutoML.
+5. Atomically seal the separate v4 contract and launch the three independent
+   mode controllers from the same watcher process.
 
 No additional model or dataset is implicated by these blockers.
 
@@ -191,3 +203,10 @@ The complete production and experiment repository suite passed:
 
 Only the three established sklearn Gaussian-process convergence warnings were
 observed in each relevant complete suite.
+
+The v4 bounded-requeue and evidence-bound successor adds SDK cap tests,
+campaign-local registry projection tests, terminal zero-success behavior,
+source-import and historical-contract binding, exact prepared/excluded cohort
+checks, and immutable per-restart checkpoint-decision history. Final v4 suite
+counts are recorded in the integrating commit/MR validation summary rather
+than rewriting the frozen v3 runtime evidence.
