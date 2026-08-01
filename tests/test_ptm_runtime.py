@@ -713,6 +713,36 @@ def test_runtime_eligibility_model_and_artifact_are_revalidated(
         _resolve(verified_report, "accuracy")
 
 
+def test_explicit_in_memory_registry_is_bound_without_mutating_packaged_registry(
+    tmp_path,
+    monkeypatch,
+):
+    report, explicit_registry = _report(tmp_path)
+    unrelated_document = explicit_registry.to_dict()
+    unrelated_document["registry_version"] = "unrelated-runtime-v1"
+    unrelated_registry = PTMRegistry(unrelated_document)
+    monkeypatch.setattr(
+        runtime_module,
+        "load_ptm_registry",
+        lambda: unrelated_registry,
+    )
+
+    resolved = _resolve(
+        report,
+        "latency",
+        registry=explicit_registry,
+    )
+    assert resolved.report.registry_sha256 == explicit_registry.document_sha256
+
+    with pytest.raises(ValueError, match="registry identity"):
+        _resolve(report, "latency", registry=unrelated_registry)
+
+    # The caller-owned projection and packaged-registry loader remain
+    # independent objects; resolution performs no write or status mutation.
+    assert explicit_registry.registry_version == "test-runtime-v1"
+    assert unrelated_registry.registry_version == "unrelated-runtime-v1"
+
+
 def test_adapted_checkpoint_provenance_is_recomputed_with_source_and_adapter(
     verified_report,
     tmp_path,
