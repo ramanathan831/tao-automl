@@ -64,7 +64,7 @@ SEARCH_SPACE = {
 
 FROZEN_CANDIDATE_BUDGET = 30
 # The already-preregistered AutoML search remains a ten-epoch experiment.
-# Qualification v2 is a distinct, higher-fidelity boundary and must not
+# Qualification v3 is a distinct, higher-fidelity boundary and must not
 # silently mutate the search budget.
 FROZEN_TRAINING_EPOCHS = 10
 FROZEN_QUALIFICATION_TRAINING_EPOCHS = 50
@@ -99,9 +99,9 @@ FROZEN_SQSH = {
         "7.1.0-rc-245-multiarch"
     ),
 }
-QUALIFICATION_REVISION = 2
+QUALIFICATION_REVISION = 3
 QUALIFICATION_CAMPAIGN_ID = (
-    "segformer-voc2012-direct-full-ptm-qualification-v2"
+    "segformer-voc2012-direct-full-ptm-qualification-v3"
 )
 FROZEN_QUALIFICATION_FIDELITY = {
     "source_recipe": (
@@ -193,6 +193,60 @@ FROZEN_V1_QUALIFICATION_EVIDENCE = {
     "preserve_immutable": True,
     "reuse_for_v2": False,
 }
+FROZEN_V2_QUALIFICATION_EVIDENCE = {
+    "campaign_id": "segformer-voc2012-direct-full-ptm-qualification-v2",
+    "completion_path": (
+        "/localhome/local-rarunachalam/.tao/artifacts/"
+        "cross_model_automl_20260729/"
+        "segformer_voc2012_ptm_qualification_v2/completion.json"
+    ),
+    "completion_whole_file_sha256": (
+        "0e74b0016711bf614b40382c7a28b512c87971951dff6295cf107f44a901cf1a"
+    ),
+    "evidence_sha256": (
+        "4faab6fd5d9f6bda96c1f6e5cfd73e83ff70dc99ef7aaeb990a68fea4f5ac422"
+    ),
+    "ptm_stage_manifest_path": (
+        "/localhome/local-rarunachalam/.tao/artifacts/"
+        "cross_model_automl_20260729/"
+        "segformer_voc2012_ptm_qualification_v2/ptm_stage_manifest.json"
+    ),
+    "ptm_stage_manifest_whole_file_sha256": (
+        "2ebb382ec62805caae24681ec1228bb248bdf86a94478c0c92c95cc9c0d9beec"
+    ),
+    "ptm_stage_manifest_sha256": (
+        "dfd9eff35ab9b8ea5480606dc266512d3cccf6949791ef5372f2c0ee88eb1906"
+    ),
+    "launch_preflight_path": (
+        "/localhome/local-rarunachalam/.tao/artifacts/"
+        "cross_model_automl_20260729/"
+        "segformer_voc2012_ptm_qualification_v2/"
+        "qualification_launch_preflight.json"
+    ),
+    "launch_preflight_whole_file_sha256": (
+        "322fd61f382ec1fcccab68b819098c75a49f61b7f829c361d4631b884c3ce2e6"
+    ),
+    "automatic_handoff_path": (
+        "/localhome/local-rarunachalam/.tao/artifacts/"
+        "cross_model_automl_20260729/"
+        "segformer_voc2012_ptm_qualification_v2/automatic_handoff.json"
+    ),
+    "automatic_handoff_whole_file_sha256": (
+        "a6f1c4e841e444266715a3a90243700527d71c89f98394ecfa15c3082eaa31bc"
+    ),
+    "source_commit": "aa4cecd4e2a5f1d5c8fc28b9a438fdd244425201",
+    "status": "terminal_with_failures",
+    "successful_workflows": 0,
+    "failed_workflows": 13,
+    "controller_failure_workflows": 12,
+    "runtime_failure_workflows": 1,
+    "preserve_immutable": True,
+    "reuse_for_v3": False,
+}
+FROZEN_PRIOR_QUALIFICATION_EVIDENCE = [
+    copy.deepcopy(FROZEN_V1_QUALIFICATION_EVIDENCE),
+    copy.deepcopy(FROZEN_V2_QUALIFICATION_EVIDENCE),
+]
 LATENCY_PROTOCOL = {
     "warmup_iterations": 50,
     "timed_iterations": 100,
@@ -525,7 +579,7 @@ def profile_overrides(dataset_root: str) -> dict[str, Any]:
 
 
 def qualification_profile_overrides(dataset_root: str) -> dict[str, Any]:
-    """Return the v2 official multi-class fidelity for every PTM arm."""
+    """Return the v3 official multi-class fidelity for every PTM arm."""
     value = profile_overrides(dataset_root)
     fidelity = FROZEN_QUALIFICATION_FIDELITY
     value["dataset"]["segment"]["augmentation"] = {
@@ -645,7 +699,7 @@ def build_preregistered_contract(
                 FROZEN_QUALIFICATION_RUNTIME_OVERLAY
             ),
             "prior_revision_evidence": copy.deepcopy(
-                FROZEN_V1_QUALIFICATION_EVIDENCE
+                FROZEN_PRIOR_QUALIFICATION_EVIDENCE
             ),
             "qualification_evidence_path": runtime[
                 "qualification_evidence_path"
@@ -769,10 +823,10 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
         or qualification.get("runtime_overlay")
         != FROZEN_QUALIFICATION_RUNTIME_OVERLAY
         or qualification.get("prior_revision_evidence")
-        != FROZEN_V1_QUALIFICATION_EVIDENCE
+        != FROZEN_PRIOR_QUALIFICATION_EVIDENCE
     ):
         raise CampaignContractError(
-            "qualification v2 fidelity or provenance changed"
+            "qualification v3 fidelity or provenance changed"
         )
     if any(value["agent_intervention_flags"].values()):
         raise CampaignContractError("agent intervention flags must remain false")
@@ -795,6 +849,7 @@ __all__ = [
     "FROZEN_QUALIFICATION_FIDELITY",
     "FROZEN_QUALIFICATION_RUNTIME_OVERLAY",
     "FROZEN_QUALIFICATION_TRAINING_EPOCHS",
+    "FROZEN_PRIOR_QUALIFICATION_EVIDENCE",
     "FROZEN_SEARCH_SEED",
     "FROZEN_SLURM_RETRY_CAP",
     "FROZEN_SLURM_PARTITION",
@@ -804,6 +859,7 @@ __all__ = [
     "FROZEN_TRAINING_EPOCHS",
     "FROZEN_VALIDATION_SANITY_MIN_MIOU",
     "FROZEN_V1_QUALIFICATION_EVIDENCE",
+    "FROZEN_V2_QUALIFICATION_EVIDENCE",
     "LATENCY_PROTOCOL",
     "MODES",
     "QUALIFICATION_CAMPAIGN_ID",

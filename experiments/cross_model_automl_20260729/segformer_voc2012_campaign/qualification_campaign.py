@@ -68,22 +68,22 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_CONTRACT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "segformer_voc2012_three_mode/campaign.v2.json"
+    "segformer_voc2012_three_mode/campaign.v3.json"
 )
 DEFAULT_RUNTIME_ROOT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "segformer_voc2012_ptm_qualification_v2"
+    "segformer_voc2012_ptm_qualification_v3"
 )
 DEFAULT_STAGE_MANIFEST = DEFAULT_RUNTIME_ROOT / "ptm_stage_manifest.json"
 DEFAULT_LOCAL_CACHE = Path(
     "/localhome/local-rarunachalam/.tao/cache/"
-    "segformer_voc2012_ptm_qualification_v2"
+    "segformer_voc2012_ptm_qualification_v3"
 )
 DEFAULT_LUSTRE_INPUT_ROOT = Path(
     "/lustre/fsw/portfolios/edgeai/users/rarunachalam/"
     "cross_model_automl_20260729/"
-    "segformer_voc2012_ptm_qualification_v2/inputs"
+    "segformer_voc2012_ptm_qualification_v3/inputs"
 )
 QUALIFICATION_CAMPAIGN_ID = campaign_contract.QUALIFICATION_CAMPAIGN_ID
 EVALUATION_CHECKPOINT_SENTINEL = (
@@ -248,7 +248,7 @@ def verify_slurm_preflight(
         != campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
     ):
         raise CampaignExecutionError(
-            "qualification v2 fidelity or runtime overlay changed"
+            "qualification v3 fidelity or runtime overlay changed"
         )
     run_campaign.configure_slurm_runtime(contract)
     sdk_dir = Path(runtime["sdk_dir"]).resolve()
@@ -658,7 +658,7 @@ def stage_runtime_inputs(
             campaign_contract.FROZEN_QUALIFICATION_FIDELITY
         ),
         "prior_revision_evidence": copy.deepcopy(
-            campaign_contract.FROZEN_V1_QUALIFICATION_EVIDENCE
+            campaign_contract.FROZEN_PRIOR_QUALIFICATION_EVIDENCE
         ),
         "ptms": rows,
         "execution": {
@@ -739,7 +739,7 @@ def validate_stage_manifest(
         or value.get("recipe_fidelity")
         != campaign_contract.FROZEN_QUALIFICATION_FIDELITY
         or value.get("prior_revision_evidence")
-        != campaign_contract.FROZEN_V1_QUALIFICATION_EVIDENCE
+        != campaign_contract.FROZEN_PRIOR_QUALIFICATION_EVIDENCE
         or not isinstance(rows, list)
         or tuple(item.get("checkpoint_id") for item in rows)
         != expected_ids
@@ -1071,7 +1071,7 @@ def _runtime_overlay_install_command(
     *,
     action_name: str,
 ) -> str:
-    """Return the fail-closed v2 overlay pre-entrypoint."""
+    """Return the fail-closed v3 overlay pre-entrypoint."""
     overlay = contract["qualification_policy"].get("runtime_overlay")
     if (
         overlay
@@ -1766,7 +1766,7 @@ def build_completion(
             campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
         ),
         "prior_revision_evidence": copy.deepcopy(
-            campaign_contract.FROZEN_V1_QUALIFICATION_EVIDENCE
+            campaign_contract.FROZEN_PRIOR_QUALIFICATION_EVIDENCE
         ),
         "qualification_controller_sha256": contract[
             "launcher_integrity"
@@ -1874,7 +1874,7 @@ def qualification_plan(
             campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
         ),
         "prior_revision_evidence": copy.deepcopy(
-            campaign_contract.FROZEN_V1_QUALIFICATION_EVIDENCE
+            campaign_contract.FROZEN_PRIOR_QUALIFICATION_EVIDENCE
         ),
         "resources_per_job": {
             "nodes": 1,

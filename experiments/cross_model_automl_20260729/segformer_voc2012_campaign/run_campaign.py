@@ -57,7 +57,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct execution
 
 HERE = Path(__file__).resolve().parent
 ENV_PATH = Path("/localhome/local-rarunachalam/.tao/config.env")
-DEFAULT_CONTRACT = HERE / "campaign.v2.json"
+DEFAULT_CONTRACT = HERE / "campaign.v3.json"
 DEFAULT_RUNTIME_ROOT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/segformer_voc2012_three_mode"

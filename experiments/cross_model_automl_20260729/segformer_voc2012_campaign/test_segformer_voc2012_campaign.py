@@ -4,7 +4,10 @@ import ast
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
+import socket
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -173,9 +176,16 @@ def _workflow(
             "gpus": 8,
             "val_miou": metric,
             "terminal_checkpoint": {
-                "path": f"/lustre/results/{checkpoint_id}.pth",
+                "path": (
+                    "/lustre/results/"
+                    f"{checkpoint_id}/model_epoch_049_step_09150.pth"
+                ),
                 "size_bytes": 123,
                 "sha256": "b" * 64,
+                "training_epochs": 50,
+                "terminal_epoch_index": 49,
+                "naming_contract": "model_epoch_049_step_numeric",
+                "ambiguity_policy": "fail_closed",
             },
         },
         "evaluation": {
@@ -227,7 +237,7 @@ def _qualification_document(success_id: str | None = None) -> dict:
             campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
         ),
         "prior_revision_evidence": copy.deepcopy(
-            campaign_contract.FROZEN_V1_QUALIFICATION_EVIDENCE
+            campaign_contract.FROZEN_PRIOR_QUALIFICATION_EVIDENCE
         ),
         "cpu_model_runs": 0,
         "smoke_model_runs": 0,
@@ -388,7 +398,7 @@ def _fake_qualification_stage(contract: dict) -> dict:
             campaign_contract.FROZEN_QUALIFICATION_FIDELITY
         ),
         "prior_revision_evidence": copy.deepcopy(
-            campaign_contract.FROZEN_V1_QUALIFICATION_EVIDENCE
+            campaign_contract.FROZEN_PRIOR_QUALIFICATION_EVIDENCE
         ),
         "ptms": rows,
         "execution": {
@@ -498,7 +508,7 @@ def test_search_profile_remains_frozen_at_v1_fidelity():
     assert train["tensorboard"]["enabled"] is False
 
 
-def test_qualification_v2_uses_official_multiclass_fidelity_uniformly():
+def test_qualification_v3_uses_official_multiclass_fidelity_uniformly():
     profile = campaign_contract.qualification_profile_overrides(
         _dataset()["prepared_root"]
     )
@@ -524,38 +534,61 @@ def test_qualification_v2_uses_official_multiclass_fidelity_uniformly():
     assert train["use_distributed_sampler"] is True
 
 
-def test_qualification_v2_paths_preserve_frozen_v1_evidence():
-    prior = campaign_contract.FROZEN_V1_QUALIFICATION_EVIDENCE
-    assert prior["campaign_id"].endswith("-v1")
-    assert prior["status"] == "terminal_with_failures"
-    assert prior["successful_workflows"] == 0
-    assert prior["failed_workflows"] == 13
-    assert prior["preserve_immutable"] is True
-    assert prior["reuse_for_v2"] is False
+def test_qualification_v3_paths_preserve_frozen_v1_and_v2_evidence():
+    v1 = campaign_contract.FROZEN_V1_QUALIFICATION_EVIDENCE
+    v2 = campaign_contract.FROZEN_V2_QUALIFICATION_EVIDENCE
+    prior = campaign_contract.FROZEN_PRIOR_QUALIFICATION_EVIDENCE
+    assert prior == [v1, v2]
+    assert v1["campaign_id"].endswith("-v1")
+    assert v1["status"] == "terminal_with_failures"
+    assert v1["successful_workflows"] == 0
+    assert v1["failed_workflows"] == 13
+    assert v1["preserve_immutable"] is True
+    assert v1["reuse_for_v2"] is False
     assert "/segformer_voc2012_ptm_qualification_v1/" in (
-        prior["completion_path"]
+        v1["completion_path"]
     )
-    assert qualification_campaign.QUALIFICATION_CAMPAIGN_ID.endswith("-v2")
-    assert qualification_campaign.DEFAULT_CONTRACT.name == "campaign.v2.json"
-    assert run_campaign.DEFAULT_CONTRACT.name == "campaign.v2.json"
-    assert "qualification_v2" in str(
+    assert v2["campaign_id"].endswith("-v2")
+    assert v2["status"] == "terminal_with_failures"
+    assert v2["successful_workflows"] == 0
+    assert v2["failed_workflows"] == 13
+    assert v2["controller_failure_workflows"] == 12
+    assert v2["runtime_failure_workflows"] == 1
+    assert v2["preserve_immutable"] is True
+    assert v2["reuse_for_v3"] is False
+    assert campaign_contract.sha256_file(v2["completion_path"]) == (
+        v2["completion_whole_file_sha256"]
+    )
+    assert campaign_contract.sha256_file(
+        v2["ptm_stage_manifest_path"]
+    ) == v2["ptm_stage_manifest_whole_file_sha256"]
+    assert campaign_contract.sha256_file(
+        v2["launch_preflight_path"]
+    ) == v2["launch_preflight_whole_file_sha256"]
+    assert campaign_contract.sha256_file(
+        v2["automatic_handoff_path"]
+    ) == v2["automatic_handoff_whole_file_sha256"]
+    assert qualification_campaign.QUALIFICATION_CAMPAIGN_ID.endswith("-v3")
+    assert qualification_campaign.DEFAULT_CONTRACT.name == "campaign.v3.json"
+    assert run_campaign.DEFAULT_CONTRACT.name == "campaign.v3.json"
+    assert "qualification_v3" in str(
         qualification_campaign.DEFAULT_RUNTIME_ROOT
     )
-    assert "qualification_v2" in str(
+    assert "qualification_v3" in str(
         qualification_campaign.DEFAULT_LOCAL_CACHE
     )
-    assert "qualification_v2" in str(
+    assert "qualification_v3" in str(
         qualification_campaign.DEFAULT_LUSTRE_INPUT_ROOT
     )
     assert manifest_generator.DEFAULT_QUALIFICATION != Path(
-        prior["completion_path"]
+        v2["completion_path"]
     )
     assert manifest_generator.DEFAULT_PTM_STAGE_MANIFEST != Path(
-        prior["ptm_stage_manifest_path"]
+        v2["ptm_stage_manifest_path"]
     )
 
 
-def test_qualification_v2_binds_combined_runtime_overlay(contract):
+def test_qualification_v3_binds_combined_runtime_overlay(contract):
     overlay = campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
     assert overlay["combined_commit"] == (
         "3b1e073571f3bbf3702b0ae837e9279ad12f4286"
@@ -566,15 +599,15 @@ def test_qualification_v2_binds_combined_runtime_overlay(contract):
     )
     assert overlay["required_actions"] == ["train", "evaluate"]
     policy = contract["qualification_policy"]
-    assert policy["revision"] == 2
-    assert policy["campaign_id"].endswith("-v2")
+    assert policy["revision"] == 3
+    assert policy["campaign_id"].endswith("-v3")
     assert policy["training_epochs"] == 50
     assert policy["recipe_fidelity"] == (
         campaign_contract.FROZEN_QUALIFICATION_FIDELITY
     )
     assert policy["runtime_overlay"] == overlay
     assert policy["prior_revision_evidence"] == (
-        campaign_contract.FROZEN_V1_QUALIFICATION_EVIDENCE
+        campaign_contract.FROZEN_PRIOR_QUALIFICATION_EVIDENCE
     )
     assert contract["search"]["training_epochs"] == 10
 
@@ -710,7 +743,7 @@ def test_unverified_full_run_success_cannot_bypass_registry(tmp_path: Path):
             QualificationLoadEvidence(decision)
 
 
-def test_v1_evidence_is_preserved_but_cannot_satisfy_v2_gate(
+def test_prior_evidence_is_preserved_but_cannot_satisfy_v3_gate(
     tmp_path: Path,
 ):
     document = _qualification_document()
@@ -727,6 +760,26 @@ def test_v1_evidence_is_preserved_but_cannot_satisfy_v2_gate(
         }
     )
     path = tmp_path / "qualification.v1.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(
+        QualificationGateError,
+        match="campaign identity or execution policy changed",
+    ):
+        audit_qualification(path)
+
+    document = _qualification_document()
+    document["qualification_revision"] = 2
+    document["campaign_id"] = (
+        campaign_contract.FROZEN_V2_QUALIFICATION_EVIDENCE["campaign_id"]
+    )
+    document["evidence_sha256"] = canonical_sha256(
+        {
+            key: value
+            for key, value in document.items()
+            if key != "evidence_sha256"
+        }
+    )
+    path = tmp_path / "qualification.v2.json"
     path.write_text(json.dumps(document), encoding="utf-8")
     with pytest.raises(
         QualificationGateError,
@@ -917,7 +970,7 @@ def test_contract_integrity_rejects_mutation(contract):
     )
     with pytest.raises(
         campaign_contract.CampaignContractError,
-        match="qualification v2 fidelity or provenance changed",
+        match="qualification v3 fidelity or provenance changed",
     ):
         campaign_contract.validate_contract(changed)
 
@@ -928,7 +981,7 @@ def test_qualification_plan_contains_every_official_arm_without_fallback(
     plan = qualification_campaign.qualification_plan(contract)
     assert plan["workflow_count"] == 13
     assert plan["schema_version"] == 2
-    assert plan["qualification_revision"] == 2
+    assert plan["qualification_revision"] == 3
     assert plan["workflow"] == (
         "full_voc2012_50_epoch_train_then_standalone_full_validation"
     )
@@ -1303,6 +1356,62 @@ def test_direct_qualification_submission_is_pinned_one_node_eight_gpu(
     assert "segformer train -e {config_path}" in guard
 
 
+def test_qualification_gpu_guard_exports_usable_allocation_port(
+    tmp_path: Path,
+):
+    nvidia_smi = tmp_path / "nvidia-smi"
+    nvidia_smi.write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        "  *query-gpu=name*) value='NVIDIA A100-SXM4-80GB' ;;\n"
+        "  *query-gpu=compute_cap*) value='8.0' ;;\n"
+        "  *query-gpu=memory.total*) value='81920' ;;\n"
+        "  *) exit 2 ;;\n"
+        "esac\n"
+        "i=0; while [ \"$i\" -lt 8 ]; do printf '%s\\n' \"$value\"; "
+        "i=$((i + 1)); done\n",
+        encoding="utf-8",
+    )
+    nvidia_smi.chmod(0o755)
+    selected_port = None
+    for port in range(
+        qualification_campaign.QUALIFICATION_MASTER_PORT_BASE,
+        qualification_campaign.QUALIFICATION_MASTER_PORT_BASE
+        + qualification_campaign.QUALIFICATION_MASTER_PORT_SPAN,
+    ):
+        with socket.socket() as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+        selected_port = port
+        break
+    assert selected_port is not None
+    job_id = str(
+        selected_port
+        - qualification_campaign.QUALIFICATION_MASTER_PORT_BASE
+    )
+    guard = qualification_campaign._gpu_guard(
+        "printf 'rendezvous=%s:%s\\n' \"$MASTER_ADDR\" "
+        "\"$MASTER_PORT\""
+    )
+
+    result = subprocess.run(
+        ["bash", "-c", guard],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env={
+            **os.environ,
+            "PATH": f"{tmp_path}:{os.environ['PATH']}",
+            "SLURM_JOB_ID": job_id,
+        },
+    )
+
+    assert result.stdout == f"rendezvous=127.0.0.1:{selected_port}\n"
+
+
 def test_qualification_entrypoint_installs_exact_overlay_for_both_actions(
     contract,
 ):
@@ -1490,6 +1599,44 @@ def test_qualification_terminal_checkpoint_rejects_search_epoch_checkpoint(
         qualification_campaign._qualification_terminal_checkpoint(
             FakeSDK(),
             "train-job",
+        )
+
+
+def test_qualification_gate_rejects_epoch_9_terminal_checkpoint():
+    checkpoint_id = campaign_contract.segformer_registry_snapshot()[
+        "records"
+    ][0]["id"]
+    workflow = _workflow(checkpoint_id, success=True)
+    terminal = workflow["train"]["terminal_checkpoint"]
+    terminal.update(
+        {
+            "path": (
+                "/lustre/results/"
+                f"{checkpoint_id}/model_epoch_009_step_01830.pth"
+            ),
+            "training_epochs": 10,
+            "terminal_epoch_index": 9,
+            "naming_contract": "model_epoch_009_step_numeric",
+        }
+    )
+    workflow["workflow_sha256"] = canonical_sha256(
+        {
+            key: value
+            for key, value in workflow.items()
+            if key != "workflow_sha256"
+        }
+    )
+    record = load_ptm_registry().checkpoint(checkpoint_id)
+    record["sha256"] = "a" * 64
+
+    with pytest.raises(
+        QualificationGateError,
+        match="terminal checkpoint contract changed",
+    ):
+        qualification_gate._successful_workflow(
+            workflow,
+            checkpoint_id=checkpoint_id,
+            registry_record=record,
         )
 
 

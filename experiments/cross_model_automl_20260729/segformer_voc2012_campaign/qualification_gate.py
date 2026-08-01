@@ -32,7 +32,7 @@ from .campaign_contract import (
     FROZEN_QUALIFICATION_TRAINING_EPOCHS,
     FROZEN_SQSH,
     FROZEN_VALIDATION_SANITY_MIN_MIOU,
-    FROZEN_V1_QUALIFICATION_EVIDENCE,
+    FROZEN_PRIOR_QUALIFICATION_EVIDENCE,
     QUALIFICATION_CAMPAIGN_ID,
     QUALIFICATION_REVISION,
     segformer_registry_snapshot,
@@ -150,7 +150,7 @@ def _stage_evidence(
         or stage.get("runtime", {}).get("runtime_overlay")
         != FROZEN_QUALIFICATION_RUNTIME_OVERLAY
         or stage.get("prior_revision_evidence")
-        != FROZEN_V1_QUALIFICATION_EVIDENCE
+        != FROZEN_PRIOR_QUALIFICATION_EVIDENCE
         or not isinstance(rows, list)
     ):
         raise QualificationGateError(
@@ -273,7 +273,7 @@ class QualificationDecision:
     def stable_dict(self) -> dict[str, Any]:
         return {
             "schema_version": 2,
-            "gate": "segformer_direct_full_gpu_then_supported_registry_v2",
+            "gate": "segformer_direct_full_gpu_then_supported_registry_v3",
             "evidence_path": self.evidence_path,
             "evidence_sha256": self.evidence_sha256,
             "qualification_campaign_id": self.qualification_campaign_id,
@@ -403,10 +403,30 @@ def _successful_workflow(
         raise QualificationGateError(
             f"{checkpoint_id} full train/evaluation contract is incomplete"
         )
+    terminal_checkpoint = train.get("terminal_checkpoint")
     checkpoint_path, checkpoint_sha, checkpoint_size = _artifact(
-        train.get("terminal_checkpoint"),
+        terminal_checkpoint,
         name=f"{checkpoint_id}.terminal_checkpoint",
     )
+    terminal_epoch = FROZEN_QUALIFICATION_TRAINING_EPOCHS - 1
+    epoch_token = f"{terminal_epoch:03d}"
+    filename = Path(checkpoint_path).name
+    if (
+        not isinstance(terminal_checkpoint, Mapping)
+        or terminal_checkpoint.get("training_epochs")
+        != FROZEN_QUALIFICATION_TRAINING_EPOCHS
+        or terminal_checkpoint.get("terminal_epoch_index")
+        != terminal_epoch
+        or terminal_checkpoint.get("naming_contract")
+        != f"model_epoch_{epoch_token}_step_numeric"
+        or terminal_checkpoint.get("ambiguity_policy") != "fail_closed"
+        or not filename.startswith(f"model_epoch_{epoch_token}_step_")
+        or not filename.endswith(".pth")
+        or not filename[len(f"model_epoch_{epoch_token}_step_"):-4].isdigit()
+    ):
+        raise QualificationGateError(
+            f"{checkpoint_id} terminal checkpoint contract changed"
+        )
     val_miou = _metric(train.get("val_miou"), f"{checkpoint_id}.val_miou")
     test_miou = _metric(
         evaluation.get("test_miou"),
@@ -464,7 +484,7 @@ def audit_qualification(path: str | Path) -> QualificationDecision:
         or document.get("runtime_overlay")
         != FROZEN_QUALIFICATION_RUNTIME_OVERLAY
         or document.get("prior_revision_evidence")
-        != FROZEN_V1_QUALIFICATION_EVIDENCE
+        != FROZEN_PRIOR_QUALIFICATION_EVIDENCE
         or document.get("cpu_model_runs") != 0
         or document.get("smoke_model_runs") != 0
         or document.get("mini_step_runs") != 0
@@ -512,7 +532,7 @@ def audit_qualification(path: str | Path) -> QualificationDecision:
                 != FROZEN_QUALIFICATION_RUNTIME_OVERLAY
             ):
                 raise QualificationGateError(
-                    f"{checkpoint_id} qualification v2 identity changed"
+                    f"{checkpoint_id} qualification v3 identity changed"
                 )
             workflow_sha = _workflow_integrity(
                 workflow,
@@ -680,7 +700,7 @@ class QualificationLoadEvidence:
             reason=(
                 "Exact checkpoint passed full-dataset one-node/eight-GPU "
                 "50-epoch training, validation, terminal reload, and "
-                "standalone eval with the sealed v2 runtime overlay"
+                "standalone eval with the sealed v3 runtime overlay"
             ),
             details={
                 "cpu_or_smoke_model_job_launched": False,
