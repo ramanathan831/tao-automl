@@ -748,12 +748,6 @@ def build_completion(
             if contract["qualification_policy"].get("version") == 3
             else 0
         ),
-        "checkpoint_resume_policy": copy.deepcopy(
-            contract["qualification_policy"].get(
-                "checkpoint_resume_policy",
-                campaign_contract.CHECKPOINT_RESUME_POLICY,
-            )
-        ),
         "distributed_strategy_resolution": copy.deepcopy(
             contract["qualification_policy"][
                 "distributed_strategy_resolution"
@@ -766,6 +760,11 @@ def build_completion(
         ),
         "workflows": [copy.deepcopy(dict(item)) for item in workflows],
     }
+    resume_policy = contract["qualification_policy"].get(
+        "checkpoint_resume_policy"
+    )
+    if resume_policy is not None:
+        value["checkpoint_resume_policy"] = copy.deepcopy(resume_policy)
     value["evidence_sha256"] = canonical_sha256(value)
     return value
 

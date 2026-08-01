@@ -775,7 +775,7 @@ def test_v5_runtime_paths_preserve_v1_v2_v3_and_replay_evidence():
 
 def test_v4_pins_reviewed_bounded_requeue_sdk_and_product_wheel():
     assert manifest_generator.EXPECTED_SDK_COMMIT == (
-        "ff64be3a277ff277f1f6823717dedc7b48f74c45"
+        "1a981d79af40d156735f3d89b98495e7818d0891"
     )
     assert (
         subprocess.run(

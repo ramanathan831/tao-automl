@@ -849,17 +849,14 @@ def build_completion(
         "reused_predecessor_workflow_count": len(reused_ids),
         "reused_predecessor_checkpoint_ids": sorted(reused_ids),
         "recovery_checkpoint_ids": sorted(recovery_ids),
-        "checkpoint_resume_policy": copy.deepcopy(
-            policy.get(
-                "checkpoint_resume_policy",
-                campaign_contract.CHECKPOINT_RESUME_POLICY,
-            )
-        ),
         "predecessor_evidence": copy.deepcopy(
             policy.get("predecessor_evidence")
         ),
         "workflows": [copy.deepcopy(dict(item)) for item in workflows],
     }
+    resume_policy = policy.get("checkpoint_resume_policy")
+    if resume_policy is not None:
+        value["checkpoint_resume_policy"] = copy.deepcopy(resume_policy)
     value["evidence_sha256"] = canonical_sha256(value)
     return value
 

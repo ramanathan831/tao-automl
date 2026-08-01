@@ -55,7 +55,7 @@ the resume field blank. An integrity-hashed decision record is written beside
 the generated spec on every execution.
 
 The v4 successor pins TAO SDK commit
-`ff64be3a277ff277f1f6823717dedc7b48f74c45` and the exact environment name
+`1a981d79af40d156735f3d89b98495e7818d0891` and the exact environment name
 `SLURM_MAX_JOB_RETRIES`. Timeout self-requeue is now bounded with
 `SLURM_RESTART_COUNT`; invalid counts fail closed, the configured cap is ten,
 and non-timeout exit status is preserved. The initial slice may start fresh

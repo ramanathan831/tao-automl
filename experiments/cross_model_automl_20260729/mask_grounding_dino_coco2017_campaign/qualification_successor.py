@@ -127,7 +127,7 @@ def build_contract(
     source_commit = _git(repository, "rev-parse", "HEAD")
     sdk_commit = _git(sdk, "rev-parse", "HEAD")
     skills_commit = _git(skills, "rev-parse", "HEAD")
-    if sdk_commit != "ff64be3a277ff277f1f6823717dedc7b48f74c45":
+    if sdk_commit != "1a981d79af40d156735f3d89b98495e7818d0891":
         raise QualificationSuccessorError("bounded-requeue SDK changed")
     if skills_commit != "2e9c1b25f3c7cb1ae444c75652e36c47eace8229":
         raise QualificationSuccessorError("TAO skills commit changed")

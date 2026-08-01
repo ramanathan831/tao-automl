@@ -149,7 +149,7 @@ command.
 
 The v4 successor keeps the same four-hour allocation and 3.8-hour inner
 timeout, and pins TAO SDK commit
-`ff64be3a277ff277f1f6823717dedc7b48f74c45` (SDK MR !33). The generated sbatch
+`1a981d79af40d156735f3d89b98495e7818d0891` (SDK MR !33). The generated sbatch
 script receives `SLURM_MAX_JOB_RETRIES=10`; timeout-driven `scontrol requeue`
 uses decimal-safe `SLURM_RESTART_COUNT` and stops at that cap. Non-timeout
 failures retain their original status.
