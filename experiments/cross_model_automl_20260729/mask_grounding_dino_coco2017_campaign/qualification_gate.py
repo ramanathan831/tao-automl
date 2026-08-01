@@ -27,6 +27,7 @@ from tao_automl.ptm_registry import canonical_sha256, load_ptm_registry
 
 from .campaign_contract import (
     AGENT_FLAGS,
+    FROZEN_DDP_STRATEGY_RESOLUTION,
     FROZEN_SQSH,
     FROZEN_TRAINING_EPOCHS,
     FROZEN_VALIDATION_SANITY_MIN_MASK_AP,
@@ -112,7 +113,7 @@ class QualificationDecision:
     def stable_dict(self) -> dict[str, Any]:
         return {
             "schema_version": 1,
-            "gate": "mask_grounding_dino_direct_full_gpu_then_supported_registry_v1",
+            "gate": "mask_grounding_dino_direct_full_gpu_then_supported_registry_v2",
             "evidence_path": self.evidence_path,
             "evidence_sha256": self.evidence_sha256,
             "qualification_campaign_id": self.qualification_campaign_id,
@@ -206,6 +207,8 @@ def _successful_workflow(
         or train.get("validation_record_count") != FROZEN_TRAINING_EPOCHS
         or train.get("nodes") != 1
         or train.get("gpus") != 8
+        or train.get("distributed_strategy_resolution")
+        != FROZEN_DDP_STRATEGY_RESOLUTION
         or not isinstance(evaluation, Mapping)
         or evaluation.get("status") != "Complete"
         or evaluation.get("full_validation_split") is not True
@@ -299,6 +302,14 @@ def audit_qualification(
             != runtime.get("ptm_stage_manifest_path")
             or document["ptm_stage_manifest_sha256"]
             != runtime.get("ptm_stage_manifest_sha256")
+            or document.get("distributed_strategy_resolution")
+            != expected_contract.get("qualification_policy", {}).get(
+                "distributed_strategy_resolution"
+            )
+            or document.get("predecessor_failure_evidence")
+            != expected_contract.get("qualification_policy", {}).get(
+                "predecessor_failure_evidence"
+            )
         ):
             raise QualificationGateError(
                 "qualification launcher or PTM stage differs from the "
@@ -342,6 +353,19 @@ def audit_qualification(
         or document.get("cpu_model_runs") != 0
         or document.get("smoke_model_runs") != 0
         or document.get("mini_step_runs") != 0
+        or document.get("distributed_strategy_resolution")
+        != FROZEN_DDP_STRATEGY_RESOLUTION
+        or not isinstance(
+            document.get("predecessor_failure_evidence"), Mapping
+        )
+        or document["predecessor_failure_evidence"].get(
+            "all_terminal_failures_preserved"
+        )
+        is not True
+        or document["predecessor_failure_evidence"].get(
+            "replacement_submitted"
+        )
+        is not False
     ):
         raise QualificationGateError(
             "qualification campaign identity or execution policy changed"

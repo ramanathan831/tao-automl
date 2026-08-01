@@ -70,6 +70,14 @@ def _runtime(tmp_path: Path) -> dict:
         "qualification_evidence_path": str(
             tmp_path / "qualification.json"
         ),
+        "predecessor_failure_evidence": {
+            "path": str(tmp_path / "qualification_v1.json"),
+            "sha256": "9" * 64,
+            "campaign_id": "mask-grounding-dino-qualification-v1-test",
+            "workflow_count": 4,
+            "all_terminal_failures_preserved": True,
+            "replacement_submitted": False,
+        },
         "ptm_stage_manifest_path": str(tmp_path / "ptms.json"),
         "ptm_stage_manifest_sha256": "e" * 64,
         "ptm_stage_content_sha256": "f" * 64,
@@ -98,6 +106,9 @@ def contract(tmp_path: Path) -> dict:
     )
     value.pop("contract_sha256")
     value["launcher_integrity"] = {
+        "ddp_strategy_audit_sha256": campaign_contract.sha256_file(
+            HERE / "ddp_strategy_audit.v2.json"
+        ),
         "campaign_contract_sha256": campaign_contract.sha256_file(
             HERE / "campaign_contract.py"
         ),
@@ -171,6 +182,9 @@ def _workflow(
             ),
             "nodes": 1,
             "gpus": 8,
+            "distributed_strategy_resolution": copy.deepcopy(
+                campaign_contract.FROZEN_DDP_STRATEGY_RESOLUTION
+            ),
             **train_metric,
             "terminal_checkpoint": {
                 "path": f"/lustre/results/{checkpoint_id}.pth",
@@ -229,6 +243,17 @@ def _qualification_document(
         "cpu_model_runs": 0,
         "smoke_model_runs": 0,
         "mini_step_runs": 0,
+        "distributed_strategy_resolution": copy.deepcopy(
+            campaign_contract.FROZEN_DDP_STRATEGY_RESOLUTION
+        ),
+        "predecessor_failure_evidence": {
+            "path": "/tmp/qualification_v1.json",
+            "sha256": "9" * 64,
+            "campaign_id": "mask-grounding-dino-qualification-v1-test",
+            "workflow_count": 4,
+            "all_terminal_failures_preserved": True,
+            "replacement_submitted": False,
+        },
         "workflows": workflows,
     }
     value["evidence_sha256"] = canonical_sha256(value)
@@ -364,10 +389,90 @@ def test_profile_is_instance_coco_eight_gpu_not_smoke():
     assert train["num_epochs"] == 3
     assert train["validation_interval"] == 1
     assert train["distributed_strategy"] == "ddp"
+    assert train["activation_checkpoint"] is False
     assert train["precision"] == "fp32"
     evaluate = profile["evaluate"]
     assert evaluate["num_gpus"] == 8
     assert evaluate["gpu_ids"] == list(range(8))
+
+
+def test_v2_uses_tao_supported_unused_parameter_strategy_resolution(
+    contract,
+):
+    resolution = contract["qualification_policy"][
+        "distributed_strategy_resolution"
+    ]
+    assert resolution == campaign_contract.FROZEN_DDP_STRATEGY_RESOLUTION
+    assert resolution == {
+        "tao_config_value": "ddp",
+        "activation_checkpoint": False,
+        "resolved_lightning_strategy": "ddp_find_unused_parameters_true",
+        "direct_alias_is_valid_tao_config_value": False,
+        "resolution_source": (
+            "pinned_mask_grounding_dino_train_launcher_branch"
+        ),
+    }
+    assert contract["qualification_policy"]["version"] == 2
+
+
+def test_v2_strategy_audit_preserves_exact_v1_failure_evidence():
+    audit_path = HERE / "ddp_strategy_audit.v2.json"
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    predecessor = Path(
+        audit["v1_preserved"]["completion_path"]
+    )
+    assert predecessor.is_file()
+    assert campaign_contract.sha256_file(predecessor) == (
+        audit["v1_preserved"]["completion_sha256"]
+    )
+    assert audit["v1_preserved"]["slurm_job_ids"] == [
+        "31243535",
+        "31243536",
+        "31243537",
+        "31243538",
+    ]
+    assert audit["v2_change_scope"] == {
+        "effective_distributed_strategy_changed": True,
+        "ptm_changed": False,
+        "dataset_changed": False,
+        "search_space_changed": False,
+        "training_epochs_changed": False,
+        "objective_changed": False,
+        "seed_changed": False,
+        "candidate_injected": False,
+        "cpu_model_runs": 0,
+        "smoke_model_runs": 0,
+        "mini_step_runs": 0,
+    }
+
+
+def test_strategy_or_predecessor_mutation_is_fail_closed(contract):
+    changed = copy.deepcopy(contract)
+    changed.pop("contract_sha256")
+    changed["qualification_policy"]["distributed_strategy_resolution"][
+        "resolved_lightning_strategy"
+    ] = "ddp"
+    changed["contract_sha256"] = canonical_sha256(changed)
+    with pytest.raises(
+        campaign_contract.CampaignContractError,
+        match="campaign execution policy changed",
+    ):
+        campaign_contract.validate_contract(changed)
+
+    changed = copy.deepcopy(contract)
+    changed.pop("contract_sha256")
+    changed["runtime"]["predecessor_failure_evidence"][
+        "replacement_submitted"
+    ] = True
+    changed["qualification_policy"]["predecessor_failure_evidence"][
+        "replacement_submitted"
+    ] = True
+    changed["contract_sha256"] = canonical_sha256(changed)
+    with pytest.raises(
+        campaign_contract.CampaignContractError,
+        match="preserved v1 qualification evidence contract changed",
+    ):
+        campaign_contract.validate_contract(changed)
 
 
 def test_mask_ap_sanity_is_separate_from_product_selection(contract):

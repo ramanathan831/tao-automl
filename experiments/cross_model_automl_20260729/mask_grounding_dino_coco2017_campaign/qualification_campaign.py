@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Run the direct full-COCO Mask Grounding DINO PTM qualification workflow.
+"""Run the v2 direct full-COCO Mask Grounding DINO PTM qualification.
 
 The default invocation is plan-only. ``--launch`` is the only path that
 constructs a scheduler client or submits jobs. It runs no CPU/model smoke and
@@ -38,7 +38,7 @@ DEFAULT_CONTRACT = run_campaign.DEFAULT_CONTRACT
 DEFAULT_RUNTIME_ROOT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "mask_grounding_dino_coco2017_ptm_qualification_v1"
+    "mask_grounding_dino_coco2017_ptm_qualification_v2"
 )
 ENV_PATH = run_campaign.ENV_PATH
 CampaignExecutionError = run_campaign.CampaignExecutionError
@@ -61,7 +61,7 @@ def qualification_plan(contract: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": 1,
         "campaign_id": (
-            "mask_grounding_dino-coco2017-direct-full-qualification-20260731"
+            "mask_grounding_dino-coco2017-direct-full-qualification-v2-20260801"
         ),
         "contract_sha256": contract["contract_sha256"],
         "model": "mask_grounding_dino",
@@ -86,6 +86,12 @@ def qualification_plan(contract: Mapping[str, Any]) -> dict[str, Any]:
         "mini_step_runs": 0,
         "replacement_workflows_allowed": False,
         "registry_bypass_allowed": False,
+        "distributed_strategy_resolution": copy.deepcopy(
+            campaign_contract.FROZEN_DDP_STRATEGY_RESOLUTION
+        ),
+        "predecessor_failure_evidence": copy.deepcopy(
+            contract["qualification_policy"]["predecessor_failure_evidence"]
+        ),
         "scheduler_client_constructed": False,
         "jobs_submitted": 0,
         "agent_intervention_flags": {
@@ -241,6 +247,16 @@ def _qualification_specs(
     evaluate["results_dir"] = ""
     evaluate["evaluate"]["checkpoint"] = ""
     evaluate["evaluate"]["results_dir"] = ""
+    strategy = train["train"].get("distributed_strategy")
+    activation_checkpoint = train["train"].get("activation_checkpoint")
+    if (
+        strategy != campaign_contract.FROZEN_TAO_DISTRIBUTED_STRATEGY
+        or activation_checkpoint
+        is not campaign_contract.FROZEN_ACTIVATION_CHECKPOINT
+    ):
+        raise CampaignExecutionError(
+            "qualification DDP strategy differs from the sealed v2 policy"
+        )
     return train, evaluate
 
 
@@ -373,6 +389,11 @@ def _run_one(
     diagnostics: dict[str, Any] = {
         "source_checkpoint": copy.deepcopy(dict(source)),
         "train_spec_sha256": canonical_sha256(train_spec),
+        "distributed_strategy_resolution": copy.deepcopy(
+            contract["qualification_policy"][
+                "distributed_strategy_resolution"
+            ]
+        ),
         "agent_intervention_flags": {
             name: False for name in campaign_contract.AGENT_FLAGS
         },
@@ -506,6 +527,11 @@ def _run_one(
                 "validation_record_count": len(mask_values),
                 "nodes": 1,
                 "gpus": 8,
+                "distributed_strategy_resolution": copy.deepcopy(
+                    contract["qualification_policy"][
+                        "distributed_strategy_resolution"
+                    ]
+                ),
                 "segm_val_mAP50_95": mask_values[-1],
                 "terminal_checkpoint": terminal,
                 "tao_job_id": train_job.id,
@@ -541,7 +567,7 @@ def build_completion(
     value = {
         "schema_version": 1,
         "campaign_id": (
-            "mask_grounding_dino-coco2017-direct-full-qualification-20260731"
+            "mask_grounding_dino-coco2017-direct-full-qualification-v2-20260801"
         ),
         "model": "mask_grounding_dino",
         "task": "category_prompted_grounded_instance_segmentation",
@@ -563,6 +589,14 @@ def build_completion(
         "smoke_model_runs": 0,
         "mini_step_runs": 0,
         "replacement_workflows_submitted": False,
+        "distributed_strategy_resolution": copy.deepcopy(
+            contract["qualification_policy"][
+                "distributed_strategy_resolution"
+            ]
+        ),
+        "predecessor_failure_evidence": copy.deepcopy(
+            contract["qualification_policy"]["predecessor_failure_evidence"]
+        ),
         "workflows": [copy.deepcopy(dict(item)) for item in workflows],
     }
     value["evidence_sha256"] = canonical_sha256(value)
