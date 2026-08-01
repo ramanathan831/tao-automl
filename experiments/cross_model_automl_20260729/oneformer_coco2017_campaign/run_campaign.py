@@ -408,6 +408,16 @@ def verify_local_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
                 "qualification_gate_sha256"
             ],
         ),
+        "qualification_campaign": (
+            HERE / "qualification_campaign.py",
+            contract["launcher_integrity"][
+                "qualification_campaign_sha256"
+            ],
+        ),
+        "ptm_stage_manifest": (
+            runtime["ptm_stage_manifest_path"],
+            runtime["ptm_stage_manifest_sha256"],
+        ),
         "run_campaign": (
             HERE / "run_campaign.py",
             contract["launcher_integrity"]["run_campaign_sha256"],

@@ -589,6 +589,12 @@ def build_preregistered_contract(
                 "qualification_evidence_path"
             ],
             "ptm_stage_manifest_path": runtime["ptm_stage_manifest_path"],
+            "ptm_stage_manifest_sha256": runtime[
+                "ptm_stage_manifest_sha256"
+            ],
+            "ptm_stage_content_sha256": runtime[
+                "ptm_stage_content_sha256"
+            ],
         },
         "execution": {
             "kind": "objective_aware_three_mode_search",
@@ -708,6 +714,14 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
         or value.get("validation_sanity_gate", {}).get("metric") != "PQ"
         or value.get("validation_sanity_gate", {}).get("minimum")
         != FROZEN_VALIDATION_SANITY_MIN_PQ
+        or value.get("qualification_policy", {}).get(
+            "ptm_stage_manifest_sha256"
+        )
+        != value.get("runtime", {}).get("ptm_stage_manifest_sha256")
+        or value.get("qualification_policy", {}).get(
+            "ptm_stage_content_sha256"
+        )
+        != value.get("runtime", {}).get("ptm_stage_content_sha256")
     ):
         raise CampaignContractError("campaign execution policy changed")
     validate_dataset_record(value["dataset"])

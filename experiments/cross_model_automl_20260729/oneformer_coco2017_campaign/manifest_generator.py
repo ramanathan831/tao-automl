@@ -13,9 +13,9 @@ import tarfile
 from pathlib import Path
 from typing import Any
 
-from tao_automl.ptm_registry import canonical_sha256
+from tao_automl.ptm_registry import canonical_sha256, load_ptm_registry
 
-from . import campaign_contract
+from . import campaign_contract, ptm_stage
 
 
 HERE = Path(__file__).resolve().parent
@@ -308,6 +308,30 @@ def _runtime(
             "campaign source does not match the wheel's OneFormer registry"
         )
     overlay = runtime_overlay_record(runtime_overlay)
+    if (
+        not ptm_stage_manifest.is_file()
+        or ptm_stage_manifest.is_symlink()
+        or ptm_stage_manifest.stat().st_mode & 0o222
+    ):
+        raise ManifestGenerationError(
+            "immutable OneFormer PTM stage manifest is unavailable"
+        )
+    stage_document = json.loads(
+        ptm_stage_manifest.read_text(encoding="utf-8")
+    )
+    stage_root = stage_document.get("publication", {}).get(
+        "canonical_root"
+    )
+    try:
+        stage_document = ptm_stage.validate_stage_manifest(
+            stage_document,
+            registry=load_ptm_registry(),
+            canonical_root=stage_root,
+        )
+    except Exception as exc:
+        raise ManifestGenerationError(
+            "OneFormer PTM stage manifest is invalid"
+        ) from exc
     return {
         "repository": str(repository.resolve()),
         "source_commit": head,
@@ -327,6 +351,10 @@ def _runtime(
         ),
         "qualification_evidence_path": str(qualification.resolve()),
         "ptm_stage_manifest_path": str(ptm_stage_manifest.resolve()),
+        "ptm_stage_manifest_sha256": campaign_contract.sha256_file(
+            ptm_stage_manifest
+        ),
+        "ptm_stage_content_sha256": stage_document["manifest_sha256"],
         "runtime_overlay_local_archive_path": overlay[
             "local_archive_path"
         ],
@@ -334,7 +362,8 @@ def _runtime(
         "partition": "polar3",
         "account": "edgeai_tao-ptm_image-foundation-model-clip",
         "base_results_dir": (
-            "/lustre/fsw/portfolios/edgeai/users/rarunachalam"
+            "/lustre/fsw/portfolios/edgeai/projects/"
+            "edgeai_tao-ptm_image-foundation-model-clip/users/rarunachalam"
         ),
         "container_mounts": "/lustre",
         "time_hours": 4.0,
@@ -381,6 +410,9 @@ def build_contract(
         ),
         "qualification_gate_sha256": campaign_contract.sha256_file(
             HERE / "qualification_gate.py"
+        ),
+        "qualification_campaign_sha256": campaign_contract.sha256_file(
+            HERE / "qualification_campaign.py"
         ),
         "run_campaign_sha256": campaign_contract.sha256_file(
             HERE / "run_campaign.py"

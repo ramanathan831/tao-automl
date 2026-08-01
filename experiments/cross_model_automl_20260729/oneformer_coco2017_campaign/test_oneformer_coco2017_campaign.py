@@ -10,7 +10,12 @@ import pytest
 
 from tao_automl.ptm_registry import canonical_sha256, load_ptm_registry
 
-from . import campaign_contract, manifest_generator, run_campaign
+from . import (
+    campaign_contract,
+    manifest_generator,
+    qualification_campaign,
+    run_campaign,
+)
 from . import qualification_gate
 from .qualification_gate import (
     QualificationGateError,
@@ -92,6 +97,8 @@ def runtime() -> dict:
         "skill_dir": str(SKILL_DIR),
         "qualification_evidence_path": "/tmp/qualification.json",
         "ptm_stage_manifest_path": "/tmp/ptm_stage.json",
+        "ptm_stage_manifest_sha256": "e" * 64,
+        "ptm_stage_content_sha256": "f" * 64,
         "runtime_overlay_local_archive_path": (
             str(manifest_generator.DEFAULT_RUNTIME_OVERLAY)
         ),
@@ -131,6 +138,41 @@ def test_registry_snapshots_all_four_official_nonordinal_arms():
         and record["checkpoint_spec_file"]["source"] == "repository"
         for record in snapshot["records"]
     )
+
+
+def test_direct_qualification_plan_is_four_concurrent_full_gpu_workflows():
+    plan = qualification_campaign.qualification_plan(contract())
+    assert plan["workflow_count"] == 4
+    assert plan["all_workflows_independent"] is True
+    assert plan["all_workflows_concurrent"] is True
+    assert plan["full_dataset"] is True
+    assert plan["training_epochs"] == 1
+    assert plan["standalone_full_validation"] is True
+    assert plan["resources_per_job"]["nodes"] == 1
+    assert plan["resources_per_job"]["gpus"] == 8
+    assert plan["cpu_model_runs"] == 0
+    assert plan["smoke_model_runs"] == 0
+    assert plan["mini_step_runs"] == 0
+    assert plan["replacement_workflows_allowed"] is False
+
+
+def test_direct_qualification_completion_matches_gate_identity():
+    value = contract()
+    value["launcher_integrity"] = {
+        "qualification_campaign_sha256": "1" * 64,
+    }
+    completion = qualification_campaign.build_completion(value, [])
+    assert completion["model"] == "oneformer"
+    assert completion["task"] == "panoptic_segmentation"
+    assert completion["metric"] == "PQ"
+    assert completion["pq_emitted"] is True
+    assert completion["pq_claim_authorized"] is True
+    assert completion["cpu_model_runs"] == 0
+    assert completion["smoke_model_runs"] == 0
+    assert completion["mini_step_runs"] == 0
+    payload = copy.deepcopy(completion)
+    supplied = payload.pop("evidence_sha256")
+    assert supplied == canonical_sha256(payload)
 
 
 def test_packaged_schema_owns_every_frozen_search_parameter():
