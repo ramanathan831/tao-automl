@@ -35,6 +35,7 @@ from tao_automl.ptm_registry import (
 from .campaign_contract import (
     AGENT_FLAGS,
     FROZEN_QUALIFICATION_FIDELITY,
+    FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY,
     FROZEN_QUALIFICATION_RUNTIME_OVERLAY,
     FROZEN_QUALIFICATION_TRAINING_EPOCHS,
     FROZEN_RUNTIME_LOCAL_CHECKPOINT_SPEC_FILE,
@@ -169,6 +170,8 @@ def _stage_evidence(
         != FROZEN_QUALIFICATION_FIDELITY
         or stage.get("runtime", {}).get("runtime_overlay")
         != FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+        or stage.get("runtime", {}).get("infrastructure_retry_policy")
+        != FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
         or stage.get("prior_revision_evidence")
         != FROZEN_PRIOR_QUALIFICATION_EVIDENCE
         or not isinstance(rows, list)
@@ -447,6 +450,137 @@ def _pretrained_load_evidence(
     return copy.deepcopy(dict(report))
 
 
+def _job_infrastructure_evidence(
+    job: Mapping[str, Any],
+    *,
+    checkpoint_id: str,
+    phase: str,
+) -> None:
+    """Reject unsealed, ambiguous, or successful-job replacement attempts."""
+    policy = FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
+    policy_sha256 = canonical_sha256(policy)
+    attempts = job.get("attempts")
+    if (
+        job.get("status") != "Complete"
+        or job.get("infrastructure_retry_policy_sha256") != policy_sha256
+        or job.get("maximum_job_attempts")
+        != policy["maximum_job_attempts_per_phase"]
+        or job.get("successful_job_replacement_allowed") is not False
+        or not isinstance(attempts, list)
+        or not 1 <= len(attempts) <= policy["maximum_job_attempts_per_phase"]
+        or job.get("job_attempt") != len(attempts)
+        or job.get("infrastructure_retry_count") != len(attempts) - 1
+    ):
+        raise QualificationGateError(
+            f"{checkpoint_id}.{phase} infrastructure retry evidence is invalid"
+        )
+    job_ids = []
+    for index, attempt in enumerate(attempts, start=1):
+        if not isinstance(attempt, Mapping):
+            raise QualificationGateError(
+                f"{checkpoint_id}.{phase} job attempt is invalid"
+            )
+        submission = attempt.get("submission")
+        failures = (
+            submission.get("transient_failures")
+            if isinstance(submission, Mapping)
+            else None
+        )
+        if (
+            attempt.get("job_attempt") != index
+            or not isinstance(attempt.get("tao_job_id"), str)
+            or not attempt["tao_job_id"]
+            or attempt.get("command_sha256") != job.get("command_sha256")
+            or not isinstance(attempt.get("submitted_at_utc"), str)
+            or not isinstance(attempt.get("terminal_at_utc"), str)
+            or not str(attempt.get("result_root", "")).startswith("/lustre/")
+            or not isinstance(submission, Mapping)
+            or submission.get("policy_sha256") != policy_sha256
+            or submission.get("stable_job_identity_obtained") is not True
+            or isinstance(submission.get("attempt_count"), bool)
+            or not isinstance(submission.get("attempt_count"), int)
+            or not 1
+            <= submission["attempt_count"]
+            <= policy["maximum_submission_attempts_per_job"]
+            or submission.get("retry_count")
+            != submission["attempt_count"] - 1
+            or not isinstance(failures, list)
+            or len(failures) != submission["retry_count"]
+        ):
+            raise QualificationGateError(
+                f"{checkpoint_id}.{phase} submission evidence is invalid"
+            )
+        for failure_index, failure in enumerate(failures, start=1):
+            if (
+                not isinstance(failure, Mapping)
+                or failure.get("attempt") != failure_index
+                or failure.get("exception_type")
+                != policy["retryable_submission_exception_type"]
+                or failure.get("message")
+                != policy["retryable_submission_message"]
+                or failure.get("classification")
+                != "pre_submission_stable_identity_unavailable"
+            ):
+                raise QualificationGateError(
+                    f"{checkpoint_id}.{phase} submission retry is invalid"
+                )
+        infrastructure = attempt.get("infrastructure_failure_evidence")
+        if not isinstance(infrastructure, Mapping):
+            raise QualificationGateError(
+                f"{checkpoint_id}.{phase} terminal evidence is invalid"
+            )
+        is_final = index == len(attempts)
+        if is_final:
+            valid_terminal = (
+                attempt.get("status") == "Complete"
+                and attempt.get("infrastructure_retry_submitted") is False
+                and infrastructure
+                == {
+                    "classification": "terminal_status_not_retryable",
+                    "retry_eligible": False,
+                    "terminal_status": "Complete",
+                }
+            )
+        else:
+            analysis = infrastructure.get("sdk_failure_analysis")
+            valid_terminal = (
+                attempt.get("status") == policy["retryable_terminal_status"]
+                and attempt.get("infrastructure_retry_submitted") is True
+                and infrastructure.get("classification")
+                == "pre_import_cuda_driver_runtime_incompatible"
+                and infrastructure.get("retry_eligible") is True
+                and infrastructure.get("terminal_status")
+                == policy["retryable_terminal_status"]
+                and infrastructure.get("controller_marker_occurrences") == 1
+                and _sha(
+                    infrastructure.get("log_sha256"),
+                    f"{checkpoint_id}.{phase}.attempt_{index}.log_sha256",
+                )
+                == infrastructure.get("log_sha256")
+                and isinstance(infrastructure.get("log_size_bytes"), int)
+                and infrastructure["log_size_bytes"] > 0
+                and isinstance(analysis, Mapping)
+                and analysis.get("reason")
+                == "infrastructure_failure_pattern"
+                and analysis.get("retriable") is True
+                and analysis.get("match")
+                == policy["sdk_failure_analysis_match"]
+            )
+        if not valid_terminal:
+            raise QualificationGateError(
+                f"{checkpoint_id}.{phase} job retry classification is invalid"
+            )
+        job_ids.append(attempt["tao_job_id"])
+    if (
+        len(set(job_ids)) != len(job_ids)
+        or job.get("tao_job_id") != job_ids[-1]
+        or job.get("result_root") != attempts[-1]["result_root"]
+    ):
+        raise QualificationGateError(
+            f"{checkpoint_id}.{phase} final job identity is invalid"
+        )
+
+
 def _successful_workflow(
     workflow: Mapping[str, Any],
     *,
@@ -464,6 +598,8 @@ def _successful_workflow(
         != FROZEN_QUALIFICATION_FIDELITY
         or workflow.get("runtime_overlay")
         != FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+        or workflow.get("infrastructure_retry_policy")
+        != FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
     ):
         raise QualificationGateError(
             f"{checkpoint_id} did not finish qualification successfully"
@@ -523,6 +659,16 @@ def _successful_workflow(
         raise QualificationGateError(
             f"{checkpoint_id} full train/evaluation contract is incomplete"
         )
+    _job_infrastructure_evidence(
+        train["job"],
+        checkpoint_id=checkpoint_id,
+        phase="train",
+    )
+    _job_infrastructure_evidence(
+        evaluation["job"],
+        checkpoint_id=checkpoint_id,
+        phase="evaluate",
+    )
     pretrained_load = _pretrained_load_evidence(
         train,
         checkpoint_id=checkpoint_id,
@@ -910,6 +1056,8 @@ def audit_qualification(
         != FROZEN_QUALIFICATION_FIDELITY
         or document.get("runtime_overlay")
         != FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+        or document.get("infrastructure_retry_policy")
+        != FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
         or document.get("prior_revision_evidence")
         != FROZEN_PRIOR_QUALIFICATION_EVIDENCE
         or document.get("cpu_model_runs") != 0
@@ -987,6 +1135,8 @@ def audit_qualification(
                 != FROZEN_QUALIFICATION_FIDELITY
                 or workflow.get("runtime_overlay")
                 != FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+                or workflow.get("infrastructure_retry_policy")
+                != FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
             ):
                 raise QualificationGateError(
                     f"{checkpoint_id} qualification v4 identity changed"
