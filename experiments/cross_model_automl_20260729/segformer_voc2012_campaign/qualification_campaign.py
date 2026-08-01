@@ -248,6 +248,9 @@ def verify_slurm_preflight(
         )
     qualification = contract["qualification_policy"]
     overlay = qualification.get("runtime_overlay")
+    infrastructure_policy = qualification.get(
+        "infrastructure_retry_policy"
+    )
     if (
         qualification.get("revision")
         != campaign_contract.QUALIFICATION_REVISION
@@ -255,6 +258,8 @@ def verify_slurm_preflight(
         != campaign_contract.FROZEN_QUALIFICATION_FIDELITY
         or overlay
         != campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+        or infrastructure_policy
+        != campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
     ):
         raise CampaignExecutionError(
             "qualification v4 fidelity or runtime overlay changed"
@@ -302,6 +307,9 @@ def verify_slurm_preflight(
         "sdk_source": str(sdk_source),
         "sqsh_readable": True,
         "qualification_runtime_overlay": copy.deepcopy(overlay),
+        "qualification_infrastructure_retry_policy": copy.deepcopy(
+            infrastructure_policy
+        ),
         "scheduler_jobs_submitted": 0,
     }
 
@@ -662,6 +670,9 @@ def stage_runtime_inputs(
             "runtime_overlay": copy.deepcopy(
                 campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
             ),
+            "infrastructure_retry_policy": copy.deepcopy(
+                campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
+            ),
         },
         "recipe_fidelity": copy.deepcopy(
             campaign_contract.FROZEN_QUALIFICATION_FIDELITY
@@ -743,6 +754,9 @@ def validate_stage_manifest(
             "required_gpu": campaign_contract.FROZEN_HARDWARE,
             "runtime_overlay": (
                 campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+            ),
+            "infrastructure_retry_policy": (
+                campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
             ),
         }
         or value.get("recipe_fidelity")
@@ -1043,8 +1057,27 @@ def _action(contract: Mapping[str, Any], name: str) -> Mapping[str, Any]:
     return action
 
 
+def _infrastructure_policy(
+    contract: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    policy = contract.get("qualification_policy", {}).get(
+        "infrastructure_retry_policy"
+    )
+    if policy != campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY:
+        raise CampaignExecutionError(
+            "qualification infrastructure retry policy changed"
+        )
+    return policy
+
+
 def _gpu_guard(command: str) -> str:
     """Require the exact frozen one-node/eight-A100 runtime."""
+    policy = campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
+    failure_marker = shlex.quote(policy["node_preflight_failure_marker"])
+    failure_exit = policy["node_preflight_failure_exit_code"]
+    minimum_driver_major = policy["minimum_nvidia_driver_major"]
+    minimum_cuda_api = policy["minimum_cuda_driver_api_version"]
+    success_marker = policy["node_preflight_success_marker"]
     return " ".join(
         [
             "set -eu;",
@@ -1064,6 +1097,22 @@ def _gpu_guard(command: str) -> str:
             "--format=csv,noheader)\";",
             "gpu_mem=\"$(nvidia-smi --query-gpu=memory.total "
             "--format=csv,noheader,nounits)\";",
+            "if ! python3 -c 'import ctypes,subprocess,sys; "
+            "versions=subprocess.check_output([\"nvidia-smi\", "
+            "\"--query-gpu=driver_version\", "
+            "\"--format=csv,noheader\"], text=True).splitlines(); "
+            f"ok=len(versions)==8 and all(v.split(\".\",1)[0].isdigit() "
+            f"and int(v.split(\".\",1)[0])>={minimum_driver_major} "
+            "for v in versions); ok or sys.exit(1); "
+            "d=ctypes.CDLL(\"libcuda.so.1\"); v=ctypes.c_int(); "
+            "r=d.cuInit(0); r and sys.exit(r); "
+            "r=d.cuDriverGetVersion(ctypes.byref(v)); "
+            f"r and sys.exit(r); v.value>={minimum_cuda_api} "
+            "or sys.exit(1)'; then "
+            f"printf '%s\\n' {failure_marker}; exit {failure_exit}; fi;",
+            f"printf '%s\\n' '{success_marker} "
+            f"minimum_nvidia_driver_major={minimum_driver_major} "
+            f"minimum_cuda_driver_api_version={minimum_cuda_api}';",
             "test \"$(printf '%s\\n' \"$gpu_names\" | "
             "sed '/^$/d' | wc -l)\" -eq 8;",
             "test \"$(printf '%s\\n' \"$gpu_names\" | sort -u)\" = "
@@ -1120,6 +1169,7 @@ def _entrypoint(
     from tao_sdk.script_runner import build_entrypoint
 
     action = _action(contract, action_name)
+    _infrastructure_policy(contract)
     overlay = _runtime_overlay_install_command(
         contract,
         action_name=action_name,
@@ -1140,16 +1190,76 @@ def _submit_job(
     sdk: Any,
     contract: Mapping[str, Any],
     command: str,
-) -> Any:
+    *,
+    events: Path | None = None,
+    checkpoint_id: str | None = None,
+    phase: str | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    """Submit with one sealed retry for the exact stable-identity defect."""
     runtime = contract["runtime"]
-    return sdk.create_job(
-        image=contract["sqsh"]["path"],
-        command=command,
-        gpu_count=8,
-        num_nodes=1,
-        partition=runtime["partition"],
-        account=runtime["account"],
-    )
+    policy = _infrastructure_policy(contract)
+    failures = []
+    maximum_attempts = policy["maximum_submission_attempts_per_job"]
+    for attempt in range(1, maximum_attempts + 1):
+        try:
+            job = sdk.create_job(
+                image=contract["sqsh"]["path"],
+                command=command,
+                gpu_count=8,
+                num_nodes=1,
+                partition=runtime["partition"],
+                account=runtime["account"],
+            )
+        except RuntimeError as exc:
+            exact_retryable = (
+                type(exc).__name__
+                == policy["retryable_submission_exception_type"]
+                and str(exc) == policy["retryable_submission_message"]
+            )
+            if not exact_retryable:
+                raise
+            failure = {
+                "attempt": attempt,
+                "exception_type": type(exc).__name__,
+                "message": str(exc),
+                "classification": (
+                    "pre_submission_stable_identity_unavailable"
+                ),
+            }
+            failures.append(failure)
+            exhausted = attempt == maximum_attempts
+            if (
+                events is not None
+                and checkpoint_id is not None
+                and phase is not None
+            ):
+                append_jsonl(
+                    events,
+                    {
+                        "event": (
+                            "qualification_submission_retry_exhausted"
+                            if exhausted
+                            else "qualification_submission_retry"
+                        ),
+                        "phase": phase,
+                        "checkpoint_id": checkpoint_id,
+                        "submission_attempt": attempt,
+                        "classification": failure["classification"],
+                        "observed_at_utc": utc_timestamp(),
+                    },
+                )
+            if exhausted:
+                raise
+            time.sleep(policy["retry_delay_seconds"])
+            continue
+        return job, {
+            "attempt_count": attempt,
+            "retry_count": len(failures),
+            "transient_failures": failures,
+            "stable_job_identity_obtained": True,
+            "policy_sha256": canonical_sha256(policy),
+        }
+    raise AssertionError("unreachable submission retry state")
 
 
 def _wait_for_job(
@@ -1179,6 +1289,189 @@ def _wait_for_job(
         if status in TERMINAL_JOB_STATUSES:
             return status
         time.sleep(10)
+
+
+def _terminal_infrastructure_retry_evidence(
+    sdk: Any,
+    contract: Mapping[str, Any],
+    job_id: str,
+    status: str,
+) -> dict[str, Any]:
+    """Classify only the controller-owned CUDA preflight failure marker."""
+    policy = _infrastructure_policy(contract)
+    if status != policy["retryable_terminal_status"]:
+        return {
+            "classification": "terminal_status_not_retryable",
+            "retry_eligible": False,
+            "terminal_status": status,
+        }
+    try:
+        logs = sdk.get_job_logs(job_id, tail=500)
+        failure_analysis = sdk.get_failure_analysis(job_id)
+    except Exception as exc:
+        return {
+            "classification": "infrastructure_evidence_unavailable",
+            "retry_eligible": False,
+            "terminal_status": status,
+            "evidence_error_type": type(exc).__name__,
+        }
+    if not isinstance(logs, str):
+        logs = ""
+    marker = policy["node_preflight_failure_marker"]
+    marker_occurrences = sum(
+        line.strip() == marker for line in logs.splitlines()
+    )
+    analysis = (
+        copy.deepcopy(dict(failure_analysis))
+        if isinstance(failure_analysis, Mapping)
+        else None
+    )
+    analysis_matches = bool(
+        analysis
+        and analysis.get("reason") == "infrastructure_failure_pattern"
+        and analysis.get("retriable") is True
+        and analysis.get("match") == policy["sdk_failure_analysis_match"]
+    )
+    retry_eligible = marker_occurrences == 1 and analysis_matches
+    return {
+        "classification": (
+            "pre_import_cuda_driver_runtime_incompatible"
+            if retry_eligible
+            else "terminal_error_not_exact_infrastructure_signature"
+        ),
+        "retry_eligible": retry_eligible,
+        "terminal_status": status,
+        "controller_marker_occurrences": marker_occurrences,
+        "log_size_bytes": len(logs.encode("utf-8")),
+        "log_sha256": hashlib.sha256(logs.encode("utf-8")).hexdigest(),
+        "sdk_failure_analysis": analysis,
+    }
+
+
+def _run_qualification_job(
+    sdk: Any,
+    contract: Mapping[str, Any],
+    command: str,
+    *,
+    evidence: dict[str, Any],
+    evidence_path: Path,
+    events: Path,
+    checkpoint_id: str,
+    phase: str,
+    job_key: str,
+    job_metadata: Mapping[str, Any],
+) -> tuple[Any, str]:
+    """Run one phase with one exact-signature infrastructure retry."""
+    policy = _infrastructure_policy(contract)
+    policy_sha256 = canonical_sha256(policy)
+    maximum_attempts = policy["maximum_job_attempts_per_phase"]
+    attempts: list[dict[str, Any]] = []
+    base = copy.deepcopy(dict(job_metadata))
+    evidence["jobs"][job_key] = {
+        **base,
+        "status": "submitting",
+        "attempts": [],
+        "infrastructure_retry_policy_sha256": policy_sha256,
+        "maximum_job_attempts": maximum_attempts,
+        "successful_job_replacement_allowed": False,
+    }
+    atomic_json(evidence_path, evidence)
+
+    for job_attempt in range(1, maximum_attempts + 1):
+        job, submission = _submit_job(
+            sdk,
+            contract,
+            command,
+            events=events,
+            checkpoint_id=checkpoint_id,
+            phase=phase,
+        )
+        attempt = {
+            "job_attempt": job_attempt,
+            "tao_job_id": job.id,
+            "status": "submitted",
+            "submitted_at_utc": utc_timestamp(),
+            "submission": submission,
+            "command_sha256": base["command_sha256"],
+        }
+        attempts.append(attempt)
+        evidence["jobs"][job_key] = {
+            **base,
+            "tao_job_id": job.id,
+            "status": "submitted",
+            "submitted_at_utc": attempt["submitted_at_utc"],
+            "job_attempt": job_attempt,
+            "attempts": copy.deepcopy(attempts),
+            "infrastructure_retry_policy_sha256": policy_sha256,
+            "maximum_job_attempts": maximum_attempts,
+            "successful_job_replacement_allowed": False,
+        }
+        atomic_json(evidence_path, evidence)
+
+        status = _wait_for_job(
+            sdk,
+            job.id,
+            events=events,
+            checkpoint_id=checkpoint_id,
+            phase=phase,
+        )
+        attempt.update(
+            {
+                "status": status,
+                "terminal_at_utc": utc_timestamp(),
+                "result_root": run_campaign._local_lustre_path(
+                    sdk.get_job_results_dir(job.id)
+                ),
+            }
+        )
+        infrastructure = _terminal_infrastructure_retry_evidence(
+            sdk,
+            contract,
+            job.id,
+            status,
+        )
+        attempt["infrastructure_failure_evidence"] = infrastructure
+        retry_submitted = bool(
+            infrastructure["retry_eligible"]
+            and job_attempt < maximum_attempts
+        )
+        attempt["infrastructure_retry_submitted"] = retry_submitted
+        evidence["jobs"][job_key] = {
+            **base,
+            "tao_job_id": job.id,
+            "status": status,
+            "submitted_at_utc": attempt["submitted_at_utc"],
+            "terminal_at_utc": attempt["terminal_at_utc"],
+            "result_root": attempt["result_root"],
+            "job_attempt": job_attempt,
+            "attempts": copy.deepcopy(attempts),
+            "infrastructure_retry_count": sum(
+                item["infrastructure_retry_submitted"] for item in attempts
+            ),
+            "infrastructure_retry_policy_sha256": policy_sha256,
+            "maximum_job_attempts": maximum_attempts,
+            "successful_job_replacement_allowed": False,
+        }
+        atomic_json(evidence_path, evidence)
+        if status == "Complete":
+            return job, status
+        if not retry_submitted:
+            return job, status
+        append_jsonl(
+            events,
+            {
+                "event": "qualification_infrastructure_phase_retry",
+                "phase": phase,
+                "checkpoint_id": checkpoint_id,
+                "prior_tao_job_id": job.id,
+                "prior_job_attempt": job_attempt,
+                "next_job_attempt": job_attempt + 1,
+                "classification": infrastructure["classification"],
+                "observed_at_utc": utc_timestamp(),
+            },
+        )
+        time.sleep(policy["retry_delay_seconds"])
+    raise AssertionError("unreachable qualification job retry state")
 
 
 def _status_records(
@@ -1423,27 +1716,47 @@ def _evaluation_status_evidence(
         job_id,
         action="evaluate",
     )
-    metrics = []
+    metric_occurrences = []
     for record in records:
         kpi = record.get("kpi")
         if not isinstance(kpi, Mapping):
             continue
-        for name in ("test_miou", "val_miou", "mIoU"):
-            if name in kpi:
-                metrics.append(
-                    {
-                        "reported_name": name,
-                        "test_miou": _metric(
-                            kpi[name],
-                            name="standalone test_miou",
-                        ),
-                    }
-                )
-                break
-    if len(metrics) != 1:
+        names = [
+            name
+            for name in ("test_miou", "val_miou", "mIoU")
+            if name in kpi
+        ]
+        if not names:
+            continue
+        if len(names) != 1:
+            raise CampaignExecutionError(
+                "standalone evaluation KPI snapshot contains multiple "
+                "accepted mIoU metric names"
+            )
+        name = names[0]
+        snapshot = {
+            "reported_name": name,
+            "test_miou": _metric(
+                kpi[name],
+                name="standalone test_miou",
+            ),
+            "kpi": copy.deepcopy(dict(kpi)),
+        }
+        metric_occurrences.append(
+            {
+                **snapshot,
+                "snapshot_sha256": canonical_sha256(snapshot),
+            }
+        )
+    unique_metrics = {
+        item["snapshot_sha256"]: item for item in metric_occurrences
+    }
+    if len(unique_metrics) != 1:
         raise CampaignExecutionError(
-            f"standalone evaluation emitted {len(metrics)} mIoU records; "
-            "expected exactly one"
+            "standalone evaluation emitted "
+            f"{len(metric_occurrences)} mIoU records representing "
+            f"{len(unique_metrics)} unique semantic KPI snapshots; "
+            "expected exactly one unique snapshot"
         )
     if not any(
         record.get("message") == "Evaluate finished successfully."
@@ -1452,11 +1765,15 @@ def _evaluation_status_evidence(
         raise CampaignExecutionError(
             "evaluation status lacks the terminal TAO success record"
         )
+    metric = next(iter(unique_metrics.values()))
     return {
         **identity,
-        "test_metric_record_count": 1,
-        "reported_metric_name": metrics[0]["reported_name"],
-        "test_miou": metrics[0]["test_miou"],
+        "test_metric_record_count": len(metric_occurrences),
+        "unique_test_metric_snapshot_count": 1,
+        "duplicate_identical_metric_snapshots_allowed": True,
+        "metric_snapshot_sha256": metric["snapshot_sha256"],
+        "reported_metric_name": metric["reported_name"],
+        "test_miou": metric["test_miou"],
         "terminal_success": True,
         "terminal_success_message": "Evaluate finished successfully.",
     }
@@ -1518,6 +1835,9 @@ def _run_workflow(
         "runtime_overlay": copy.deepcopy(
             campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
         ),
+        "infrastructure_retry_policy": copy.deepcopy(
+            campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
+        ),
         "jobs": {},
         "agent_intervention_flags": {
             name: False for name in campaign_contract.AGENT_FLAGS
@@ -1554,38 +1874,27 @@ def _run_workflow(
             "train",
             train_spec,
         )
-        train_job = _submit_job(sdk, contract, train_command)
-        evidence["jobs"]["train"] = {
-            "tao_job_id": train_job.id,
-            "status": "submitted",
-            "submitted_at_utc": utc_timestamp(),
-            "spec_sha256": canonical_sha256(train_spec),
-            "staged_spec_sha256": row["specs"]["train"][
-                "raw_yaml_sha256"
-            ],
-            "command_sha256": train_command_sha,
-            "runtime_overlay_required": True,
-            "nodes": 1,
-            "gpus": 8,
-        }
-        atomic_json(evidence_path, evidence)
-        train_status = _wait_for_job(
+        train_job, train_status = _run_qualification_job(
             sdk,
-            train_job.id,
+            contract,
+            train_command,
+            evidence=evidence,
+            evidence_path=evidence_path,
             events=events,
             checkpoint_id=checkpoint_id,
             phase=phase,
+            job_key="train",
+            job_metadata={
+                "spec_sha256": canonical_sha256(train_spec),
+                "staged_spec_sha256": row["specs"]["train"][
+                    "raw_yaml_sha256"
+                ],
+                "command_sha256": train_command_sha,
+                "runtime_overlay_required": True,
+                "nodes": 1,
+                "gpus": 8,
+            },
         )
-        evidence["jobs"]["train"].update(
-            {
-                "status": train_status,
-                "terminal_at_utc": utc_timestamp(),
-                "result_root": run_campaign._local_lustre_path(
-                    sdk.get_job_results_dir(train_job.id)
-                ),
-            }
-        )
-        atomic_json(evidence_path, evidence)
         if train_status != "Complete":
             evidence["jobs"]["train"]["failure_analysis"] = (
                 sdk.get_failure_analysis(train_job.id)
@@ -1635,43 +1944,28 @@ def _run_workflow(
             "evaluate",
             evaluation_spec,
         )
-        evaluation_job = _submit_job(
+        evaluation_job, evaluation_status = _run_qualification_job(
             sdk,
             contract,
             evaluation_command,
-        )
-        evidence["jobs"]["evaluate"] = {
-            "tao_job_id": evaluation_job.id,
-            "status": "submitted",
-            "submitted_at_utc": utc_timestamp(),
-            "template_sha256": row["specs"]["evaluate"][
-                "document_sha256"
-            ],
-            "resolved_spec_sha256": canonical_sha256(evaluation_spec),
-            "command_sha256": evaluation_command_sha,
-            "runtime_overlay_required": True,
-            "checkpoint": checkpoint,
-            "nodes": 1,
-            "gpus": 8,
-        }
-        atomic_json(evidence_path, evidence)
-        evaluation_status = _wait_for_job(
-            sdk,
-            evaluation_job.id,
+            evidence=evidence,
+            evidence_path=evidence_path,
             events=events,
             checkpoint_id=checkpoint_id,
             phase=phase,
+            job_key="evaluate",
+            job_metadata={
+                "template_sha256": row["specs"]["evaluate"][
+                    "document_sha256"
+                ],
+                "resolved_spec_sha256": canonical_sha256(evaluation_spec),
+                "command_sha256": evaluation_command_sha,
+                "runtime_overlay_required": True,
+                "checkpoint": checkpoint,
+                "nodes": 1,
+                "gpus": 8,
+            },
         )
-        evidence["jobs"]["evaluate"].update(
-            {
-                "status": evaluation_status,
-                "terminal_at_utc": utc_timestamp(),
-                "result_root": run_campaign._local_lustre_path(
-                    sdk.get_job_results_dir(evaluation_job.id)
-                ),
-            }
-        )
-        atomic_json(evidence_path, evidence)
         if evaluation_status != "Complete":
             evidence["jobs"]["evaluate"]["failure_analysis"] = (
                 sdk.get_failure_analysis(evaluation_job.id)
@@ -1753,6 +2047,9 @@ def _run_workflow(
             "runtime_overlay": copy.deepcopy(
                 campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
             ),
+            "infrastructure_retry_policy": copy.deepcopy(
+                campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
+            ),
             "jobs": copy.deepcopy(evidence.get("jobs", {})),
             "terminal_at_utc": utc_timestamp(),
             "agent_intervention_flags": {
@@ -1789,6 +2086,9 @@ def _missing_workflow(
             ),
             "runtime_overlay": copy.deepcopy(
                 campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+            ),
+            "infrastructure_retry_policy": copy.deepcopy(
+                campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
             ),
             "terminal_at_utc": utc_timestamp(),
             "agent_intervention_flags": {
@@ -1849,6 +2149,9 @@ def build_completion(
         ),
         "runtime_overlay": copy.deepcopy(
             campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+        ),
+        "infrastructure_retry_policy": copy.deepcopy(
+            campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
         ),
         "prior_revision_evidence": copy.deepcopy(
             campaign_contract.FROZEN_PRIOR_QUALIFICATION_EVIDENCE

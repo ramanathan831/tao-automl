@@ -167,6 +167,36 @@ FROZEN_QUALIFICATION_RUNTIME_OVERLAY = {
         "positive_pretrained_load_receipt",
     ],
 }
+FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY = {
+    "schema_version": 1,
+    "container_cuda_toolkit_version": "13.2",
+    "minimum_nvidia_driver_major": 580,
+    "minimum_cuda_driver_api_version": 13000,
+    "node_preflight_failure_exit_code": 92,
+    "node_preflight_failure_marker": (
+        "SEGFORMER_INFRASTRUCTURE_PREFLIGHT_FAILURE "
+        "CUDA driver version is insufficient"
+    ),
+    "node_preflight_success_marker": (
+        "SEGFORMER_INFRASTRUCTURE_PREFLIGHT_OK"
+    ),
+    "maximum_job_attempts_per_phase": 2,
+    "maximum_submission_attempts_per_job": 2,
+    "retry_delay_seconds": 10,
+    "retryable_submission_exception_type": "RuntimeError",
+    "retryable_submission_message": (
+        "SLURM cluster did not provide a stable identity; refusing to "
+        "launch an unrecoverable job"
+    ),
+    "retryable_terminal_status": "Error",
+    "sdk_failure_analysis_match": "CUDA driver version is insufficient",
+    "retry_scope": [
+        "pre_submission_stable_identity",
+        "pre_import_cuda_driver_runtime_compatibility",
+    ],
+    "non_infrastructure_failure_retry_allowed": False,
+    "successful_job_replacement_allowed": False,
+}
 RUNTIME_LOCAL_ELIGIBILITY_KIND = (
     "segformer_positive_load_runtime_local_v1"
 )
@@ -783,6 +813,9 @@ def build_preregistered_contract(
             "runtime_overlay": copy.deepcopy(
                 FROZEN_QUALIFICATION_RUNTIME_OVERLAY
             ),
+            "infrastructure_retry_policy": copy.deepcopy(
+                FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
+            ),
             "prior_revision_evidence": copy.deepcopy(
                 FROZEN_PRIOR_QUALIFICATION_EVIDENCE
             ),
@@ -912,6 +945,8 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
         != FROZEN_QUALIFICATION_FIDELITY
         or qualification.get("runtime_overlay")
         != FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+        or qualification.get("infrastructure_retry_policy")
+        != FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
         or qualification.get("prior_revision_evidence")
         != FROZEN_PRIOR_QUALIFICATION_EVIDENCE
     ):
@@ -1051,6 +1086,7 @@ __all__ = [
     "FROZEN_LATENCY_RETENTION",
     "FROZEN_LATENCY_TOLERANCE_MS",
     "FROZEN_QUALIFICATION_FIDELITY",
+    "FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY",
     "FROZEN_QUALIFICATION_RUNTIME_OVERLAY",
     "FROZEN_RUNTIME_LOCAL_CHECKPOINT_SPEC_FILE",
     "FROZEN_QUALIFICATION_TRAINING_EPOCHS",

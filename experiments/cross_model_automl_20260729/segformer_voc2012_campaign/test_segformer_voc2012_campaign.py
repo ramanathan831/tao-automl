@@ -6,8 +6,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import socket
 import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -140,6 +142,9 @@ def _workflow(
             "runtime_overlay": copy.deepcopy(
                 campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
             ),
+            "infrastructure_retry_policy": copy.deepcopy(
+                campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
+            ),
         }
         value["workflow_sha256"] = canonical_sha256(value)
         return value
@@ -164,6 +169,54 @@ def _workflow(
         "status_record_occurrences": 1,
         "report_sha256": canonical_sha256(load_payload),
     }
+
+    def completed_job(phase: str) -> dict:
+        policy = campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
+        command_sha256 = ("d" if phase == "train" else "e") * 64
+        job_id = f"{phase}-job-id"
+        result_root = f"/lustre/results/{checkpoint_id}/{phase}"
+        submitted_at = "2026-08-01T00:00:00Z"
+        terminal_at = "2026-08-01T00:01:00Z"
+        attempt = {
+            "job_attempt": 1,
+            "tao_job_id": job_id,
+            "status": "Complete",
+            "submitted_at_utc": submitted_at,
+            "terminal_at_utc": terminal_at,
+            "result_root": result_root,
+            "submission": {
+                "attempt_count": 1,
+                "retry_count": 0,
+                "transient_failures": [],
+                "stable_job_identity_obtained": True,
+                "policy_sha256": canonical_sha256(policy),
+            },
+            "command_sha256": command_sha256,
+            "infrastructure_failure_evidence": {
+                "classification": "terminal_status_not_retryable",
+                "retry_eligible": False,
+                "terminal_status": "Complete",
+            },
+            "infrastructure_retry_submitted": False,
+        }
+        return {
+            "runtime_overlay_required": True,
+            "command_sha256": command_sha256,
+            "tao_job_id": job_id,
+            "status": "Complete",
+            "submitted_at_utc": submitted_at,
+            "terminal_at_utc": terminal_at,
+            "result_root": result_root,
+            "job_attempt": 1,
+            "attempts": [attempt],
+            "infrastructure_retry_count": 0,
+            "infrastructure_retry_policy_sha256": canonical_sha256(policy),
+            "maximum_job_attempts": policy[
+                "maximum_job_attempts_per_phase"
+            ],
+            "successful_job_replacement_allowed": False,
+        }
+
     value = {
         "schema_version": 2,
         "qualification_revision": campaign_contract.QUALIFICATION_REVISION,
@@ -192,7 +245,7 @@ def _workflow(
             "runtime_overlay": copy.deepcopy(
                 campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
             ),
-            "job": {"runtime_overlay_required": True},
+            "job": completed_job("train"),
             "nodes": 1,
             "gpus": 8,
             "val_miou": metric,
@@ -218,7 +271,7 @@ def _workflow(
             "runtime_overlay": copy.deepcopy(
                 campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
             ),
-            "job": {"runtime_overlay_required": True},
+            "job": completed_job("evaluate"),
             "nodes": 1,
             "gpus": 8,
             "test_miou": metric,
@@ -231,6 +284,9 @@ def _workflow(
         ),
         "runtime_overlay": copy.deepcopy(
             campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+        ),
+        "infrastructure_retry_policy": copy.deepcopy(
+            campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
         ),
     }
     value["workflow_sha256"] = canonical_sha256(value)
@@ -259,6 +315,9 @@ def _qualification_document(success_id: str | None = None) -> dict:
         ),
         "runtime_overlay": copy.deepcopy(
             campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+        ),
+        "infrastructure_retry_policy": copy.deepcopy(
+            campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
         ),
         "prior_revision_evidence": copy.deepcopy(
             campaign_contract.FROZEN_PRIOR_QUALIFICATION_EVIDENCE
@@ -497,6 +556,9 @@ def _fake_qualification_stage(contract: dict) -> dict:
             ),
             "runtime_overlay": copy.deepcopy(
                 campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+            ),
+            "infrastructure_retry_policy": copy.deepcopy(
+                campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
             ),
         },
         "recipe_fidelity": copy.deepcopy(
@@ -1615,7 +1677,19 @@ def test_direct_qualification_submission_is_pinned_one_node_eight_gpu(
             calls.append(kwargs)
             return SimpleNamespace(id="job")
 
-    qualification_campaign._submit_job(FakeSDK(), contract, "command")
+    job, submission = qualification_campaign._submit_job(
+        FakeSDK(), contract, "command"
+    )
+    assert job.id == "job"
+    assert submission == {
+        "attempt_count": 1,
+        "retry_count": 0,
+        "transient_failures": [],
+        "stable_job_identity_obtained": True,
+        "policy_sha256": canonical_sha256(
+            campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
+        ),
+    }
     assert calls == [
         {
             "image": campaign_contract.FROZEN_SQSH["path"],
@@ -1640,6 +1714,202 @@ def test_direct_qualification_submission_is_pinned_one_node_eight_gpu(
     assert "segformer train -e /tmp/spec.yaml" in rendered
 
 
+def test_qualification_submission_retries_only_exact_stable_identity_error(
+    contract,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    message = campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY[
+        "retryable_submission_message"
+    ]
+    calls = []
+    sleeps = []
+
+    class FakeSDK:
+        def create_job(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise RuntimeError(message)
+            return SimpleNamespace(id="stable-job")
+
+    monkeypatch.setattr(
+        qualification_campaign.time,
+        "sleep",
+        lambda seconds: sleeps.append(seconds),
+    )
+    job, evidence = qualification_campaign._submit_job(
+        FakeSDK(), contract, "command"
+    )
+
+    assert job.id == "stable-job"
+    assert len(calls) == 2
+    assert sleeps == [10]
+    assert evidence["attempt_count"] == 2
+    assert evidence["retry_count"] == 1
+    assert evidence["transient_failures"] == [
+        {
+            "attempt": 1,
+            "exception_type": "RuntimeError",
+            "message": message,
+            "classification": "pre_submission_stable_identity_unavailable",
+        }
+    ]
+
+
+def test_qualification_submission_retry_is_bounded_and_fail_closed(
+    contract,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    message = campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY[
+        "retryable_submission_message"
+    ]
+    calls = []
+    monkeypatch.setattr(
+        qualification_campaign.time,
+        "sleep",
+        lambda _seconds: None,
+    )
+
+    class AlwaysUnstable:
+        def create_job(self, **_kwargs):
+            calls.append(True)
+            raise RuntimeError(message)
+
+    with pytest.raises(RuntimeError, match="stable identity"):
+        qualification_campaign._submit_job(
+            AlwaysUnstable(), contract, "command"
+        )
+    assert len(calls) == 2
+
+    calls.clear()
+
+    class UnrelatedFailure:
+        def create_job(self, **_kwargs):
+            calls.append(True)
+            raise RuntimeError("unrelated scheduler failure")
+
+    with pytest.raises(RuntimeError, match="unrelated scheduler failure"):
+        qualification_campaign._submit_job(
+            UnrelatedFailure(), contract, "command"
+        )
+    assert len(calls) == 1
+
+
+def test_terminal_infrastructure_retry_requires_exact_owned_marker(contract):
+    policy = campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
+
+    class FakeSDK:
+        def __init__(self, logs):
+            self.logs = logs
+
+        def get_job_logs(self, _job_id, tail=None):
+            assert tail == 500
+            return self.logs
+
+        def get_failure_analysis(self, _job_id):
+            return {
+                "reason": "infrastructure_failure_pattern",
+                "pattern": "CUDA driver.*insufficient",
+                "match": policy["sdk_failure_analysis_match"],
+                "retriable": True,
+            }
+
+    exact = qualification_campaign._terminal_infrastructure_retry_evidence(
+        FakeSDK(policy["node_preflight_failure_marker"] + "\n"),
+        contract,
+        "job",
+        "Error",
+    )
+    assert exact["retry_eligible"] is True
+    assert exact["classification"] == (
+        "pre_import_cuda_driver_runtime_incompatible"
+    )
+
+    for logs in (
+        "CUDA driver version is insufficient\n",
+        policy["node_preflight_failure_marker"] * 2,
+        "model raised CUDA initialization error\n",
+    ):
+        rejected = (
+            qualification_campaign._terminal_infrastructure_retry_evidence(
+                FakeSDK(logs), contract, "job", "Error"
+            )
+        )
+        assert rejected["retry_eligible"] is False
+
+
+def test_phase_retry_preserves_failed_attempt_and_never_replaces_success(
+    contract,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    policy = campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
+    created = []
+
+    class FakeSDK:
+        def create_job(self, **_kwargs):
+            job = SimpleNamespace(id=f"job-{len(created) + 1}")
+            created.append(job)
+            return job
+
+        def get_job_results_dir(self, job_id):
+            return f"/lustre/results/{job_id}"
+
+        def get_job_logs(self, job_id, tail=None):
+            assert tail == 500
+            if job_id == "job-1":
+                return policy["node_preflight_failure_marker"] + "\n"
+            return ""
+
+        def get_failure_analysis(self, job_id):
+            if job_id != "job-1":
+                return None
+            return {
+                "reason": "infrastructure_failure_pattern",
+                "pattern": "CUDA driver.*insufficient",
+                "match": policy["sdk_failure_analysis_match"],
+                "retriable": True,
+            }
+
+    statuses = iter(("Error", "Complete"))
+    monkeypatch.setattr(
+        qualification_campaign,
+        "_wait_for_job",
+        lambda *_args, **_kwargs: next(statuses),
+    )
+    monkeypatch.setattr(
+        qualification_campaign.time,
+        "sleep",
+        lambda _seconds: None,
+    )
+    evidence = {"jobs": {}}
+    output = tmp_path / "workflow.json"
+    events = tmp_path / "events.jsonl"
+    job, status = qualification_campaign._run_qualification_job(
+        FakeSDK(),
+        contract,
+        "sealed-command",
+        evidence=evidence,
+        evidence_path=output,
+        events=events,
+        checkpoint_id="segformer.test",
+        phase="standalone_evaluation",
+        job_key="evaluate",
+        job_metadata={"command_sha256": "a" * 64},
+    )
+
+    assert job.id == "job-2"
+    assert status == "Complete"
+    assert len(created) == 2
+    record = evidence["jobs"]["evaluate"]
+    assert record["infrastructure_retry_count"] == 1
+    assert [item["status"] for item in record["attempts"]] == [
+        "Error",
+        "Complete",
+    ]
+    assert record["attempts"][0]["infrastructure_retry_submitted"] is True
+    assert record["attempts"][1]["infrastructure_retry_submitted"] is False
+
+
 def test_qualification_gpu_guard_exports_usable_allocation_port(
     tmp_path: Path,
 ):
@@ -1648,8 +1918,9 @@ def test_qualification_gpu_guard_exports_usable_allocation_port(
         "#!/bin/sh\n"
         "case \"$*\" in\n"
         "  *query-gpu=name*) value='NVIDIA A100-SXM4-80GB' ;;\n"
-        "  *query-gpu=compute_cap*) value='8.0' ;;\n"
-        "  *query-gpu=memory.total*) value='81920' ;;\n"
+            "  *query-gpu=compute_cap*) value='8.0' ;;\n"
+            "  *query-gpu=memory.total*) value='81920' ;;\n"
+            "  *query-gpu=driver_version*) value='580.65.06' ;;\n"
         "  *) exit 2 ;;\n"
         "esac\n"
         "i=0; while [ \"$i\" -lt 8 ]; do printf '%s\\n' \"$value\"; "
@@ -1657,6 +1928,16 @@ def test_qualification_gpu_guard_exports_usable_allocation_port(
         encoding="utf-8",
     )
     nvidia_smi.chmod(0o755)
+    python3 = tmp_path / "python3"
+    python3.write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        "  *cuDriverGetVersion*) exit 0 ;;\n"
+        "esac\n"
+        f"exec {shlex.quote(os.path.realpath(sys.executable))} \"$@\"\n",
+        encoding="utf-8",
+    )
+    python3.chmod(0o755)
     selected_port = None
     for port in range(
         qualification_campaign.QUALIFICATION_MASTER_PORT_BASE,
@@ -1693,7 +1974,12 @@ def test_qualification_gpu_guard_exports_usable_allocation_port(
         },
     )
 
-    assert result.stdout == f"rendezvous=127.0.0.1:{selected_port}\n"
+    assert result.stdout == (
+        "SEGFORMER_INFRASTRUCTURE_PREFLIGHT_OK "
+        "minimum_nvidia_driver_major=580 "
+        "minimum_cuda_driver_api_version=13000\n"
+        f"rendezvous=127.0.0.1:{selected_port}\n"
+    )
 
 
 def test_qualification_entrypoint_installs_exact_overlay_for_both_actions(
@@ -1800,6 +2086,82 @@ def test_training_status_evidence_counts_one_evaluation_record_per_epoch(
     assert evidence["pretrained_load"]["report_sha256"] == canonical_sha256(
         load_report
     )
+
+
+def test_evaluation_status_deduplicates_identical_semantic_kpi_snapshots(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    kpi = {"test_miou": 0.431, "test_loss": 1.25}
+    records = [
+        {
+            "message": "Test metrics generated.",
+            "kpi": copy.deepcopy(kpi),
+        },
+        {
+            "message": "Evaluate finished successfully.",
+            "kpi": copy.deepcopy(kpi),
+        },
+    ]
+    monkeypatch.setattr(
+        qualification_campaign,
+        "_status_records",
+        lambda *_args, **_kwargs: (
+            records,
+            {"path": "/immutable/status.json", "record_count": 2},
+        ),
+    )
+
+    evidence = qualification_campaign._evaluation_status_evidence(
+        object(), "job-id"
+    )
+
+    snapshot = {
+        "reported_name": "test_miou",
+        "test_miou": 0.431,
+        "kpi": kpi,
+    }
+    assert evidence["test_metric_record_count"] == 2
+    assert evidence["unique_test_metric_snapshot_count"] == 1
+    assert evidence["duplicate_identical_metric_snapshots_allowed"] is True
+    assert evidence["metric_snapshot_sha256"] == canonical_sha256(snapshot)
+    assert evidence["test_miou"] == pytest.approx(0.431)
+
+
+@pytest.mark.parametrize(
+    "second_kpi",
+    [
+        {"test_miou": 0.432, "test_loss": 1.25},
+        {"test_miou": 0.431, "test_loss": 1.24},
+        {"val_miou": 0.431, "test_loss": 1.25},
+    ],
+)
+def test_evaluation_status_rejects_conflicting_kpi_snapshots(
+    monkeypatch: pytest.MonkeyPatch,
+    second_kpi: dict,
+):
+    records = [
+        {
+            "message": "Test metrics generated.",
+            "kpi": {"test_miou": 0.431, "test_loss": 1.25},
+        },
+        {
+            "message": "Evaluate finished successfully.",
+            "kpi": second_kpi,
+        },
+    ]
+    monkeypatch.setattr(
+        qualification_campaign,
+        "_status_records",
+        lambda *_args, **_kwargs: (records, {"record_count": 2}),
+    )
+
+    with pytest.raises(
+        qualification_campaign.CampaignExecutionError,
+        match="2 unique semantic KPI snapshots",
+    ):
+        qualification_campaign._evaluation_status_evidence(
+            object(), "job-id"
+        )
 
 
 def test_training_status_evidence_rejects_missing_epoch_evaluation_record(
