@@ -22,8 +22,8 @@ The read-only [static SQSH audit](static_sqsh_audit.v1.json) records three
 defects in the immutable base image: no full-checkpoint loader, no panoptic PQ
 endpoint, and no globally reduced status metric. Those findings are preserved
 unchanged. The campaign remediates them with the reviewed TAO PyTorch source
-overlay at commit `c25a20e0d6e2cf98ccb80c16eb0d4d30bb40f600`, archive SHA-256
-`6b976090fb264b319ba23e7092445f261fd1b445964400d3f879c2746247a4f3`.
+overlay at commit `1752ec2c2a7040d4db0e6c3e6f52cc489e8dbc86`, archive SHA-256
+`a3d71c97c3a5fe9c2cf3c44e778681d0b8d6eb16475e0b64c8f3c2819446a074`.
 Every training, standalone-evaluation, and latency command verifies and
 installs that overlay before importing TAO PyTorch, and persists an installer
 receipt. A missing, changed, or inapplicable overlay leaves the automatic
@@ -37,6 +37,27 @@ schema rejected `evaluate.task`.  All four v1 failures are preserved.  The v2
 launcher executes the complete overlay-plus-entrypoint payload through one
 quoted in-container `bash -lc`; no model, dataset, PTM, metric, budget, or gate
 setting changed.
+
+All four independent v2 qualification workflows were submitted and preserved
+as terminal failures. Their sealed completion record is
+`/localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/oneformer_coco2017_ptm_qualification_v2/completion.json`
+(SHA-256
+`9e7e059ae7bea812b391c2eff82bab4aa888aa7511460ae5676a02a6f8059cd1`).
+The common failure occurred before training: the v2 installer audited the
+empty ephemeral output tree instead of the immutable package root in the
+pinned SQSH. In addition, the SDK entrypoint begins with a best-effort install
+ending in `|| true`; without grouping the complete entrypoint, that clause
+could mask an overlay-prefix failure and allow unpatched TAO to start.
+
+The versioned v3 qualification fixes only those launcher defects. Overlay
+manifest/receipt schema 2 audits
+`/usr/local/lib/python3.12/dist-packages` directly, writes patched modules to a
+separate ephemeral `PYTHONPATH` tree, and groups the complete SDK entrypoint on
+the right side of the fail-closed overlay `&&`. The model, dataset, four PTM
+arms, metric, one-epoch budget, and eight-A100 resource contract remain
+unchanged. No v3 replacement is submitted by preparation or sealing; the
+automatic campaign release remains closed until exact direct-full
+qualification evidence is successful and accepted by the qualification gate.
 
 All campaign children use the pinned TAO 7.1 SQSH, one node/eight A100s, and
 the native 133-category panoptic label map. Candidate zero runs independently
@@ -116,12 +137,12 @@ full-run PQ qualification evidence exists, and registry support is reviewed:
 ```bash
 cd /localhome/local-rarunachalam/tao-automl
 python -m experiments.cross_model_automl_20260729.oneformer_coco2017_campaign.manifest_generator \
-  --runtime-overlay /localhome/local-rarunachalam/.tao/artifacts/oneformer-runtime-product-fixes-c25a20e0/oneformer-runtime-overlay.tar \
-  --output /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/oneformer_coco2017_three_mode_v2/campaign.v2.json
+  --runtime-overlay /localhome/local-rarunachalam/.tao/artifacts/oneformer-runtime-product-fixes-1752ec2c/oneformer-runtime-overlay.v2.tar \
+  --output /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/oneformer_coco2017_three_mode_v3/campaign.v3.json
 
 python -m experiments.cross_model_automl_20260729.oneformer_coco2017_campaign.run_campaign \
-  --contract /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/oneformer_coco2017_three_mode_v2/campaign.v2.json \
-  --runtime-root /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/oneformer_coco2017_three_mode_v2 \
+  --contract /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/oneformer_coco2017_three_mode_v3/campaign.v3.json \
+  --runtime-root /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/oneformer_coco2017_three_mode_v3 \
   --automatic-trigger \
   --launch
 ```

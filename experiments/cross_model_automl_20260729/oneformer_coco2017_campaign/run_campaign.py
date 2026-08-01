@@ -60,11 +60,11 @@ ENV_PATH = Path("/localhome/local-rarunachalam/.tao/config.env")
 DEFAULT_CONTRACT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "oneformer_coco2017_three_mode_v2/campaign.v2.json"
+    "oneformer_coco2017_three_mode_v3/campaign.v3.json"
 )
 DEFAULT_RUNTIME_ROOT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
-    "cross_model_automl_20260729/oneformer_coco2017_three_mode_v2"
+    "cross_model_automl_20260729/oneformer_coco2017_three_mode_v3"
 )
 STATIC_SQSH_AUDIT = HERE / "static_sqsh_audit.v1.json"
 TERMINAL_JOB_STATUSES = frozenset({"Complete", "Error", "Canceled"})
@@ -111,6 +111,8 @@ def runtime_overlay_install_command(
             f"{base_site_packages}/nvidia_tao_pytorch/.",
             "\"$overlay_site/nvidia_tao_pytorch/\"",
             f"&& python \"$overlay_tmp\"/{installer}",
+            "--base-site-packages",
+            base_site_packages,
             "--site-packages",
             "\"$overlay_site\"",
             "--receipt "
@@ -120,6 +122,21 @@ def runtime_overlay_install_command(
             "\"$overlay_site${PYTHONPATH:+:$PYTHONPATH}\"",
         ]
     )
+
+
+def _overlay_then_command(prefix: str, command: str) -> str:
+    """Run the whole SDK entrypoint only after the overlay succeeds.
+
+    ``build_entrypoint`` starts with a best-effort dependency install ending
+    in ``|| true``.  Grouping that complete entrypoint on the right side of a
+    single ``&&`` keeps its permissive clause from swallowing an overlay
+    installation failure.
+    """
+    if not isinstance(prefix, str) or not prefix.strip():
+        raise CampaignExecutionError("runtime-overlay prefix is invalid")
+    if not isinstance(command, str) or not command.strip():
+        raise CampaignExecutionError("container command is invalid")
+    return f"{prefix} && (\n{command}\n)"
 
 
 class RuntimeOverlaySDK:
@@ -155,7 +172,7 @@ class RuntimeOverlaySDK:
         arguments = list(args)
         if "command" in kwargs:
             command = kwargs["command"]
-            payload = f"{self._prefix} && {command}"
+            payload = _overlay_then_command(self._prefix, command)
             # The SDK appends the supplied command directly after ``srun``.
             # Without an explicit in-container shell, ``&&`` is interpreted
             # by the outer sbatch shell and the overlay installer sees the
@@ -164,7 +181,7 @@ class RuntimeOverlaySDK:
             kwargs["command"] = f"bash -lc {shlex.quote(payload)}"
         elif len(arguments) >= 2:
             command = arguments[1]
-            payload = f"{self._prefix} && {command}"
+            payload = _overlay_then_command(self._prefix, command)
             arguments[1] = f"bash -lc {shlex.quote(payload)}"
         else:
             raise CampaignExecutionError(
@@ -879,10 +896,13 @@ def _runtime_overlay_receipt(
     overlay = contract["runtime_overlay"]
     actions = document.get("actions")
     if (
-        document.get("schema_version") != 1
+        document.get("schema_version")
+        != overlay["receipt_schema_version"]
         or document.get("overlay_source_commit") != overlay["source_commit"]
         or document.get("container_expected_sha256")
         != contract["sqsh"]["sha256"]
+        or document.get("base_site_packages")
+        != overlay["base_site_packages"]
         or not isinstance(document.get("site_packages"), str)
         or not document["site_packages"].startswith(
             "/tmp/oneformer-runtime-overlay."
@@ -897,6 +917,13 @@ def _runtime_overlay_receipt(
             not isinstance(item, Mapping)
             or item.get("action")
             not in {"replace_base", "already_installed", "install_new"}
+            or (
+                item.get("base_sha256") is not None
+                and re.fullmatch(
+                    r"[0-9a-f]{64}", str(item.get("base_sha256"))
+                )
+                is None
+            )
             or not isinstance(item.get("path"), str)
             or re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256")))
             is None

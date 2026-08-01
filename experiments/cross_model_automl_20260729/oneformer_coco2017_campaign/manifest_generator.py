@@ -44,7 +44,7 @@ DEFAULT_STAGE_MANIFEST = (
 DEFAULT_QUALIFICATION = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "oneformer_coco2017_ptm_qualification_v2/completion.json"
+    "oneformer_coco2017_ptm_qualification_v3/completion.json"
 )
 DEFAULT_PTM_STAGE_MANIFEST = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
@@ -53,8 +53,8 @@ DEFAULT_PTM_STAGE_MANIFEST = Path(
 )
 DEFAULT_RUNTIME_OVERLAY = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
-    "oneformer-runtime-product-fixes-c25a20e0/"
-    "oneformer-runtime-overlay.tar"
+    "oneformer-runtime-product-fixes-1752ec2c/"
+    "oneformer-runtime-overlay.v2.tar"
 )
 EXPECTED_DATASET_FILE_MANIFEST_SHA256 = (
     "10566a60498de9998154f44a34445a488c9f030e09f2a7346d20a4a1c55f804e"
@@ -115,6 +115,8 @@ def runtime_overlay_record(path: str | Path) -> dict[str, Any]:
         != frozen["manifest_sha256"]
         or hashlib.sha256(installer_bytes).hexdigest()
         != frozen["installer_sha256"]
+        or manifest.get("schema_version")
+        != frozen["manifest_schema_version"]
         or manifest.get("artifact_type") != frozen["artifact_type"]
         or manifest.get("scope") != frozen["scope"]
         or manifest.get("source", {}).get("commit")
@@ -129,6 +131,10 @@ def runtime_overlay_record(path: str | Path) -> dict[str, Any]:
             "panoptic_primary_metric"
         )
         != "PQ"
+        or manifest.get("runtime_contract", {}).get("base_audit_root")
+        != frozen["base_site_packages"]
+        or manifest.get("runtime_contract", {}).get("overlay_output_root")
+        != "ephemeral_pythonpath_site_packages"
         or len(manifest.get("files", ())) != frozen["file_count"]
     ):
         raise ManifestGenerationError(
@@ -399,7 +405,7 @@ def build_contract(
     repository_path = Path(repository).resolve()
     value = campaign_contract.build_preregistered_contract(
         campaign_id=(
-            "oneformer-coco2017-objective-aware-three-mode-v2-20260801"
+            "oneformer-coco2017-objective-aware-three-mode-v3-20260801"
         ),
         dataset=dataset_record(dataset_manifest, stage_manifest),
         skill_dir=(

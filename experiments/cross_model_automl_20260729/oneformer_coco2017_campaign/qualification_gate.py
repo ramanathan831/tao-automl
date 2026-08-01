@@ -208,7 +208,8 @@ def _validate_overlay_receipt(
     digest = receipt.get("sha256")
     actions = receipt.get("actions")
     if (
-        receipt.get("schema_version") != 1
+        receipt.get("schema_version")
+        != FROZEN_RUNTIME_OVERLAY["receipt_schema_version"]
         or receipt.get("overlay_source_commit")
         != FROZEN_RUNTIME_OVERLAY["source_commit"]
         or receipt.get("container_expected_sha256") != FROZEN_SQSH["sha256"]
@@ -220,6 +221,8 @@ def _validate_overlay_receipt(
         or not receipt["site_packages"].endswith(
             FROZEN_RUNTIME_OVERLAY["runtime_site_packages_suffix"]
         )
+        or receipt.get("base_site_packages")
+        != FROZEN_RUNTIME_OVERLAY["base_site_packages"]
         or not isinstance(path, str)
         or not path.startswith("/lustre/")
         or not isinstance(digest, str)
@@ -231,6 +234,13 @@ def _validate_overlay_receipt(
             not isinstance(item, Mapping)
             or item.get("action")
             not in {"replace_base", "already_installed", "install_new"}
+            or (
+                item.get("base_sha256") is not None
+                and re.fullmatch(
+                    r"[0-9a-f]{64}", str(item.get("base_sha256"))
+                )
+                is None
+            )
             or not isinstance(item.get("path"), str)
             or re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256")))
             is None

@@ -113,32 +113,36 @@ FROZEN_SQSH = {
     ),
 }
 FROZEN_RUNTIME_OVERLAY = {
+    "manifest_schema_version": 2,
+    "receipt_schema_version": 2,
     "artifact_type": "tao_pytorch_source_overlay",
     "scope": "oneformer_runtime_product_fixes",
     "archive_path": (
-        "/lustre/fsw/portfolios/edgeai/users/rarunachalam/artifacts/"
-        "oneformer-runtime-product-fixes-c25a20e0/"
-        "oneformer-runtime-overlay.tar"
+        "/lustre/fsw/portfolios/edgeai/projects/"
+        "edgeai_tao-ptm_image-foundation-model-clip/users/rarunachalam/"
+        "artifacts/oneformer-runtime-product-fixes-1752ec2c/"
+        "oneformer-runtime-overlay.v2.tar"
     ),
     "archive_sha256": (
-        "6b976090fb264b319ba23e7092445f261fd1b445964400d3f879c2746247a4f3"
+        "a3d71c97c3a5fe9c2cf3c44e778681d0b8d6eb16475e0b64c8f3c2819446a074"
     ),
-    "archive_size_bytes": 153600,
+    "archive_size_bytes": 112640,
     "archive_root": "oneformer-runtime-overlay",
     "manifest_sha256": (
-        "1ed2721226677e023d8a688f629fa85c997f1ce7f9889b00cda01fc5db899760"
+        "d1997f71cbcbb94ee309c003f7fabf66f2687c4f8de014dbbaedcc1a64a77fb3"
     ),
     "installer_sha256": (
-        "c0db61d777cbedc33ffeab795825f30924c7b56faa6996504181684096dfc030"
+        "2360730fb46548da4d272d438ed69b9ba08df11bebe8b63aa53da114fffd298a"
     ),
     "source_repository": "tao-pytorch",
-    "source_commit": "c25a20e0d6e2cf98ccb80c16eb0d4d30bb40f600",
+    "source_commit": "1752ec2c2a7040d4db0e6c3e6f52cc489e8dbc86",
     "product_fix_commit": "e3ebf59a47d0aea365c855919a1de196f8a0432e",
     "base_commit": "99741bc8229617d0d3dd52e30540111d55efd1af",
     "base_site_packages": "/usr/local/lib/python3.12/dist-packages",
+    "base_audit_strategy": "immutable_sqsh_package_root",
     "runtime_site_packages_strategy": "writable_tmp_symlink_tree",
     "runtime_site_packages_suffix": "/site-packages",
-    "file_count": 19,
+    "file_count": 6,
     "remediates_static_findings": [
         "oneformer_full_checkpoint_loader_missing",
         "oneformer_panoptic_pq_not_emitted",

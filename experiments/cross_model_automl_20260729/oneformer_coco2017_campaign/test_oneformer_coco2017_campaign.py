@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import shlex
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -469,11 +470,14 @@ def test_missing_qualification_never_launches_a_model(tmp_path):
 
 def test_qualification_receipt_requires_exact_overlay_and_all_actions():
     receipt = {
-        "schema_version": 1,
+        "schema_version": 2,
         "overlay_source_commit": (
             campaign_contract.FROZEN_RUNTIME_OVERLAY["source_commit"]
         ),
         "container_expected_sha256": campaign_contract.FROZEN_SQSH["sha256"],
+        "base_site_packages": (
+            campaign_contract.FROZEN_RUNTIME_OVERLAY["base_site_packages"]
+        ),
         "site_packages": (
             "/tmp/oneformer-runtime-overlay.abc123/site-packages"
         ),
@@ -484,6 +488,7 @@ def test_qualification_receipt_requires_exact_overlay_and_all_actions():
             {
                 "path": f"nvidia_tao_pytorch/file_{index}.py",
                 "action": "replace_base",
+                "base_sha256": "b" * 64,
                 "sha256": f"{index:064x}",
             }
             for index in range(
@@ -545,10 +550,16 @@ def test_runtime_overlay_prefix_is_applied_to_every_container_job():
     assert len(tokens) == 3
     in_container_payload = tokens[2]
     overlay = campaign_contract.FROZEN_RUNTIME_OVERLAY
-    assert in_container_payload.endswith("&& tao model train")
+    assert in_container_payload.endswith("&& (\ntao model train\n)")
     assert overlay["archive_path"] in in_container_payload
     assert overlay["archive_sha256"] in in_container_payload
     assert "install_overlay.py" in in_container_payload
+    assert (
+        f"--base-site-packages {overlay['base_site_packages']}"
+        in in_container_payload
+    )
+    assert '--site-packages "$overlay_site"' in in_container_payload
+    assert 'export PYTHONPATH="$overlay_site' in in_container_payload
     assert "runtime_overlay/receipt.json" in in_container_payload
     command_evidence = wrapped.command_evidence(job.id)
     assert command_evidence["runtime_overlay_applied"] is True
@@ -573,8 +584,29 @@ def test_runtime_overlay_positional_command_is_one_in_container_shell():
     tokens = shlex.split(arguments[1])
     assert tokens[:2] == ["bash", "-lc"]
     assert tokens[2].endswith(
-        "&& /bin/bash /lustre/entrypoint.sh"
+        "&& (\n/bin/bash /lustre/entrypoint.sh\n)"
     )
+
+
+def test_runtime_overlay_failure_cannot_be_swallowed_by_entrypoint_or_true(
+    tmp_path,
+):
+    marker = tmp_path / "entrypoint-ran"
+    entrypoint = "\n".join(
+        [
+            "false || true",
+            f"printf reached > {shlex.quote(str(marker))}",
+        ]
+    )
+    payload = run_campaign._overlay_then_command("false", entrypoint)
+    completed = subprocess.run(
+        ["bash", "-lc", payload],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode != 0
+    assert not marker.exists()
 
 
 def test_evaluation_spec_forces_panoptic_task():
