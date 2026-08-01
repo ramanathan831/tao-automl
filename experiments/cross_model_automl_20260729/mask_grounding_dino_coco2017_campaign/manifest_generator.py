@@ -52,6 +52,11 @@ DEFAULT_TEXT_ENCODER_STAGE = (
 DEFAULT_QUALIFICATION = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
+    "mask_grounding_dino_coco2017_ptm_qualification_v2/completion.json"
+)
+DEFAULT_PREDECESSOR_QUALIFICATION = Path(
+    "/localhome/local-rarunachalam/.tao/artifacts/"
+    "cross_model_automl_20260729/"
     "mask_grounding_dino_coco2017_ptm_qualification_v1/completion.json"
 )
 DEFAULT_PTM_STAGE_MANIFEST = Path(
@@ -76,6 +81,9 @@ EXPECTED_WHEEL_SHA256 = (
 )
 EXPECTED_SDK_COMMIT = "a2e50d0930c3e3785b4b39fa8c3da88b39ff89e5"
 EXPECTED_SKILLS_COMMIT = "2e9c1b25f3c7cb1ae444c75652e36c47eace8229"
+EXPECTED_PREDECESSOR_QUALIFICATION_SHA256 = (
+    "a48d8d8d2a5c65e35c9d39bd5ed1362be54e2be0b89dcda5471812da331a6996"
+)
 
 
 class ManifestGenerationError(RuntimeError):
@@ -403,6 +411,7 @@ def _runtime(
     qualification: Path,
     ptm_stage_manifest: Path,
     text_encoder_stage: Path,
+    predecessor_qualification: Path,
 ) -> dict[str, Any]:
     if not wheel.is_file() or (
         campaign_contract.sha256_file(wheel) != EXPECTED_WHEEL_SHA256
@@ -447,6 +456,32 @@ def _runtime(
         raise ManifestGenerationError(
             "frozen Grounding DINO text-encoder provenance changed"
         )
+    predecessor = predecessor_qualification.resolve()
+    if (
+        not predecessor.is_file()
+        or campaign_contract.sha256_file(predecessor)
+        != EXPECTED_PREDECESSOR_QUALIFICATION_SHA256
+    ):
+        raise ManifestGenerationError(
+            "preserved v1 qualification evidence is unavailable or changed"
+        )
+    predecessor_document = json.loads(
+        predecessor.read_text(encoding="utf-8")
+    )
+    predecessor_workflows = predecessor_document.get("workflows")
+    if (
+        not isinstance(predecessor_workflows, list)
+        or len(predecessor_workflows) != 4
+        or any(
+            not isinstance(item, dict)
+            or item.get("status") != "failure"
+            or item.get("failure_preserved") is not True
+            for item in predecessor_workflows
+        )
+    ):
+        raise ManifestGenerationError(
+            "preserved v1 qualification is not the sealed four-arm failure"
+        )
     return {
         "repository": str(repository.resolve()),
         "source_commit": _git(repository, "rev-parse", "HEAD"),
@@ -480,6 +515,14 @@ def _runtime(
             text_encoder["offline_runtime"]
         ),
         "qualification_evidence_path": str(qualification.resolve()),
+        "predecessor_failure_evidence": {
+            "path": str(predecessor),
+            "sha256": EXPECTED_PREDECESSOR_QUALIFICATION_SHA256,
+            "campaign_id": predecessor_document.get("campaign_id"),
+            "workflow_count": 4,
+            "all_terminal_failures_preserved": True,
+            "replacement_submitted": False,
+        },
         "ptm_stage_manifest_path": ptm_stage["path"],
         "ptm_stage_manifest_sha256": ptm_stage["sha256"],
         "ptm_stage_content_sha256": ptm_stage["manifest_sha256"],
@@ -512,11 +555,14 @@ def build_contract(
     qualification: str | Path = DEFAULT_QUALIFICATION,
     ptm_stage_manifest: str | Path = DEFAULT_PTM_STAGE_MANIFEST,
     text_encoder_stage: str | Path = DEFAULT_TEXT_ENCODER_STAGE,
+    predecessor_qualification: str | Path = (
+        DEFAULT_PREDECESSOR_QUALIFICATION
+    ),
 ) -> dict[str, Any]:
     repository_path = Path(repository).resolve()
     value = campaign_contract.build_preregistered_contract(
         campaign_id=(
-            "mask_grounding_dino-coco2017-objective-aware-three-mode-20260731"
+            "mask_grounding_dino-coco2017-objective-aware-three-mode-v2-20260801"
         ),
         dataset=dataset_record(
             dataset_manifest,
@@ -535,10 +581,14 @@ def build_contract(
             qualification=Path(qualification),
             ptm_stage_manifest=Path(ptm_stage_manifest),
             text_encoder_stage=Path(text_encoder_stage),
+            predecessor_qualification=Path(predecessor_qualification),
         ),
     )
     value.pop("contract_sha256")
     value["launcher_integrity"] = {
+        "ddp_strategy_audit_sha256": campaign_contract.sha256_file(
+            HERE / "ddp_strategy_audit.v2.json"
+        ),
         "campaign_contract_sha256": campaign_contract.sha256_file(
             HERE / "campaign_contract.py"
         ),
@@ -594,6 +644,11 @@ def main(argv: list[str] | None = None) -> int:
         "--qualification", type=Path, default=DEFAULT_QUALIFICATION
     )
     parser.add_argument(
+        "--predecessor-qualification",
+        type=Path,
+        default=DEFAULT_PREDECESSOR_QUALIFICATION,
+    )
+    parser.add_argument(
         "--ptm-stage-manifest",
         type=Path,
         default=DEFAULT_PTM_STAGE_MANIFEST,
@@ -613,6 +668,7 @@ def main(argv: list[str] | None = None) -> int:
         qualification=args.qualification,
         ptm_stage_manifest=args.ptm_stage_manifest,
         text_encoder_stage=args.text_encoder_stage,
+        predecessor_qualification=args.predecessor_qualification,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(

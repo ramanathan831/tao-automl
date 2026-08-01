@@ -88,6 +88,28 @@ FROZEN_LATENCY_TOLERANCE_MS = 0.73553775
 FROZEN_VALIDATION_SANITY_MIN_MASK_AP = 0.05
 FROZEN_SLURM_RETRY_CAP = 10
 FROZEN_BATCH_SIZE_PER_REPLICA = 4
+FROZEN_QUALIFICATION_VERSION = 2
+
+# The pinned TAO 7.1 SQSH does not accept Lightning's strategy alias as the
+# value of ``train.distributed_strategy``: that field is restricted to
+# ``ddp``/``fsdp``.  Its Mask Grounding DINO launcher does, however, resolve
+# the supported pair below to Lightning's unused-parameter-aware DDP strategy.
+# V1 used activation checkpointing and therefore resolved to plain DDP, which
+# failed on the first distributed batch.  V2 changes only that effective DDP
+# behavior; data, PTMs, fidelity, objectives, seeds, and search space stay
+# frozen.
+FROZEN_TAO_DISTRIBUTED_STRATEGY = "ddp"
+FROZEN_ACTIVATION_CHECKPOINT = False
+FROZEN_LIGHTNING_DDP_STRATEGY = "ddp_find_unused_parameters_true"
+FROZEN_DDP_STRATEGY_RESOLUTION = {
+    "tao_config_value": FROZEN_TAO_DISTRIBUTED_STRATEGY,
+    "activation_checkpoint": FROZEN_ACTIVATION_CHECKPOINT,
+    "resolved_lightning_strategy": FROZEN_LIGHTNING_DDP_STRATEGY,
+    "direct_alias_is_valid_tao_config_value": False,
+    "resolution_source": (
+        "pinned_mask_grounding_dino_train_launcher_branch"
+    ),
+}
 FROZEN_CONTIGUOUS_VALIDATION_JSON = (
     "/lustre/fsw/portfolios/edgeai/users/rarunachalam/data/"
     "cross_model_automl_20260729/"
@@ -546,8 +568,8 @@ def profile_overrides(
             "resume_training_checkpoint_path": "",
             "results_dir": "",
             "precision": "fp32",
-            "distributed_strategy": "ddp",
-            "activation_checkpoint": True,
+            "distributed_strategy": FROZEN_TAO_DISTRIBUTED_STRATEGY,
+            "activation_checkpoint": FROZEN_ACTIVATION_CHECKPOINT,
             "cudnn": {"benchmark": False, "deterministic": True},
             "optim": {
                 "optimizer": "AdamW",
@@ -713,6 +735,7 @@ def build_preregistered_contract(
             ),
         },
         "qualification_policy": {
+            "version": FROZEN_QUALIFICATION_VERSION,
             "kind": "direct_full_gpu_train_eval_then_supported_registry",
             "cpu_model_runs": 0,
             "smoke_model_runs": 0,
@@ -728,6 +751,12 @@ def build_preregistered_contract(
                 "qualification_evidence_path"
             ],
             "ptm_stage_manifest_path": runtime["ptm_stage_manifest_path"],
+            "distributed_strategy_resolution": copy.deepcopy(
+                FROZEN_DDP_STRATEGY_RESOLUTION
+            ),
+            "predecessor_failure_evidence": copy.deepcopy(
+                runtime["predecessor_failure_evidence"]
+            ),
         },
         "execution": {
             "kind": "objective_aware_three_mode_search",
@@ -853,6 +882,16 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
             "ptm_stage_manifest_path"
         )
         != value.get("runtime", {}).get("ptm_stage_manifest_path")
+        or value.get("qualification_policy", {}).get("version")
+        != FROZEN_QUALIFICATION_VERSION
+        or value.get("qualification_policy", {}).get(
+            "distributed_strategy_resolution"
+        )
+        != FROZEN_DDP_STRATEGY_RESOLUTION
+        or value.get("qualification_policy", {}).get(
+            "predecessor_failure_evidence"
+        )
+        != value.get("runtime", {}).get("predecessor_failure_evidence")
     ):
         raise CampaignContractError("campaign execution policy changed")
     validate_dataset_record(value["dataset"])
@@ -860,6 +899,20 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
         raise CampaignContractError("pinned SQSH identity changed")
     runtime = value.get("runtime", {})
     search = value.get("search", {})
+    predecessor = runtime.get("predecessor_failure_evidence", {})
+    if (
+        not isinstance(predecessor, Mapping)
+        or not isinstance(predecessor.get("path"), str)
+        or not Path(predecessor["path"]).is_absolute()
+        or not isinstance(predecessor.get("sha256"), str)
+        or len(predecessor["sha256"]) != 64
+        or predecessor.get("workflow_count") != 4
+        or predecessor.get("all_terminal_failures_preserved") is not True
+        or predecessor.get("replacement_submitted") is not False
+    ):
+        raise CampaignContractError(
+            "preserved v1 qualification evidence contract changed"
+        )
     if (
         value.get("ptm_inventory") != mask_grounding_dino_registry_snapshot()
         or value.get("latency_protocol") != LATENCY_PROTOCOL
@@ -930,6 +983,7 @@ __all__ = [
     "AGENT_FLAGS",
     "CampaignContractError",
     "FROZEN_BATCH_SIZE_PER_REPLICA",
+    "FROZEN_ACTIVATION_CHECKPOINT",
     "FROZEN_CALIBRATION_POINTS_PER_ARM",
     "FROZEN_CANDIDATE_BUDGET",
     "FROZEN_CONTIGUOUS_MANIFEST_SHA256",
@@ -938,12 +992,16 @@ __all__ = [
     "FROZEN_HARDWARE",
     "FROZEN_LATENCY_RETENTION",
     "FROZEN_LATENCY_TOLERANCE_MS",
+    "FROZEN_LIGHTNING_DDP_STRATEGY",
+    "FROZEN_DDP_STRATEGY_RESOLUTION",
+    "FROZEN_QUALIFICATION_VERSION",
     "FROZEN_SEARCH_SEED",
     "FROZEN_SLURM_RETRY_CAP",
     "FROZEN_SQSH",
     "FROZEN_TEXT_ENCODER_ROOT",
     "FROZEN_TEXT_ENCODER_TREE_SHA256",
     "FROZEN_TRAINING_EPOCHS",
+    "FROZEN_TAO_DISTRIBUTED_STRATEGY",
     "FROZEN_VALIDATION_SANITY_MIN_MASK_AP",
     "LATENCY_PROTOCOL",
     "MODES",

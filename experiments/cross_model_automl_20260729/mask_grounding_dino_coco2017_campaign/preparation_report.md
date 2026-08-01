@@ -2,15 +2,20 @@
 
 ## Verdict
 
-Static implementation is complete and fail-closed; runtime qualification and
-the three AutoML jobs have not run. No CPU/model smoke, mini-step, local model
-execution, GPU model execution, or SLURM submission was performed.
+The immutable four-PTM stage is complete. Qualification v1 submitted four
+concurrent direct-full one-node/eight-A100 jobs (`31243535`–`31243538`). All
+loaded the sealed PTM and dataset and failed on the first distributed training
+batch because unused-parameter detection was disabled. No CPU/model smoke,
+mini-step, or local model execution occurred. V1 remains immutable at SHA-256
+`a48d8d8d2a5c65e35c9d39bd5ed1362be54e2be0b89dcda5471812da331a6996`.
 
-The exact launch state is `blocked` for missing immutable PTM stage and
-direct-full qualification evidence, plus repository registry status:
-all four official Mask Grounding DINO records remain `unverified`. A final
-campaign manifest can be sealed only from a clean reviewed commit and matching
-wheel after those prerequisite identities exist.
+Qualification v2 is a preregistered narrow correction. The pinned TAO config
+does not accept the Lightning alias directly; it resolves
+`distributed_strategy: ddp` plus `activation_checkpoint: false` to
+`ddp_find_unused_parameters_true`. PTMs, data, fidelity, objectives, search
+space, seeds, hardware, and SQSH are unchanged. The automatic three-mode
+watcher stays fail-closed until v2 succeeds and exact PTMs are independently
+promoted to repository status `supported`.
 
 ## Implementation audit
 
@@ -64,7 +69,7 @@ durable SDK state stores. Every unsuccessful arm is preserved as a terminal
 exclusion. Success is still blocked until the exact registry record is
 independently promoted to `supported`; evidence never bypasses registry policy.
 
-The repository now includes a minimal data-only `ptm_stage.py` path for all
+The repository includes a minimal data-only `ptm_stage.py` path for all
 four arms. It uses `NGCHTTPSClient` and `AtomicArtifactCache`, verifies exact
 immutable member identity, size, and checksum, and atomically publishes
 read-only bytes plus the existing stage-manifest schema on Lustre. It is
@@ -79,7 +84,7 @@ derived, verified to correspond, and never accepted as an independent
 identity. Both manifest copies retain canonical `/lustre/...` checkpoint
 paths. Unsafe canonical roots, inactive or symlinked mounts, path escapes,
 non-corresponding roots, and non-inventory stage content fail closed. No mount
-was established and the stager was not executed during this preparation.
+was used only for data staging; no model ran in that step.
 
 ## Three independent mode jobs
 
@@ -113,14 +118,15 @@ the remaining 23 recommendations per mode are automatically released.
 
 | Blocker | State |
 | --- | --- |
-| Four-checkpoint immutable PTM stage manifest | Stager implemented; execution pending |
-| Direct-full qualification completion | Missing |
+| Four-checkpoint immutable PTM stage manifest | Complete and read-only |
+| Direct-full qualification v1 | Preserved terminal first-batch DDP failure for 4/4 arms |
+| Direct-full qualification v2 | Pending/running until runtime completion evidence exists |
 | Runtime-supported Mask Grounding DINO registry record | None; 4/4 unverified |
-| Clean final source commit and matching wheel | Not yet sealed |
-| Final `campaign.v1.json` | Not generated |
+| Clean v2 source commit and matching sealed inputs | Required before v2 launch |
+| Final `campaign.v2.json` | Generated only from the clean v2 commit |
 
-These are prerequisite blockers, not model results. No scheduler client was
-constructed and no Mask Grounding DINO job ID exists from this preparation.
+The v1 failures are diagnostic qualification evidence, not benchmark results;
+there is no valid Mask Grounding DINO accuracy or latency metric yet.
 
 ## Verification
 
@@ -133,20 +139,14 @@ specification, and integrity failure paths.
 The final static verification completed with:
 
 ```text
-PTM-stage focused suite: 13 passed
-campaign-specific suite: 41 passed
-full production suite: 969 passed, 1 skipped
-complete cross-model experiment suite: 359 passed
+campaign-specific suite: 44 passed
+full production suite: 970 passed, 1 skipped
+complete cross-model experiment suite: 429 passed
 python compilation: passed
 git diff --check: passed
 ```
 
-The isolated campaign branch predates the already-integrated
-`fcf0aa6` one-line registry-sidecar count correction. The production total
-above was verified with that exact target-branch correction applied and then
-removed from this change to avoid duplicating it; without it, the isolated
-branch reports 968 passed, 1 skipped, and only the known 13-versus-17 inventory
-assertion failure. The three production-suite and three cross-model-suite
-warnings are the established sklearn Gaussian-process convergence warnings;
-no additional warning was observed. The source commit is recorded in the
-parent campaign handoff after this report is committed.
+The three production-suite and three cross-model-suite warnings are the
+established sklearn Gaussian-process convergence warnings; no additional
+warning was observed. The source commit is recorded in the sealed v2 campaign
+after this report is committed.

@@ -57,10 +57,10 @@ except ModuleNotFoundError:  # pragma: no cover - direct execution
 
 HERE = Path(__file__).resolve().parent
 ENV_PATH = Path("/localhome/local-rarunachalam/.tao/config.env")
-DEFAULT_CONTRACT = HERE / "campaign.v1.json"
+DEFAULT_CONTRACT = HERE / "campaign.v2.json"
 DEFAULT_RUNTIME_ROOT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
-    "cross_model_automl_20260729/mask_grounding_dino_coco2017_three_mode"
+    "cross_model_automl_20260729/mask_grounding_dino_coco2017_three_mode_v2"
 )
 TERMINAL_JOB_STATUSES = frozenset({"Complete", "Error", "Canceled"})
 SUCCESS_RECOMMENDATION_STATUSES = frozenset({"success", "done"})
@@ -327,6 +327,10 @@ def verify_local_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
     ):
         raise CampaignExecutionError("sealed SDK or skills commit changed")
     identities = {
+        "ddp_strategy_audit": (
+            HERE / "ddp_strategy_audit.v2.json",
+            contract["launcher_integrity"]["ddp_strategy_audit_sha256"],
+        ),
         "wheel": (
             runtime["wheel_path"],
             runtime["wheel_sha256"],
@@ -354,6 +358,10 @@ def verify_local_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
         "ptm_stage_manifest": (
             runtime["ptm_stage_manifest_path"],
             runtime["ptm_stage_manifest_sha256"],
+        ),
+        "predecessor_qualification": (
+            runtime["predecessor_failure_evidence"]["path"],
+            runtime["predecessor_failure_evidence"]["sha256"],
         ),
         "campaign_contract": (
             HERE / "campaign_contract.py",

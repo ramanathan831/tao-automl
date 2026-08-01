@@ -1,14 +1,17 @@
 # Mask Grounding DINO / full COCO 2017 AutoML campaign
 
 This directory prepares three independent, objective-aware AutoML jobs for the
-exact TAO model identifier `mask_grounding_dino`. It does not run a CPU model
-test, smoke test, mini-step, local GPU job, or SLURM job. Every eventual model
-job is bound to the pinned TAO 7.1 SQSH and one node with eight A100 GPUs.
+exact TAO model identifier `mask_grounding_dino`. It has no CPU model-test,
+smoke-test, mini-step, or local-GPU path. Every model job is bound to the pinned
+TAO 7.1 SQSH and one node with eight A100 GPUs.
 
-The campaign is statically prepared but is not launch-ready. All four official
-Mask Grounding DINO checkpoints remain `unverified`; their immutable stage,
-direct full-run qualification evidence, and reviewed registry promotion do not
-exist yet. The automatic trigger fails closed until those prerequisites exist.
+The immutable four-PTM stage is complete. Qualification v1 is preserved at
+SHA-256 `a48d8d8d2a5c65e35c9d39bd5ed1362be54e2be0b89dcda5471812da331a6996`:
+all four jobs loaded their exact PTM and full COCO data, then failed on the
+first distributed training batch because plain DDP did not detect unused
+parameters. V2 changes only the effective DDP strategy and writes to a new
+runtime root. The automatic three-mode trigger remains fail-closed until v2
+evidence and reviewed repository-supported PTM status are both available.
 
 ## Scientific contract
 
@@ -122,6 +125,29 @@ Failures are terminal preserved exclusions. Successful evidence does not
 mutate or bypass the registry: the exact record must then be independently
 reviewed and promoted to `supported`.
 
+### Qualification v2 DDP correction
+
+Static inspection of the pinned SQSH is recorded in
+`ddp_strategy_audit.v2.json`. TAO's public configuration field accepts only
+`ddp` and `fsdp`; the literal Lightning alias
+`ddp_find_unused_parameters_true` is not a valid direct TAO config value. The
+pinned Mask Grounding DINO launcher resolves the supported combination below
+to that Lightning strategy:
+
+```yaml
+train:
+  distributed_strategy: ddp
+  activation_checkpoint: false
+```
+
+V1 used `activation_checkpoint: true`, which resolved to plain DDP and caused
+the preserved first-batch failures in SLURM jobs `31243535`–`31243538`. V2
+keeps every PTM, dataset identity, batch size, epoch, objective, search range,
+seed, hardware requirement, and SQSH identity unchanged. It changes only the
+effective distributed strategy to unused-parameter-aware DDP. The direct-full
+GPU jobs—not a CPU or mini-step probe—validate whether that supported TAO
+resolution works for this model.
+
 ## Frozen objective-aware search
 
 PTM identity is a hierarchical, non-ordinal outer arm. Within each arm, the
@@ -173,16 +199,11 @@ Candidate zero in all three modes must pass full train, standalone evaluation,
 latency, provenance, and audit gates before the remaining 23 recommendations
 per mode are released automatically.
 
-Current exact blockers:
-
-- the four-PTM immutable stage manifest has not been executed;
-- direct full-run qualification evidence is absent;
-- all four registry records remain `unverified`;
-- a clean post-change source commit and matching production wheel have not been
-  sealed into `campaign.v1.json`.
-
-No campaign manifest is committed because sealing it before those identities
-exist would create invalid evidence.
+Current exact blockers are v2 direct-full qualification and reviewed registry
+promotion. The v1 failure is immutable and cannot be overwritten or treated as
+v2 evidence. A durable `--automatic-trigger --launch` watcher may run in
+parallel with qualification; it submits no three-mode job while either gate is
+unmet.
 
 ## Reproduction sequence
 
@@ -219,22 +240,25 @@ export PATH=/localhome/local-rarunachalam/.tao/venvs/dino-multiobjective-py314/b
 python -m \
   experiments.cross_model_automl_20260729.mask_grounding_dino_coco2017_campaign.manifest_generator \
   --output \
-  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask_grounding_dino_coco2017_three_mode/campaign.v1.json
+  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask_grounding_dino_coco2017_three_mode_v2/campaign.v2.json
 
-# Plan-only: constructs no scheduler client and submits no job.
+# Direct full qualification: four concurrent one-node/eight-A100 jobs.
 python -m \
   experiments.cross_model_automl_20260729.mask_grounding_dino_coco2017_campaign.qualification_campaign \
   --contract \
-  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask_grounding_dino_coco2017_three_mode/campaign.v1.json
+  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask_grounding_dino_coco2017_three_mode_v2/campaign.v2.json \
+  --runtime-root \
+  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask_grounding_dino_coco2017_ptm_qualification_v2 \
+  --launch
 
-# Add --launch only for the reviewed direct-full qualification run.
-# After successful evidence and independent registry promotion, reseal the
-# final campaign against the promoted clean source and wheel.
-
+# Run concurrently with qualification. This waits and fails closed; it does
+# not infer registry support from qualification evidence.
 python -m \
   experiments.cross_model_automl_20260729.mask_grounding_dino_coco2017_campaign.run_campaign \
   --contract \
-  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask_grounding_dino_coco2017_three_mode/campaign.v1.json \
+  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask_grounding_dino_coco2017_three_mode_v2/campaign.v2.json \
+  --runtime-root \
+  /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/mask_grounding_dino_coco2017_three_mode_v2 \
   --automatic-trigger \
   --launch
 ```
