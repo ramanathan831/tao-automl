@@ -2843,6 +2843,13 @@ def launch(
 ) -> dict[str, Any]:
     """Run the sealed 4-reuse/9-train/13-evaluate qualification plan."""
     contract = run_campaign.load_contract(contract_path)
+    qualification_path = Path(
+        contract["qualification_policy"]["qualification_evidence_path"]
+    ).resolve()
+    if runtime_root.resolve() != qualification_path.parent:
+        raise CampaignExecutionError(
+            "qualification runtime root differs from the sealed contract"
+        )
     expected_stage = Path(
         contract["qualification_policy"]["ptm_stage_manifest_path"]
     ).resolve()
@@ -2986,15 +2993,6 @@ def launch(
             for checkpoint_id in processes
         },
     )
-    qualification_path = Path(
-        contract["qualification_policy"][
-            "qualification_evidence_path"
-        ]
-    ).resolve()
-    if qualification_path.parent != runtime_root.resolve():
-        raise CampaignExecutionError(
-            "qualification output escaped the sealed runtime root"
-        )
     atomic_json(qualification_path, completion)
     handoff = build_handoff(
         contract=contract,

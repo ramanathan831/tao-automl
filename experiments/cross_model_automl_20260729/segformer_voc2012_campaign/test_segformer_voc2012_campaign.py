@@ -2922,3 +2922,20 @@ def test_v5_launch_claim_forbids_reentry_and_existing_workflow_state(
             contract_sha256="a" * 64,
             stage_manifest_sha256="b" * 64,
         )
+
+
+def test_v5_launch_rejects_unsealed_runtime_root_before_any_work(
+    contract,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(run_campaign, "load_contract", lambda _path: contract)
+    with pytest.raises(
+        qualification_campaign.CampaignExecutionError,
+        match="runtime root differs from the sealed contract",
+    ):
+        qualification_campaign.launch(
+            contract_path=tmp_path / "contract.json",
+            stage_path=tmp_path / "stage.json",
+            runtime_root=tmp_path / "alternate-root",
+        )
