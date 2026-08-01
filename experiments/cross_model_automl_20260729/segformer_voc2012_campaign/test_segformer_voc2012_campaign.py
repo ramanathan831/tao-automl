@@ -10,7 +10,7 @@ import shlex
 import socket
 import subprocess
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import yaml
@@ -124,6 +124,10 @@ def _workflow(
     metric: float = 0.4,
 ) -> dict:
     record = load_ptm_registry().checkpoint(checkpoint_id)
+    plan = qualification_campaign._v4_phase_recovery_records()[checkpoint_id]
+    phase_policy = (
+        campaign_contract.FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY
+    )
     if not success:
         value = {
             "schema_version": 2,
@@ -145,10 +149,17 @@ def _workflow(
             "infrastructure_retry_policy": copy.deepcopy(
                 campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
             ),
+            "phase_recovery_policy": copy.deepcopy(phase_policy),
+            "execution_plan": copy.deepcopy(plan),
         }
         value["workflow_sha256"] = canonical_sha256(value)
         return value
-    source_path = f"/lustre/ptms/{checkpoint_id}.pth"
+    reused = plan["mode"] == "reuse_sealed_v4_terminal_train"
+    source_path = (
+        plan["source_checkpoint"]["path"]
+        if reused
+        else f"/lustre/ptms/{checkpoint_id}.pth"
+    )
     load_payload = {
         "checkpoint": source_path,
         "component": (
@@ -164,11 +175,15 @@ def _workflow(
         "shape_mismatched_tensor_count": 4,
         "unmatched_tensor_count": 2,
     }
-    pretrained_load = {
-        **load_payload,
-        "status_record_occurrences": 1,
-        "report_sha256": canonical_sha256(load_payload),
-    }
+    pretrained_load = (
+        copy.deepcopy(plan["pretrained_load"])
+        if reused
+        else {
+            **load_payload,
+            "status_record_occurrences": 1,
+            "report_sha256": canonical_sha256(load_payload),
+        }
+    )
 
     def completed_job(phase: str) -> dict:
         policy = campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
@@ -200,6 +215,12 @@ def _workflow(
             "infrastructure_retry_submitted": False,
         }
         return {
+            "execution_mode": (
+                "run_fresh_full_train"
+                if phase == "train"
+                else "new_standalone_evaluation"
+            ),
+            "new_job_submitted": True,
             "runtime_overlay_required": True,
             "command_sha256": command_sha256,
             "tao_job_id": job_id,
@@ -217,6 +238,76 @@ def _workflow(
             "successful_job_replacement_allowed": False,
         }
 
+    if reused:
+        train_status_evidence = copy.deepcopy(
+            plan["validation_status_evidence"]
+        )
+        train_status_evidence["pretrained_load"] = copy.deepcopy(
+            pretrained_load
+        )
+        terminal_checkpoint = copy.deepcopy(plan["terminal_checkpoint"])
+        predecessor_job = copy.deepcopy(plan["train_job"])
+        train_job = {
+            "execution_mode": "reuse_sealed_v4_terminal_train",
+            "new_job_submitted": False,
+            "successful_train_reexecution": False,
+            "runtime_overlay_required": True,
+            "runtime_overlay": copy.deepcopy(
+                plan["predecessor_runtime_overlay"]
+            ),
+            "predecessor_campaign_id": phase_policy[
+                "predecessor_campaign_id"
+            ],
+            "predecessor_completion_whole_file_sha256": phase_policy[
+                "predecessor_completion_whole_file_sha256"
+            ],
+            "predecessor_load_audit_whole_file_sha256": phase_policy[
+                "predecessor_load_audit_whole_file_sha256"
+            ],
+            "v4_workflow_sha256": plan["v4_workflow_sha256"],
+            "v4_load_audit_row_sha256": plan[
+                "v4_load_audit_row_sha256"
+            ],
+            "tao_job_id": predecessor_job["tao_job_id"],
+            "tao_job_id_origin": "sealed_predecessor_v4",
+            "status": "Complete",
+            "result_root": predecessor_job["result_root"],
+            "command_sha256": predecessor_job["command_sha256"],
+            "spec_sha256": predecessor_job["spec_sha256"],
+            "predecessor_train_job": predecessor_job,
+            "status_evidence": copy.deepcopy(train_status_evidence),
+            "terminal_checkpoint": copy.deepcopy(terminal_checkpoint),
+        }
+        train_recipe = copy.deepcopy(plan["predecessor_recipe_fidelity"])
+        train_overlay = copy.deepcopy(plan["predecessor_runtime_overlay"])
+        train_revision = plan["predecessor_qualification_revision"]
+        train_metric = train_status_evidence["val_miou"]
+    else:
+        train_status_evidence = {"pretrained_load": pretrained_load}
+        terminal_checkpoint = {
+            "path": (
+                "/lustre/results/"
+                f"{checkpoint_id}/model_epoch_049_step_09150.pth"
+            ),
+            "size_bytes": 123,
+            "sha256": "b" * 64,
+            "training_epochs": 50,
+            "terminal_epoch_index": 49,
+            "naming_contract": "model_epoch_049_step_numeric",
+            "ambiguity_policy": "fail_closed",
+        }
+        train_job = completed_job("train")
+        train_recipe = copy.deepcopy(
+            campaign_contract.FROZEN_QUALIFICATION_FIDELITY
+        )
+        train_overlay = copy.deepcopy(
+            campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+        )
+        train_revision = campaign_contract.QUALIFICATION_REVISION
+        train_metric = metric
+
+    evaluation_job = completed_job("evaluate")
+    evaluation_job["checkpoint"] = copy.deepcopy(terminal_checkpoint)
     value = {
         "schema_version": 2,
         "qualification_revision": campaign_contract.QUALIFICATION_REVISION,
@@ -227,10 +318,16 @@ def _workflow(
         "source_checkpoint": {
             "path": source_path,
             "size_bytes": record["expected_size_bytes"],
-            "sha256": "a" * 64,
+            "sha256": (
+                plan["source_checkpoint"]["sha256"]
+                if reused
+                else "a" * 64
+            ),
         },
         "train": {
             "status": "Complete",
+            "execution_mode": plan["mode"],
+            "source_qualification_revision": train_revision,
             "full_dataset": True,
             "training_epochs": (
                 campaign_contract.FROZEN_QUALIFICATION_TRAINING_EPOCHS
@@ -239,31 +336,14 @@ def _workflow(
             "validation_record_count": (
                 campaign_contract.FROZEN_QUALIFICATION_TRAINING_EPOCHS
             ),
-            "recipe_fidelity": copy.deepcopy(
-                campaign_contract.FROZEN_QUALIFICATION_FIDELITY
-            ),
-            "runtime_overlay": copy.deepcopy(
-                campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
-            ),
-            "job": completed_job("train"),
+            "recipe_fidelity": train_recipe,
+            "runtime_overlay": train_overlay,
+            "job": train_job,
             "nodes": 1,
             "gpus": 8,
-            "val_miou": metric,
-            "terminal_checkpoint": {
-                "path": (
-                    "/lustre/results/"
-                    f"{checkpoint_id}/model_epoch_049_step_09150.pth"
-                ),
-                "size_bytes": 123,
-                "sha256": "b" * 64,
-                "training_epochs": 50,
-                "terminal_epoch_index": 49,
-                "naming_contract": "model_epoch_049_step_numeric",
-                "ambiguity_policy": "fail_closed",
-            },
-            "status_evidence": {
-                "pretrained_load": pretrained_load,
-            },
+            "val_miou": train_metric,
+            "terminal_checkpoint": terminal_checkpoint,
+            "status_evidence": train_status_evidence,
         },
         "evaluation": {
             "status": "Complete",
@@ -271,7 +351,7 @@ def _workflow(
             "runtime_overlay": copy.deepcopy(
                 campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
             ),
-            "job": completed_job("evaluate"),
+            "job": evaluation_job,
             "nodes": 1,
             "gpus": 8,
             "test_miou": metric,
@@ -288,6 +368,8 @@ def _workflow(
         "infrastructure_retry_policy": copy.deepcopy(
             campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
         ),
+        "phase_recovery_policy": copy.deepcopy(phase_policy),
+        "execution_plan": copy.deepcopy(plan),
     }
     value["workflow_sha256"] = canonical_sha256(value)
     return value
@@ -302,6 +384,7 @@ def _qualification_document(success_id: str | None = None) -> dict:
         )
         for record in snapshot["records"]
     ]
+    successful = sum(item["status"] == "success" for item in workflows)
     value = {
         "schema_version": 2,
         "qualification_revision": campaign_contract.QUALIFICATION_REVISION,
@@ -319,16 +402,57 @@ def _qualification_document(success_id: str | None = None) -> dict:
         "infrastructure_retry_policy": copy.deepcopy(
             campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
         ),
+        "phase_recovery_policy": copy.deepcopy(
+            campaign_contract.FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY
+        ),
         "prior_revision_evidence": copy.deepcopy(
             campaign_contract.FROZEN_PRIOR_QUALIFICATION_EVIDENCE
         ),
         "cpu_model_runs": 0,
         "smoke_model_runs": 0,
         "mini_step_runs": 0,
+        "status": (
+            "success"
+            if successful == len(workflows)
+            else "terminal_with_failures"
+        ),
+        "terminal": True,
+        "successful_workflows": successful,
+        "failed_workflows": len(workflows) - successful,
+        "all_official_arms_attempted": True,
+        "failure_records_preserved": True,
+        "replacement_workflows_submitted": False,
+        "agent_intervention_flags": {
+            name: False for name in campaign_contract.AGENT_FLAGS
+        },
         "workflows": workflows,
     }
     value["evidence_sha256"] = canonical_sha256(value)
     return value
+
+
+def _refresh_qualification_summary(document: dict) -> None:
+    successful = sum(
+        item["status"] == "success" for item in document["workflows"]
+    )
+    document.update(
+        {
+            "status": (
+                "success"
+                if successful == len(document["workflows"])
+                else "terminal_with_failures"
+            ),
+            "terminal": True,
+            "successful_workflows": successful,
+            "failed_workflows": len(document["workflows"]) - successful,
+            "all_official_arms_attempted": True,
+            "failure_records_preserved": True,
+            "replacement_workflows_submitted": False,
+            "agent_intervention_flags": {
+                name: False for name in campaign_contract.AGENT_FLAGS
+            },
+        }
+    )
 
 
 def _seal_runtime_local_qualification(
@@ -346,6 +470,7 @@ def _seal_runtime_local_qualification(
             checkpoint_id,
             success=True,
         )
+    _refresh_qualification_summary(document)
     document["automl_contract_sha256"] = contract["contract_sha256"]
     document["qualification_controller_sha256"] = contract[
         "launcher_integrity"
@@ -415,13 +540,19 @@ def _seal_runtime_local_qualification(
 def _fake_qualification_stage(contract: dict) -> dict:
     rows = []
     registry = load_ptm_registry()
+    recovery_records = qualification_campaign._v4_phase_recovery_records()
     for record_summary in campaign_contract.segformer_registry_snapshot()[
         "records"
     ]:
         record = registry.checkpoint(record_summary["id"])
+        recovery = recovery_records[record["id"]]
         checkpoint_path = (
-            "/lustre/segformer-qualification/ptms/"
-            f"{record['id']}/{record['source']['member']}"
+            recovery["source_checkpoint"]["path"]
+            if recovery["mode"] == "reuse_sealed_v4_terminal_train"
+            else (
+                "/lustre/segformer-qualification/ptms/"
+                f"{record['id']}/{record['source']['member']}"
+            )
         )
         specifications = qualification_campaign.qualification_specs(
             contract,
@@ -462,7 +593,11 @@ def _fake_qualification_stage(contract: dict) -> dict:
                     "cache_hit": False,
                 },
             }
-        observed_sha = hashlib.sha256(record["id"].encode()).hexdigest()
+        observed_sha = (
+            recovery["source_checkpoint"]["sha256"]
+            if recovery["mode"] == "reuse_sealed_v4_terminal_train"
+            else hashlib.sha256(record["id"].encode()).hexdigest()
+        )
         rows.append(
             {
                 "checkpoint_id": record["id"],
@@ -516,6 +651,7 @@ def _fake_qualification_stage(contract: dict) -> dict:
                     "cache_hit": False,
                 },
                 "specs": specs,
+                "execution_plan": copy.deepcopy(recovery),
             }
         )
     value = {
@@ -559,6 +695,9 @@ def _fake_qualification_stage(contract: dict) -> dict:
             ),
             "infrastructure_retry_policy": copy.deepcopy(
                 campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
+            ),
+            "phase_recovery_policy": copy.deepcopy(
+                campaign_contract.FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY
             ),
         },
         "recipe_fidelity": copy.deepcopy(
@@ -675,7 +814,7 @@ def test_search_profile_remains_frozen_at_v1_fidelity():
     assert train["tensorboard"]["enabled"] is False
 
 
-def test_qualification_v4_uses_official_multiclass_fidelity_uniformly():
+def test_qualification_v5_uses_official_multiclass_fidelity_uniformly():
     profile = campaign_contract.qualification_profile_overrides(
         _dataset()["prepared_root"]
     )
@@ -701,12 +840,13 @@ def test_qualification_v4_uses_official_multiclass_fidelity_uniformly():
     assert train["use_distributed_sampler"] is True
 
 
-def test_qualification_v4_paths_preserve_frozen_v1_v2_v3_evidence():
+def test_qualification_v5_paths_preserve_frozen_v1_v2_v3_v4_evidence():
     v1 = campaign_contract.FROZEN_V1_QUALIFICATION_EVIDENCE
     v2 = campaign_contract.FROZEN_V2_QUALIFICATION_EVIDENCE
     v3 = campaign_contract.FROZEN_V3_QUALIFICATION_EVIDENCE
+    v4 = campaign_contract.FROZEN_V4_QUALIFICATION_EVIDENCE
     prior = campaign_contract.FROZEN_PRIOR_QUALIFICATION_EVIDENCE
-    assert prior == [v1, v2, v3]
+    assert prior == [v1, v2, v3, v4]
     assert v1["campaign_id"].endswith("-v1")
     assert v1["status"] == "terminal_with_failures"
     assert v1["successful_workflows"] == 0
@@ -757,16 +897,29 @@ def test_qualification_v4_paths_preserve_frozen_v1_v2_v3_evidence():
         ),
     ):
         assert campaign_contract.sha256_file(v3[path_key]) == v3[sha_key]
-    assert qualification_campaign.QUALIFICATION_CAMPAIGN_ID.endswith("-v4")
-    assert qualification_campaign.DEFAULT_CONTRACT.name == "campaign.v4.json"
-    assert run_campaign.DEFAULT_CONTRACT.name == "campaign.v4.json"
-    assert "qualification_v4" in str(
+    assert v4["campaign_id"].endswith("-v4")
+    assert v4["positive_load_train_workflows"] == 4
+    assert v4["backbone_prefix_load_failure_workflows"] == 9
+    for path_key, sha_key in (
+        ("contract_path", "contract_whole_file_sha256"),
+        ("completion_path", "completion_whole_file_sha256"),
+        (
+            "ptm_stage_manifest_path",
+            "ptm_stage_manifest_whole_file_sha256",
+        ),
+        ("ptm_load_audit_path", "ptm_load_audit_whole_file_sha256"),
+    ):
+        assert campaign_contract.sha256_file(v4[path_key]) == v4[sha_key]
+    assert qualification_campaign.QUALIFICATION_CAMPAIGN_ID.endswith("-v5")
+    assert qualification_campaign.DEFAULT_CONTRACT.name == "campaign.v5.json"
+    assert run_campaign.DEFAULT_CONTRACT.name == "campaign.v5.json"
+    assert "qualification_v5" in str(
         qualification_campaign.DEFAULT_RUNTIME_ROOT
     )
-    assert "qualification_v4" in str(
+    assert "qualification_v5" in str(
         qualification_campaign.DEFAULT_LOCAL_CACHE
     )
-    assert "qualification_v4" in str(
+    assert "qualification_v5" in str(
         qualification_campaign.DEFAULT_LUSTRE_INPUT_ROOT
     )
     assert manifest_generator.DEFAULT_QUALIFICATION != Path(
@@ -777,7 +930,7 @@ def test_qualification_v4_paths_preserve_frozen_v1_v2_v3_evidence():
     )
 
 
-def test_qualification_v4_binds_combined_runtime_overlay(contract):
+def test_qualification_v5_binds_combined_runtime_overlay(contract):
     overlay = campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
     assert overlay["combined_commit"] == (
         "2681dea4c876b759f8a0446491b3619e6120b531"
@@ -790,13 +943,16 @@ def test_qualification_v4_binds_combined_runtime_overlay(contract):
     assert overlay["file_count"] == 5
     assert "positive_pretrained_load_receipt" in overlay["remediates"]
     policy = contract["qualification_policy"]
-    assert policy["revision"] == 4
-    assert policy["campaign_id"].endswith("-v4")
+    assert policy["revision"] == 5
+    assert policy["campaign_id"].endswith("-v5")
     assert policy["training_epochs"] == 50
     assert policy["recipe_fidelity"] == (
         campaign_contract.FROZEN_QUALIFICATION_FIDELITY
     )
     assert policy["runtime_overlay"] == overlay
+    assert policy["phase_recovery_policy"] == (
+        campaign_contract.FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY
+    )
     assert policy["prior_revision_evidence"] == (
         campaign_contract.FROZEN_PRIOR_QUALIFICATION_EVIDENCE
     )
@@ -1118,6 +1274,7 @@ def test_low_finite_miou_does_not_pass_ptm_qualification(tmp_path: Path):
         success=True,
         metric=0.09,
     )
+    _refresh_qualification_summary(document)
     document["evidence_sha256"] = canonical_sha256(
         {
             key: value
@@ -1274,7 +1431,7 @@ def test_contract_integrity_rejects_mutation(contract):
     )
     with pytest.raises(
         campaign_contract.CampaignContractError,
-        match="qualification v4 fidelity or provenance changed",
+        match="qualification v5 fidelity or provenance changed",
     ):
         campaign_contract.validate_contract(changed)
 
@@ -1285,10 +1442,14 @@ def test_qualification_plan_contains_every_official_arm_without_fallback(
     plan = qualification_campaign.qualification_plan(contract)
     assert plan["workflow_count"] == 13
     assert plan["schema_version"] == 2
-    assert plan["qualification_revision"] == 4
+    assert plan["qualification_revision"] == 5
     assert plan["workflow"] == (
-        "full_voc2012_50_epoch_train_then_standalone_full_validation"
+        "selective_v4_terminal_train_reuse_or_fresh_full_voc2012_"
+        "50_epoch_train_then_new_standalone_full_validation"
     )
+    assert plan["new_full_train_job_count"] == 9
+    assert plan["reused_terminal_train_phase_count"] == 4
+    assert plan["new_standalone_evaluation_job_count"] == 13
     assert plan["recipe_fidelity"] == (
         campaign_contract.FROZEN_QUALIFICATION_FIDELITY
     )
@@ -1446,7 +1607,13 @@ def test_completion_exactly_round_trips_through_qualification_gate(
         workflow["source_checkpoint"] = copy.deepcopy(
             row["checkpoint"]
         )
-        if workflow["status"] == "success":
+        if (
+            workflow["status"] == "success"
+            and workflow["train"]["status_evidence"][
+                "pretrained_load"
+            ]["schema_version"]
+            == 1
+        ):
             report = workflow["train"]["status_evidence"][
                 "pretrained_load"
             ]
@@ -1516,7 +1683,13 @@ def test_qualification_handoff_is_automatic_but_never_promotes_registry(
         workflow["source_checkpoint"] = copy.deepcopy(
             row["checkpoint"]
         )
-        if workflow["status"] == "success":
+        if (
+            workflow["status"] == "success"
+            and workflow["train"]["status_evidence"][
+                "pretrained_load"
+            ]["schema_version"]
+            == 1
+        ):
             report = workflow["train"]["status_evidence"][
                 "pretrained_load"
             ]
@@ -1589,7 +1762,13 @@ def test_independent_status_promotion_preserves_pre_promotion_evidence(
         workflow["source_checkpoint"] = copy.deepcopy(
             row["checkpoint"]
         )
-        if workflow["status"] == "success":
+        if (
+            workflow["status"] == "success"
+            and workflow["train"]["status_evidence"][
+                "pretrained_load"
+            ]["schema_version"]
+            == 1
+        ):
             report = workflow["train"]["status_evidence"][
                 "pretrained_load"
             ]
@@ -2269,9 +2448,14 @@ def test_training_status_evidence_requires_exact_positive_load_receipt(
 
 
 def test_qualification_gate_rejects_finite_metrics_without_positive_load():
-    checkpoint_id = campaign_contract.segformer_registry_snapshot()[
-        "records"
-    ][0]["id"]
+    checkpoint_id = next(
+        item["id"]
+        for item in campaign_contract.segformer_registry_snapshot()[
+            "records"
+        ]
+        if item["checkpoint_target"]
+        == "model.backbone.pretrained_backbone_path"
+    )
     workflow = _workflow(checkpoint_id, success=True, metric=0.7)
     report = workflow["train"]["status_evidence"]["pretrained_load"]
     report["loaded_tensor_count"] = 0
@@ -2381,9 +2565,14 @@ def test_qualification_terminal_checkpoint_rejects_search_epoch_checkpoint(
 
 
 def test_qualification_gate_rejects_epoch_9_terminal_checkpoint():
-    checkpoint_id = campaign_contract.segformer_registry_snapshot()[
-        "records"
-    ][0]["id"]
+    checkpoint_id = next(
+        item["id"]
+        for item in campaign_contract.segformer_registry_snapshot()[
+            "records"
+        ]
+        if item["checkpoint_target"]
+        == "model.backbone.pretrained_backbone_path"
+    )
     workflow = _workflow(checkpoint_id, success=True)
     terminal = workflow["train"]["terminal_checkpoint"]
     terminal.update(
@@ -2397,6 +2586,7 @@ def test_qualification_gate_rejects_epoch_9_terminal_checkpoint():
             "naming_contract": "model_epoch_009_step_numeric",
         }
     )
+    workflow["evaluation"]["job"]["checkpoint"] = copy.deepcopy(terminal)
     workflow["workflow_sha256"] = canonical_sha256(
         {
             key: value
@@ -2476,3 +2666,259 @@ def test_qualification_controller_has_no_local_model_or_smoke_path():
     assert "load_smoke" not in source
     assert "mini_step" in source
     assert "scheduler_jobs_submitted\": 0" in source
+
+
+def test_v5_phase_recovery_partition_and_plan_hashes_are_exact():
+    records = qualification_campaign._v4_phase_recovery_records()
+    policy = campaign_contract.FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY
+    reused = {
+        checkpoint_id
+        for checkpoint_id, plan in records.items()
+        if plan["mode"] == "reuse_sealed_v4_terminal_train"
+    }
+    fresh = set(records) - reused
+    assert reused == set(
+        campaign_contract.FROZEN_V4_REUSABLE_TRAIN_CHECKPOINT_IDS
+    )
+    assert fresh == set(campaign_contract.FROZEN_V5_FRESH_TRAIN_CHECKPOINT_IDS)
+    assert len(reused) == 4
+    assert len(fresh) == 9
+    assert {
+        checkpoint_id: canonical_sha256(plan)
+        for checkpoint_id, plan in records.items()
+    } == policy["execution_plan_sha256_by_checkpoint_id"]
+
+
+def test_v5_stage_rejects_resigned_execution_plan_tamper(contract):
+    stage = _fake_qualification_stage(contract)
+    stage["ptms"][0]["execution_plan"]["new_train_job_required"] = True
+    stage["stage_manifest_sha256"] = canonical_sha256(
+        {
+            key: value
+            for key, value in stage.items()
+            if key != "stage_manifest_sha256"
+        }
+    )
+    with pytest.raises(
+        qualification_campaign.CampaignExecutionError,
+        match="checkpoint identity differs",
+    ):
+        qualification_campaign.validate_stage_manifest(stage, contract=contract)
+
+
+def test_v5_reused_train_evidence_proves_no_new_job(
+    contract,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    row = next(
+        item
+        for item in _fake_qualification_stage(contract)["ptms"]
+        if item["execution_plan"]["mode"]
+        == "reuse_sealed_v4_terminal_train"
+    )
+    plan = row["execution_plan"]
+    identities = {
+        item["path"]: item
+        for item in (
+            row["checkpoint"],
+            plan["terminal_checkpoint"],
+            plan["validation_status_evidence"],
+        )
+    }
+
+    def fake_identity(path):
+        expected = identities[path]
+        return {
+            "path": path,
+            "size_bytes": expected["size_bytes"],
+            "sha256": expected["sha256"],
+            "mode": expected.get("mode", "644"),
+        }
+
+    monkeypatch.setattr(
+        qualification_campaign,
+        "_remote_identity",
+        fake_identity,
+    )
+    status, checkpoint, job = (
+        qualification_campaign._reused_train_phase_evidence(row)
+    )
+    assert job["new_job_submitted"] is False
+    assert job["successful_train_reexecution"] is False
+    assert job["tao_job_id"] == plan["train_job"]["tao_job_id"]
+    assert job["runtime_overlay"] == plan["predecessor_runtime_overlay"]
+    assert checkpoint == plan["terminal_checkpoint"]
+    assert status["pretrained_load"] == plan["pretrained_load"]
+
+
+def test_v5_worker_submits_nine_trains_and_thirteen_new_evaluations(
+    contract,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    stage = _fake_qualification_stage(contract)
+    stage_path = tmp_path / "stage.json"
+    stage_path.write_text(json.dumps(stage), encoding="utf-8")
+    monkeypatch.setattr(run_campaign, "load_contract", lambda _path: contract)
+    monkeypatch.setattr(
+        run_campaign,
+        "configure_slurm_runtime",
+        lambda _contract: None,
+    )
+
+    tao_sdk = ModuleType("tao_sdk")
+    tao_sdk.__path__ = []
+    tao_sdk.__file__ = str(
+        Path(contract["runtime"]["sdk_dir"]) / "tao_sdk/__init__.py"
+    )
+    platforms = ModuleType("tao_sdk.platforms")
+    platforms.__path__ = []
+    slurm = ModuleType("tao_sdk.platforms.slurm")
+
+    class FakeSDK:
+        def __init__(self, **_kwargs):
+            pass
+
+    slurm.SlurmSDK = FakeSDK
+    monkeypatch.setitem(sys.modules, "tao_sdk", tao_sdk)
+    monkeypatch.setitem(sys.modules, "tao_sdk.platforms", platforms)
+    monkeypatch.setitem(sys.modules, "tao_sdk.platforms.slurm", slurm)
+    monkeypatch.setattr(
+        qualification_campaign,
+        "_entrypoint",
+        lambda _contract, action, _spec: (action, action[0] * 64),
+    )
+    submissions = []
+
+    def fake_run_job(
+        _sdk,
+        _contract,
+        _command,
+        *,
+        evidence,
+        checkpoint_id,
+        phase,
+        job_key,
+        job_metadata,
+        **_kwargs,
+    ):
+        submissions.append((checkpoint_id, phase, job_key))
+        evidence["jobs"][job_key] = {
+            **copy.deepcopy(dict(job_metadata)),
+            "status": "Complete",
+        }
+        return SimpleNamespace(id=f"{checkpoint_id}-{job_key}"), "Complete"
+
+    monkeypatch.setattr(
+        qualification_campaign,
+        "_run_qualification_job",
+        fake_run_job,
+    )
+
+    def fake_reuse(row):
+        plan = row["execution_plan"]
+        status = copy.deepcopy(plan["validation_status_evidence"])
+        status["pretrained_load"] = copy.deepcopy(plan["pretrained_load"])
+        return status, copy.deepcopy(plan["terminal_checkpoint"]), {
+            "status": "Complete",
+            "new_job_submitted": False,
+            "tao_job_id": plan["train_job"]["tao_job_id"],
+        }
+
+    monkeypatch.setattr(
+        qualification_campaign,
+        "_reused_train_phase_evidence",
+        fake_reuse,
+    )
+    monkeypatch.setattr(
+        qualification_campaign,
+        "_training_status_evidence",
+        lambda *_args, **_kwargs: {
+            "validation_record_count": 50,
+            "val_miou": 0.5,
+            "pretrained_load": {"loaded_tensor_count": 1},
+        },
+    )
+    monkeypatch.setattr(
+        qualification_campaign,
+        "_qualification_terminal_checkpoint",
+        lambda *_args, **_kwargs: {
+            "path": "/lustre/results/model_epoch_049_step_1.pth",
+            "size_bytes": 1,
+            "sha256": "a" * 64,
+            "training_epochs": 50,
+            "terminal_epoch_index": 49,
+            "naming_contract": "model_epoch_049_step_numeric",
+            "ambiguity_policy": "fail_closed",
+        },
+    )
+    monkeypatch.setattr(
+        qualification_campaign,
+        "_evaluation_status_evidence",
+        lambda *_args, **_kwargs: {"test_miou": 0.5},
+    )
+    for row in stage["ptms"]:
+        qualification_campaign._run_workflow(
+            "contract.json",
+            str(stage_path),
+            str(tmp_path / "runtime"),
+            row["checkpoint_id"],
+        )
+    train_ids = {
+        checkpoint_id
+        for checkpoint_id, _phase, job_key in submissions
+        if job_key == "train"
+    }
+    evaluation_ids = {
+        checkpoint_id
+        for checkpoint_id, _phase, job_key in submissions
+        if job_key == "evaluate"
+    }
+    assert train_ids == set(
+        campaign_contract.FROZEN_V5_FRESH_TRAIN_CHECKPOINT_IDS
+    )
+    assert train_ids.isdisjoint(
+        campaign_contract.FROZEN_V4_REUSABLE_TRAIN_CHECKPOINT_IDS
+    )
+    assert evaluation_ids == set(row["checkpoint_id"] for row in stage["ptms"])
+    assert len([item for item in submissions if item[2] == "train"]) == 9
+    assert len([item for item in submissions if item[2] == "evaluate"]) == 13
+
+
+def test_v5_launch_claim_forbids_reentry_and_existing_workflow_state(
+    tmp_path: Path,
+):
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    claim = qualification_campaign._claim_qualification_launch(
+        runtime_root,
+        contract_sha256="a" * 64,
+        stage_manifest_sha256="b" * 64,
+    )
+    marker = Path(claim["path"])
+    sealed = json.loads(marker.read_text(encoding="utf-8"))
+    assert sealed["successful_train_reexecution_allowed"] is False
+    supplied = sealed.pop("claim_sha256")
+    assert supplied == canonical_sha256(sealed)
+    with pytest.raises(
+        qualification_campaign.CampaignExecutionError,
+        match="already claimed",
+    ):
+        qualification_campaign._claim_qualification_launch(
+            runtime_root,
+            contract_sha256="a" * 64,
+            stage_manifest_sha256="b" * 64,
+        )
+
+    dirty_root = tmp_path / "dirty-runtime"
+    workflow = dirty_root / "workflows" / "existing"
+    workflow.mkdir(parents=True)
+    with pytest.raises(
+        qualification_campaign.CampaignExecutionError,
+        match="workflow state already exists",
+    ):
+        qualification_campaign._claim_qualification_launch(
+            dirty_root,
+            contract_sha256="a" * 64,
+            stage_manifest_sha256="b" * 64,
+        )

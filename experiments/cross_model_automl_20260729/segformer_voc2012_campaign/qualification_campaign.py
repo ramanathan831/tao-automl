@@ -7,11 +7,13 @@ The controller has two explicit phases:
 * ``--stage`` is data-only.  It downloads all 13 exact NGC members, verifies
   their immutable identities and sizes, generates the per-PTM train/evaluate
   specifications, and publishes every input read-only on Lustre.
-* ``--launch`` verifies the sealed stage and submits exactly one independent
-  full-VOC2012 50-epoch train plus standalone-evaluate workflow per PTM.
+* ``--launch`` verifies the sealed stage, reuses only the four exact v4 train
+  phases with positive load evidence, runs fresh full-VOC2012 50-epoch trains
+  for the other nine arms, and submits a new standalone evaluation for all 13.
 
 There is no CPU/model smoke, mini-step, fallback checkpoint, replacement
-workflow, or manual PTM exclusion path.  Every terminal outcome is preserved.
+workflow, successful-train reexecution, or manual PTM exclusion path.  Every
+terminal outcome is preserved.
 The completion document is the exact input consumed by ``qualification_gate``.
 It cannot mutate the repository registry.  A separately sealed successor may
 bind exact successful, positive-load workflows into a campaign-local runtime
@@ -69,22 +71,23 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_CONTRACT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "segformer_voc2012_three_mode/campaign.v4.json"
+    "segformer_voc2012_three_mode/campaign.v5.json"
 )
 DEFAULT_RUNTIME_ROOT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "segformer_voc2012_ptm_qualification_v4"
+    "segformer_voc2012_ptm_qualification_v5"
 )
 DEFAULT_STAGE_MANIFEST = DEFAULT_RUNTIME_ROOT / "ptm_stage_manifest.json"
 DEFAULT_LOCAL_CACHE = Path(
     "/localhome/local-rarunachalam/.tao/cache/"
-    "segformer_voc2012_ptm_qualification_v4"
+    "segformer_voc2012_ptm_qualification_v5"
 )
 DEFAULT_LUSTRE_INPUT_ROOT = Path(
-    "/lustre/fsw/portfolios/edgeai/users/rarunachalam/"
+    "/lustre/fsw/portfolios/edgeai/projects/"
+    "edgeai_tao-ptm_image-foundation-model-clip/users/rarunachalam/"
     "cross_model_automl_20260729/"
-    "segformer_voc2012_ptm_qualification_v4/inputs"
+    "segformer_voc2012_ptm_qualification_v5/inputs"
 )
 QUALIFICATION_CAMPAIGN_ID = campaign_contract.QUALIFICATION_CAMPAIGN_ID
 EVALUATION_CHECKPOINT_SENTINEL = (
@@ -251,6 +254,7 @@ def verify_slurm_preflight(
     infrastructure_policy = qualification.get(
         "infrastructure_retry_policy"
     )
+    phase_recovery_policy = qualification.get("phase_recovery_policy")
     if (
         qualification.get("revision")
         != campaign_contract.QUALIFICATION_REVISION
@@ -260,9 +264,11 @@ def verify_slurm_preflight(
         != campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
         or infrastructure_policy
         != campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
+        or phase_recovery_policy
+        != campaign_contract.FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY
     ):
         raise CampaignExecutionError(
-            "qualification v4 fidelity or runtime overlay changed"
+            "qualification v5 fidelity or recovery policy changed"
         )
     run_campaign.configure_slurm_runtime(contract)
     sdk_dir = Path(runtime["sdk_dir"]).resolve()
@@ -309,6 +315,9 @@ def verify_slurm_preflight(
         "qualification_runtime_overlay": copy.deepcopy(overlay),
         "qualification_infrastructure_retry_policy": copy.deepcopy(
             infrastructure_policy
+        ),
+        "qualification_phase_recovery_policy": copy.deepcopy(
+            phase_recovery_policy
         ),
         "scheduler_jobs_submitted": 0,
     }
@@ -519,6 +528,289 @@ def _spec_artifact(
     }
 
 
+def _sealed_predecessor_json(
+    path: str,
+    *,
+    whole_file_sha256: str,
+    internal_key: str,
+    internal_sha256: str,
+) -> dict[str, Any]:
+    resolved = Path(path).resolve()
+    if (
+        not resolved.is_file()
+        or campaign_contract.sha256_file(resolved) != whole_file_sha256
+    ):
+        raise CampaignExecutionError(
+            f"sealed predecessor file identity changed: {resolved}"
+        )
+    try:
+        value = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise CampaignExecutionError(
+            f"sealed predecessor JSON is invalid: {resolved}"
+        ) from exc
+    if not isinstance(value, Mapping):
+        raise CampaignExecutionError(
+            f"sealed predecessor JSON root changed: {resolved}"
+        )
+    value = copy.deepcopy(dict(value))
+    payload = copy.deepcopy(value)
+    supplied = payload.pop(internal_key, None)
+    if supplied != internal_sha256 or supplied != canonical_sha256(payload):
+        raise CampaignExecutionError(
+            f"sealed predecessor internal identity changed: {resolved}"
+        )
+    return value
+
+
+def _v4_phase_recovery_records() -> dict[str, dict[str, Any]]:
+    """Resolve exact v4 train phases eligible for bounded v5 reuse."""
+    frozen = campaign_contract.FROZEN_V4_QUALIFICATION_EVIDENCE
+    completion = _sealed_predecessor_json(
+        frozen["completion_path"],
+        whole_file_sha256=frozen["completion_whole_file_sha256"],
+        internal_key="evidence_sha256",
+        internal_sha256=frozen["evidence_sha256"],
+    )
+    stage = _sealed_predecessor_json(
+        frozen["ptm_stage_manifest_path"],
+        whole_file_sha256=frozen[
+            "ptm_stage_manifest_whole_file_sha256"
+        ],
+        internal_key="stage_manifest_sha256",
+        internal_sha256=frozen["ptm_stage_manifest_sha256"],
+    )
+    audit = _sealed_predecessor_json(
+        frozen["ptm_load_audit_path"],
+        whole_file_sha256=frozen["ptm_load_audit_whole_file_sha256"],
+        internal_key="audit_sha256",
+        internal_sha256=frozen["ptm_load_audit_sha256"],
+    )
+    if (
+        completion.get("campaign_id") != frozen["campaign_id"]
+        or completion.get("terminal") is not True
+        or completion.get("successful_workflows") != 0
+        or completion.get("failed_workflows") != 13
+        or stage.get("campaign_id") != frozen["campaign_id"]
+        or audit.get("schema_version") != 2
+        or audit.get("qualification_campaign_id") != frozen["campaign_id"]
+        or audit.get("positive_load_workflows") != 4
+        or audit.get("ptm_load_failure_workflows") != 9
+        or audit.get("all_missing_all_unexpected_backbone_prefix_workflows")
+        != 9
+    ):
+        raise CampaignExecutionError(
+            "sealed v4 phase-recovery evidence changed"
+        )
+    expected_ids = {record["id"] for record in _records()}
+
+    def indexed(rows: Any, label: str) -> dict[str, Mapping[str, Any]]:
+        if not isinstance(rows, list):
+            raise CampaignExecutionError(f"v4 {label} rows are unavailable")
+        result = {
+            item.get("checkpoint_id"): item
+            for item in rows
+            if isinstance(item, Mapping)
+        }
+        if len(rows) != 13 or set(result) != expected_ids:
+            raise CampaignExecutionError(f"v4 {label} rows are ambiguous")
+        return result
+
+    completions = indexed(completion.get("workflows"), "completion")
+    stages = indexed(stage.get("ptms"), "stage")
+    audits = indexed(audit.get("workflows"), "load-audit")
+    reusable = set(
+        campaign_contract.FROZEN_V4_REUSABLE_TRAIN_CHECKPOINT_IDS
+    )
+    fresh = set(campaign_contract.FROZEN_V5_FRESH_TRAIN_CHECKPOINT_IDS)
+    if reusable & fresh or reusable | fresh != expected_ids:
+        raise CampaignExecutionError("v5 phase-recovery partition changed")
+
+    records = {}
+    for checkpoint_id in sorted(expected_ids):
+        workflow = completions[checkpoint_id]
+        staged = stages[checkpoint_id]
+        audited = audits[checkpoint_id]
+        workflow_payload = copy.deepcopy(dict(workflow))
+        workflow_sha256 = workflow_payload.pop("workflow_sha256", None)
+        if (
+            workflow_sha256 != canonical_sha256(workflow_payload)
+            or workflow.get("source_checkpoint") != staged.get("checkpoint")
+            or audited.get("source_checkpoint") != staged.get("checkpoint")
+            or audited.get("workflow_sha256") != workflow_sha256
+        ):
+            raise CampaignExecutionError(
+                f"v4 workflow/stage/audit identity changed: {checkpoint_id}"
+            )
+        audit_row_sha256 = canonical_sha256(audited)
+        if checkpoint_id in fresh:
+            if (
+                audited.get("ptm_load_success") is not False
+                or audited.get("load_evidence", {}).get("classification")
+                != "all_missing_all_unexpected_backbone_prefix"
+            ):
+                raise CampaignExecutionError(
+                    f"v5 fresh-train reason changed: {checkpoint_id}"
+                )
+            records[checkpoint_id] = {
+                "mode": "run_fresh_full_train",
+                "new_train_job_required": True,
+                "new_standalone_evaluation_job_required": True,
+                "v4_workflow_sha256": workflow_sha256,
+                "v4_load_audit_row_sha256": audit_row_sha256,
+                "v4_load_classification": (
+                    "all_missing_all_unexpected_backbone_prefix"
+                ),
+            }
+            continue
+
+        train = workflow.get("jobs", {}).get("train")
+        status_evidence = (
+            train.get("status_evidence") if isinstance(train, Mapping) else None
+        )
+        terminal_checkpoint = (
+            train.get("terminal_checkpoint")
+            if isinstance(train, Mapping)
+            else None
+        )
+        evaluate_job = workflow.get("jobs", {}).get("evaluate")
+        load = audited.get("load_evidence", {})
+        positive = load.get("unique_positive_observations")
+        if (
+            workflow.get("status") != "failure"
+            or workflow.get("failure_phase") != "standalone_evaluation"
+            or not isinstance(train, Mapping)
+            or train.get("status") != "Complete"
+            or train.get("spec_sha256")
+            != staged.get("specs", {}).get("train", {}).get(
+                "document_sha256"
+            )
+            or train.get("staged_spec_sha256")
+            != staged.get("specs", {}).get("train", {}).get(
+                "raw_yaml_sha256"
+            )
+            or train.get("nodes") != 1
+            or train.get("gpus") != 8
+            or train.get("runtime_overlay_required") is not True
+            or not isinstance(status_evidence, Mapping)
+            or status_evidence.get("validation_record_count")
+            != campaign_contract.FROZEN_QUALIFICATION_TRAINING_EPOCHS
+            or not isinstance(status_evidence.get("validation_metrics"), list)
+            or len(status_evidence["validation_metrics"])
+            != campaign_contract.FROZEN_QUALIFICATION_TRAINING_EPOCHS
+            or status_evidence.get("terminal_success") is not True
+            or status_evidence.get("terminal_success_message")
+            != "Train finished successfully."
+            or status_evidence.get("val_miou")
+            != status_evidence["validation_metrics"][-1].get("val_miou")
+            or not isinstance(terminal_checkpoint, Mapping)
+            or terminal_checkpoint.get("training_epochs")
+            != campaign_contract.FROZEN_QUALIFICATION_TRAINING_EPOCHS
+            or terminal_checkpoint.get("terminal_epoch_index") != 49
+            or terminal_checkpoint.get("naming_contract")
+            != "model_epoch_049_step_numeric"
+            or terminal_checkpoint.get("ambiguity_policy") != "fail_closed"
+            or not str(terminal_checkpoint.get("path", "")).startswith(
+                "/lustre/"
+            )
+            or not isinstance(terminal_checkpoint.get("size_bytes"), int)
+            or terminal_checkpoint["size_bytes"] < 1
+            or _SHA256_RE.fullmatch(
+                str(terminal_checkpoint.get("sha256", ""))
+            )
+            is None
+            or audited.get("ptm_load_success") is not True
+            or load.get("classification") != "positive_compatible_tensor_load"
+            or load.get("expected_component") != "model"
+            or not isinstance(positive, list)
+            or len(positive) != 1
+            or positive[0].get("checkpoint")
+            != staged.get("checkpoint", {}).get("path")
+            or positive[0].get("loaded_tensor_count", 0) < 1
+            or _SHA256_RE.fullmatch(
+                str(positive[0].get("loaded_keyset_sha256", ""))
+            )
+            is None
+            or not (
+                evaluate_job is None
+                or (
+                    isinstance(evaluate_job, Mapping)
+                    and evaluate_job.get("checkpoint")
+                    == terminal_checkpoint
+                )
+            )
+        ):
+            raise CampaignExecutionError(
+                f"v4 train phase is not reusable: {checkpoint_id}"
+            )
+        receipt = {
+            "schema_version": 2,
+            "evidence_kind": "sealed_v4_legacy_positive_load_audit",
+            "checkpoint": staged["checkpoint"]["path"],
+            "component": "model",
+            "loaded_tensor_count": positive[0]["loaded_tensor_count"],
+            "loaded_keyset_sha256": positive[0]["loaded_keyset_sha256"],
+            "status_record_occurrences": load[
+                "positive_observation_occurrences"
+            ],
+            "v4_load_audit_path": frozen["ptm_load_audit_path"],
+            "v4_load_audit_whole_file_sha256": frozen[
+                "ptm_load_audit_whole_file_sha256"
+            ],
+            "v4_load_audit_sha256": frozen["ptm_load_audit_sha256"],
+            "v4_load_audit_row_sha256": audit_row_sha256,
+            "v4_workflow_sha256": workflow_sha256,
+            "v4_train_log_sha256": audited["train_log"]["sha256"],
+        }
+        receipt["report_sha256"] = canonical_sha256(receipt)
+        records[checkpoint_id] = {
+            "mode": "reuse_sealed_v4_terminal_train",
+            "new_train_job_required": False,
+            "new_standalone_evaluation_job_required": True,
+            "predecessor_qualification_revision": workflow[
+                "qualification_revision"
+            ],
+            "predecessor_recipe_fidelity": copy.deepcopy(
+                workflow["recipe_fidelity"]
+            ),
+            "predecessor_runtime_overlay": copy.deepcopy(
+                workflow["runtime_overlay"]
+            ),
+            "v4_workflow_sha256": workflow_sha256,
+            "v4_load_audit_row_sha256": audit_row_sha256,
+            "source_checkpoint": copy.deepcopy(staged["checkpoint"]),
+            "train_job": {
+                "tao_job_id": train["tao_job_id"],
+                "status": "Complete",
+                "command_sha256": train["command_sha256"],
+                "spec_sha256": train["spec_sha256"],
+                "result_root": train["result_root"],
+            },
+            "terminal_checkpoint": copy.deepcopy(dict(terminal_checkpoint)),
+            "validation_status_evidence": copy.deepcopy(
+                dict(status_evidence)
+            ),
+            "pretrained_load": receipt,
+        }
+    expected_plan_hashes = (
+        campaign_contract.FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY[
+            "execution_plan_sha256_by_checkpoint_id"
+        ]
+    )
+    if (
+        set(expected_plan_hashes) != expected_ids
+        or any(
+            canonical_sha256(records[checkpoint_id])
+            != expected_plan_hashes[checkpoint_id]
+            for checkpoint_id in expected_ids
+        )
+    ):
+        raise CampaignExecutionError(
+            "sealed v5 per-arm phase-recovery plan changed"
+        )
+    return records
+
+
 def stage_runtime_inputs(
     *,
     contract: Mapping[str, Any],
@@ -542,6 +834,7 @@ def stage_runtime_inputs(
         "train": skill_dir / "references/spec_template_train.yaml",
         "evaluate": skill_dir / "references/spec_template_evaluate.yaml",
     }
+    recovery_records = _v4_phase_recovery_records()
     rows = []
     for record in _records():
         reference = client.resolve_member(record["source"])
@@ -571,16 +864,33 @@ def stage_runtime_inputs(
             / _safe_component(record["id"])
             / record["source"]["member"]
         )
-        remote_checkpoint = _publish_file(
-            checkpoint.path,
-            str(checkpoint_destination),
-            expected_size=checkpoint.size_bytes,
-            expected_sha256=checkpoint.sha256,
-        )
+        recovery = recovery_records[record["id"]]
+        if recovery["mode"] == "reuse_sealed_v4_terminal_train":
+            remote_checkpoint = copy.deepcopy(recovery["source_checkpoint"])
+            observed_reused = _remote_identity(remote_checkpoint["path"])
+            if (
+                observed_reused is None
+                or observed_reused["size_bytes"]
+                != remote_checkpoint["size_bytes"]
+                or observed_reused["sha256"] != remote_checkpoint["sha256"]
+                or int(observed_reused["mode"], 8) & 0o222
+            ):
+                raise CampaignExecutionError(
+                    f"reused v4 source checkpoint changed: {record['id']}"
+                )
+            remote_checkpoint = {**remote_checkpoint, **observed_reused}
+            remote_checkpoint["cache_hit"] = checkpoint.cache_hit
+        else:
+            remote_checkpoint = _publish_file(
+                checkpoint.path,
+                str(checkpoint_destination),
+                expected_size=checkpoint.size_bytes,
+                expected_sha256=checkpoint.sha256,
+            )
         specifications = qualification_specs(
             contract,
             record,
-            str(checkpoint_destination),
+            remote_checkpoint["path"],
         )
         spec_rows = {
             action: _spec_artifact(
@@ -628,6 +938,7 @@ def stage_runtime_inputs(
                 },
                 "checkpoint": remote_checkpoint,
                 "specs": spec_rows,
+                "execution_plan": copy.deepcopy(recovery),
             }
         )
 
@@ -672,6 +983,9 @@ def stage_runtime_inputs(
             ),
             "infrastructure_retry_policy": copy.deepcopy(
                 campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
+            ),
+            "phase_recovery_policy": copy.deepcopy(
+                campaign_contract.FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY
             ),
         },
         "recipe_fidelity": copy.deepcopy(
@@ -758,6 +1072,9 @@ def validate_stage_manifest(
             "infrastructure_retry_policy": (
                 campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
             ),
+            "phase_recovery_policy": (
+                campaign_contract.FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY
+            ),
         }
         or value.get("recipe_fidelity")
         != campaign_contract.FROZEN_QUALIFICATION_FIDELITY
@@ -787,6 +1104,12 @@ def validate_stage_manifest(
         raise CampaignExecutionError("PTM stage campaign contract changed")
 
     records = {record["id"]: record for record in _records()}
+    recovery_records = _v4_phase_recovery_records()
+    expected_plan_hashes = (
+        campaign_contract.FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY[
+            "execution_plan_sha256_by_checkpoint_id"
+        ]
+    )
     for row in rows:
         checkpoint_id = row["checkpoint_id"]
         record = records[checkpoint_id]
@@ -840,6 +1163,9 @@ def validate_stage_manifest(
             )
             is None
             or int(str(checkpoint.get("mode", "0")), 8) & 0o222
+            or row.get("execution_plan") != recovery_records[checkpoint_id]
+            or canonical_sha256(row.get("execution_plan"))
+            != expected_plan_hashes[checkpoint_id]
         ):
             raise CampaignExecutionError(
                 f"staged checkpoint identity differs: {checkpoint_id}"
@@ -964,6 +1290,21 @@ def validate_stage_manifest(
                 f"full-run spec contract differs: {checkpoint_id}"
             )
         checkpoint_path = checkpoint["path"]
+        if (
+            row["execution_plan"]["mode"]
+            == "reuse_sealed_v4_terminal_train"
+            and (
+                checkpoint_path
+                != row["execution_plan"]["source_checkpoint"]["path"]
+                or checkpoint["size_bytes"]
+                != row["execution_plan"]["source_checkpoint"]["size_bytes"]
+                or checkpoint["sha256"]
+                != row["execution_plan"]["source_checkpoint"]["sha256"]
+            )
+        ):
+            raise CampaignExecutionError(
+                f"reused source checkpoint differs: {checkpoint_id}"
+            )
         expected_train_ptm = (
             checkpoint_path
             if record["checkpoint_target"]
@@ -1011,13 +1352,23 @@ def verify_stage_remote(
             "train_spec": row["specs"]["train"]["lustre"],
             "evaluate_spec": row["specs"]["evaluate"]["lustre"],
         }
+        if (
+            row["execution_plan"]["mode"]
+            == "reuse_sealed_v4_terminal_train"
+        ):
+            artifacts["reused_terminal_checkpoint"] = row[
+                "execution_plan"
+            ]["terminal_checkpoint"]
         for label, expected in artifacts.items():
             observed = _remote_identity(expected["path"])
             if (
                 observed is None
                 or observed["size_bytes"] != expected["size_bytes"]
                 or observed["sha256"] != expected["sha256"]
-                or int(observed["mode"], 8) & 0o222
+                or (
+                    label != "reused_terminal_checkpoint"
+                    and int(observed["mode"], 8) & 0o222
+                )
             ):
                 raise CampaignExecutionError(
                     f"remote {label} changed for {row['checkpoint_id']}"
@@ -1035,7 +1386,15 @@ def verify_stage_remote(
         "stage_manifest_sha256": stage["stage_manifest_sha256"],
         "checked_artifacts": checked,
         "checked_artifact_count": len(checked),
-        "all_read_only": True,
+        "all_staged_artifacts_read_only": True,
+        "reused_terminal_checkpoint_count": sum(
+            item["artifact"] == "reused_terminal_checkpoint"
+            for item in checked
+        ),
+        "reused_terminal_checkpoints_hash_verified": True,
+        "reused_terminal_checkpoints_rehashed_in_worker_before_evaluation": (
+            True
+        ),
     }
 
 
@@ -1129,7 +1488,7 @@ def _runtime_overlay_install_command(
     *,
     action_name: str,
 ) -> str:
-    """Return the fail-closed v4 overlay pre-entrypoint."""
+    """Return the fail-closed v5 overlay pre-entrypoint."""
     overlay = contract["qualification_policy"].get("runtime_overlay")
     if (
         overlay
@@ -1802,6 +2161,81 @@ def _finalize_workflow(record: Mapping[str, Any]) -> dict[str, Any]:
     return value
 
 
+def _reused_train_phase_evidence(
+    row: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Re-verify and materialize one exact sealed v4 train phase."""
+    plan = row.get("execution_plan")
+    policy = campaign_contract.FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY
+    checkpoint_id = row["checkpoint_id"]
+    if (
+        not isinstance(plan, Mapping)
+        or plan.get("mode") != "reuse_sealed_v4_terminal_train"
+        or canonical_sha256(plan)
+        != policy["execution_plan_sha256_by_checkpoint_id"][checkpoint_id]
+    ):
+        raise CampaignExecutionError(
+            f"sealed v4 train reuse plan changed: {checkpoint_id}"
+        )
+    for label, expected, require_read_only in (
+        ("source checkpoint", row["checkpoint"], True),
+        ("terminal checkpoint", plan["terminal_checkpoint"], False),
+        (
+            "training status evidence",
+            plan["validation_status_evidence"],
+            False,
+        ),
+    ):
+        observed = _remote_identity(expected["path"])
+        if (
+            observed is None
+            or observed["size_bytes"] != expected["size_bytes"]
+            or observed["sha256"] != expected["sha256"]
+            or (require_read_only and int(observed["mode"], 8) & 0o222)
+        ):
+            raise CampaignExecutionError(
+                f"reused v4 {label} changed: {checkpoint_id}"
+            )
+    train_evidence = copy.deepcopy(
+        dict(plan["validation_status_evidence"])
+    )
+    train_evidence["pretrained_load"] = copy.deepcopy(
+        plan["pretrained_load"]
+    )
+    checkpoint = copy.deepcopy(dict(plan["terminal_checkpoint"]))
+    predecessor_job = copy.deepcopy(dict(plan["train_job"]))
+    job = {
+        "execution_mode": "reuse_sealed_v4_terminal_train",
+        "new_job_submitted": False,
+        "successful_train_reexecution": False,
+        "runtime_overlay_required": True,
+        "runtime_overlay": copy.deepcopy(
+            plan["predecessor_runtime_overlay"]
+        ),
+        "predecessor_campaign_id": policy["predecessor_campaign_id"],
+        "predecessor_completion_whole_file_sha256": policy[
+            "predecessor_completion_whole_file_sha256"
+        ],
+        "predecessor_load_audit_whole_file_sha256": policy[
+            "predecessor_load_audit_whole_file_sha256"
+        ],
+        "v4_workflow_sha256": plan["v4_workflow_sha256"],
+        "v4_load_audit_row_sha256": plan[
+            "v4_load_audit_row_sha256"
+        ],
+        "tao_job_id": predecessor_job["tao_job_id"],
+        "tao_job_id_origin": "sealed_predecessor_v4",
+        "status": "Complete",
+        "result_root": predecessor_job["result_root"],
+        "command_sha256": predecessor_job["command_sha256"],
+        "spec_sha256": predecessor_job["spec_sha256"],
+        "predecessor_train_job": predecessor_job,
+        "status_evidence": copy.deepcopy(train_evidence),
+        "terminal_checkpoint": copy.deepcopy(checkpoint),
+    }
+    return train_evidence, checkpoint, job
+
+
 def _run_workflow(
     contract_path: str,
     stage_path: str,
@@ -1838,6 +2272,10 @@ def _run_workflow(
         "infrastructure_retry_policy": copy.deepcopy(
             campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
         ),
+        "phase_recovery_policy": copy.deepcopy(
+            campaign_contract.FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY
+        ),
+        "execution_plan": copy.deepcopy(row["execution_plan"]),
         "jobs": {},
         "agent_intervention_flags": {
             name: False for name in campaign_contract.AGENT_FLAGS
@@ -1862,67 +2300,92 @@ def _run_workflow(
             state_file=workflow_root / "slurm_state.json",
         )
 
-        phase = "train"
-        train_spec = copy.deepcopy(row["specs"]["train"]["document"])
-        if (
-            canonical_sha256(train_spec)
-            != row["specs"]["train"]["document_sha256"]
-        ):
-            raise CampaignExecutionError("staged train spec changed")
-        train_command, train_command_sha = _entrypoint(
-            contract,
-            "train",
-            train_spec,
-        )
-        train_job, train_status = _run_qualification_job(
-            sdk,
-            contract,
-            train_command,
-            evidence=evidence,
-            evidence_path=evidence_path,
-            events=events,
-            checkpoint_id=checkpoint_id,
-            phase=phase,
-            job_key="train",
-            job_metadata={
-                "spec_sha256": canonical_sha256(train_spec),
-                "staged_spec_sha256": row["specs"]["train"][
-                    "raw_yaml_sha256"
-                ],
-                "command_sha256": train_command_sha,
-                "runtime_overlay_required": True,
-                "nodes": 1,
-                "gpus": 8,
-            },
-        )
-        if train_status != "Complete":
-            evidence["jobs"]["train"]["failure_analysis"] = (
-                sdk.get_failure_analysis(train_job.id)
+        execution_mode = row["execution_plan"]["mode"]
+        if execution_mode == "reuse_sealed_v4_terminal_train":
+            phase = "sealed_v4_train_reuse_validation"
+            train_evidence, checkpoint, reused_job = (
+                _reused_train_phase_evidence(row)
             )
+            evidence["jobs"]["train"] = reused_job
+            append_jsonl(
+                events,
+                {
+                    "event": "sealed_v4_terminal_train_reused",
+                    "checkpoint_id": checkpoint_id,
+                    "predecessor_tao_job_id": reused_job["tao_job_id"],
+                    "terminal_checkpoint": copy.deepcopy(checkpoint),
+                    "observed_at_utc": utc_timestamp(),
+                },
+            )
+        elif execution_mode == "run_fresh_full_train":
+            phase = "train"
+            train_spec = copy.deepcopy(row["specs"]["train"]["document"])
+            if (
+                canonical_sha256(train_spec)
+                != row["specs"]["train"]["document_sha256"]
+            ):
+                raise CampaignExecutionError("staged train spec changed")
+            train_command, train_command_sha = _entrypoint(
+                contract,
+                "train",
+                train_spec,
+            )
+            train_job, train_status = _run_qualification_job(
+                sdk,
+                contract,
+                train_command,
+                evidence=evidence,
+                evidence_path=evidence_path,
+                events=events,
+                checkpoint_id=checkpoint_id,
+                phase=phase,
+                job_key="train",
+                job_metadata={
+                    "execution_mode": execution_mode,
+                    "new_job_submitted": True,
+                    "spec_sha256": canonical_sha256(train_spec),
+                    "staged_spec_sha256": row["specs"]["train"][
+                        "raw_yaml_sha256"
+                    ],
+                    "command_sha256": train_command_sha,
+                    "runtime_overlay_required": True,
+                    "nodes": 1,
+                    "gpus": 8,
+                },
+            )
+            if train_status != "Complete":
+                evidence["jobs"]["train"]["failure_analysis"] = (
+                    sdk.get_failure_analysis(train_job.id)
+                )
+                raise CampaignExecutionError(
+                    f"training job ended with {train_status}"
+                )
+            expected_load_component = (
+                "model"
+                if row["checkpoint_target"]
+                == "train.pretrained_model_path"
+                else "backbone"
+            )
+            train_evidence = _training_status_evidence(
+                sdk,
+                train_job.id,
+                expected_checkpoint_path=row["checkpoint"]["path"],
+                expected_component=expected_load_component,
+            )
+            checkpoint = _qualification_terminal_checkpoint(
+                sdk,
+                train_job.id,
+            )
+            evidence["jobs"]["train"].update(
+                {
+                    "status_evidence": train_evidence,
+                    "terminal_checkpoint": checkpoint,
+                }
+            )
+        else:
             raise CampaignExecutionError(
-                f"training job ended with {train_status}"
+                f"unsupported phase-recovery mode: {execution_mode}"
             )
-        expected_load_component = (
-            "model"
-            if row["checkpoint_target"] == "train.pretrained_model_path"
-            else "backbone"
-        )
-        train_evidence = _training_status_evidence(
-            sdk,
-            train_job.id,
-            expected_checkpoint_path=row["checkpoint"]["path"],
-            expected_component=expected_load_component,
-        )
-        checkpoint = _qualification_terminal_checkpoint(
-            sdk,
-            train_job.id,
-        )
-        evidence["jobs"]["train"].update(
-            {
-                "status_evidence": train_evidence,
-                "terminal_checkpoint": checkpoint,
-            }
-        )
         atomic_json(evidence_path, evidence)
 
         phase = "standalone_evaluation"
@@ -1962,6 +2425,8 @@ def _run_workflow(
                 "command_sha256": evaluation_command_sha,
                 "runtime_overlay_required": True,
                 "checkpoint": checkpoint,
+                "execution_mode": "new_standalone_evaluation",
+                "new_job_submitted": True,
                 "nodes": 1,
                 "gpus": 8,
             },
@@ -1989,16 +2454,31 @@ def _run_workflow(
                 "terminal_at_utc": utc_timestamp(),
                 "train": {
                     "status": "Complete",
+                    "execution_mode": execution_mode,
+                    "source_qualification_revision": (
+                        row["execution_plan"].get(
+                            "predecessor_qualification_revision"
+                        )
+                        if execution_mode
+                        == "reuse_sealed_v4_terminal_train"
+                        else campaign_contract.QUALIFICATION_REVISION
+                    ),
                     "full_dataset": True,
                     "training_epochs": (
                         campaign_contract.FROZEN_QUALIFICATION_TRAINING_EPOCHS
                     ),
                     "validation_interval": 1,
                     "recipe_fidelity": copy.deepcopy(
-                        campaign_contract.FROZEN_QUALIFICATION_FIDELITY
+                        row["execution_plan"].get(
+                            "predecessor_recipe_fidelity",
+                            campaign_contract.FROZEN_QUALIFICATION_FIDELITY,
+                        )
                     ),
                     "runtime_overlay": copy.deepcopy(
-                        campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+                        row["execution_plan"].get(
+                            "predecessor_runtime_overlay",
+                            campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY,
+                        )
                     ),
                     "validation_record_count": train_evidence[
                         "validation_record_count"
@@ -2050,6 +2530,10 @@ def _run_workflow(
             "infrastructure_retry_policy": copy.deepcopy(
                 campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
             ),
+            "phase_recovery_policy": copy.deepcopy(
+                campaign_contract.FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY
+            ),
+            "execution_plan": copy.deepcopy(row["execution_plan"]),
             "jobs": copy.deepcopy(evidence.get("jobs", {})),
             "terminal_at_utc": utc_timestamp(),
             "agent_intervention_flags": {
@@ -2063,6 +2547,7 @@ def _run_workflow(
 def _missing_workflow(
     checkpoint_id: str,
     stage_sha256: str,
+    execution_plan: Mapping[str, Any],
 ) -> dict[str, Any]:
     return _finalize_workflow(
         {
@@ -2090,6 +2575,10 @@ def _missing_workflow(
             "infrastructure_retry_policy": copy.deepcopy(
                 campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
             ),
+            "phase_recovery_policy": copy.deepcopy(
+                campaign_contract.FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY
+            ),
+            "execution_plan": copy.deepcopy(dict(execution_plan)),
             "terminal_at_utc": utc_timestamp(),
             "agent_intervention_flags": {
                 name: False for name in campaign_contract.AGENT_FLAGS
@@ -2121,6 +2610,7 @@ def build_completion(
             else _missing_workflow(
                 checkpoint_id,
                 stage["stage_manifest_sha256"],
+                row["execution_plan"],
             )
         )
         workflow["worker_process_exit_code"] = exit_codes.get(
@@ -2152,6 +2642,9 @@ def build_completion(
         ),
         "infrastructure_retry_policy": copy.deepcopy(
             campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
+        ),
+        "phase_recovery_policy": copy.deepcopy(
+            campaign_contract.FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY
         ),
         "prior_revision_evidence": copy.deepcopy(
             campaign_contract.FROZEN_PRIOR_QUALIFICATION_EVIDENCE
@@ -2259,13 +2752,20 @@ def qualification_plan(
         "checkpoint_ids": [record["id"] for record in _records()],
         "workflow_count": 13,
         "workflow": (
-            "full_voc2012_50_epoch_train_then_standalone_full_validation"
+            "selective_v4_terminal_train_reuse_or_fresh_full_voc2012_"
+            "50_epoch_train_then_new_standalone_full_validation"
         ),
+        "new_full_train_job_count": 9,
+        "reused_terminal_train_phase_count": 4,
+        "new_standalone_evaluation_job_count": 13,
         "recipe_fidelity": copy.deepcopy(
             campaign_contract.FROZEN_QUALIFICATION_FIDELITY
         ),
         "runtime_overlay": copy.deepcopy(
             campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+        ),
+        "phase_recovery_policy": copy.deepcopy(
+            campaign_contract.FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY
         ),
         "prior_revision_evidence": copy.deepcopy(
             campaign_contract.FROZEN_PRIOR_QUALIFICATION_EVIDENCE
@@ -2289,13 +2789,59 @@ def qualification_plan(
     }
 
 
+def _claim_qualification_launch(
+    runtime_root: Path,
+    *,
+    contract_sha256: str,
+    stage_manifest_sha256: str,
+) -> dict[str, Any]:
+    """Atomically prevent controller re-entry and train-phase repetition."""
+    workflows = runtime_root / "workflows"
+    if workflows.exists() and any(workflows.iterdir()):
+        raise CampaignExecutionError(
+            "qualification workflow state already exists; launch re-entry "
+            "is forbidden"
+        )
+    marker = runtime_root / "qualification_launch_started.json"
+    payload = {
+        "schema_version": 1,
+        "qualification_revision": campaign_contract.QUALIFICATION_REVISION,
+        "campaign_id": QUALIFICATION_CAMPAIGN_ID,
+        "contract_sha256": contract_sha256,
+        "stage_manifest_sha256": stage_manifest_sha256,
+        "successful_train_reexecution_allowed": False,
+        "claimed_at_utc": utc_timestamp(),
+    }
+    payload["claim_sha256"] = canonical_sha256(payload)
+    data = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+    try:
+        descriptor = os.open(
+            marker,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o400,
+        )
+    except FileExistsError as exc:
+        raise CampaignExecutionError(
+            "qualification launch was already claimed; re-entry is forbidden"
+        ) from exc
+    try:
+        if os.write(descriptor, data) != len(data):
+            raise CampaignExecutionError(
+                "qualification launch claim write was incomplete"
+            )
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return {"path": str(marker), **payload}
+
+
 def launch(
     *,
     contract_path: Path,
     stage_path: Path,
     runtime_root: Path,
 ) -> dict[str, Any]:
-    """Submit all 13 direct qualification workflows and seal the handoff."""
+    """Run the sealed 4-reuse/9-train/13-evaluate qualification plan."""
     contract = run_campaign.load_contract(contract_path)
     expected_stage = Path(
         contract["qualification_policy"]["ptm_stage_manifest_path"]
@@ -2316,6 +2862,11 @@ def launch(
     if sqsh["sha256"] != contract["sqsh"]["sha256"]:
         raise CampaignExecutionError("pinned SQSH identity changed")
     runtime_root.mkdir(parents=True, exist_ok=True)
+    launch_claim = _claim_qualification_launch(
+        runtime_root,
+        contract_sha256=contract["contract_sha256"],
+        stage_manifest_sha256=stage["stage_manifest_sha256"],
+    )
     atomic_json(
         runtime_root / "qualification_launch_preflight.json",
         {
@@ -2329,6 +2880,10 @@ def launch(
             "dataset": dataset,
             "remote_stage": remote_stage,
             "sqsh": sqsh,
+            "launch_claim": launch_claim,
+            "phase_recovery_policy": copy.deepcopy(
+                campaign_contract.FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY
+            ),
             "sdk_constructed": False,
             "scheduler_jobs_submitted": 0,
             "cpu_or_smoke_model_jobs_launched": False,
@@ -2397,6 +2952,15 @@ def launch(
                         ),
                         "runtime_overlay": copy.deepcopy(
                             campaign_contract.FROZEN_QUALIFICATION_RUNTIME_OVERLAY
+                        ),
+                        "infrastructure_retry_policy": copy.deepcopy(
+                            campaign_contract.FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
+                        ),
+                        "phase_recovery_policy": copy.deepcopy(
+                            campaign_contract.FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY
+                        ),
+                        "execution_plan": copy.deepcopy(
+                            row["execution_plan"]
                         ),
                         "terminal_at_utc": utc_timestamp(),
                         "agent_intervention_flags": {

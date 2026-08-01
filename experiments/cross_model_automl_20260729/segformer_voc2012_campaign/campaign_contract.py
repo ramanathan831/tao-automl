@@ -64,7 +64,7 @@ SEARCH_SPACE = {
 
 FROZEN_CANDIDATE_BUDGET = 30
 # The already-preregistered AutoML search remains a ten-epoch experiment.
-# Qualification v4 is a distinct, higher-fidelity boundary and must not
+# Qualification v5 is a distinct, evidence-bound recovery boundary and must not
 # silently mutate the search budget.
 FROZEN_TRAINING_EPOCHS = 10
 FROZEN_QUALIFICATION_TRAINING_EPOCHS = 50
@@ -99,9 +99,9 @@ FROZEN_SQSH = {
         "7.1.0-rc-245-multiarch"
     ),
 }
-QUALIFICATION_REVISION = 4
+QUALIFICATION_REVISION = 5
 QUALIFICATION_CAMPAIGN_ID = (
-    "segformer-voc2012-direct-full-ptm-qualification-v4"
+    "segformer-voc2012-direct-full-ptm-qualification-v5"
 )
 FROZEN_QUALIFICATION_FIDELITY = {
     "source_recipe": (
@@ -125,7 +125,8 @@ FROZEN_QUALIFICATION_RUNTIME_OVERLAY = {
     "artifact_type": "tao_pytorch_source_overlay",
     "scope": "segformer_ptm_loading_and_global_ddp_metrics",
     "archive_path": (
-        "/lustre/fsw/portfolios/edgeai/users/rarunachalam/"
+        "/lustre/fsw/portfolios/edgeai/projects/"
+        "edgeai_tao-ptm_image-foundation-model-clip/users/rarunachalam/"
         "tao-pytorch-overlays/segformer-product-fixes/"
         "2681dea4c876b759f8a0446491b3619e6120b531/"
         "tao-pytorch-segformer-product-fixes-2681dea4c876.tar"
@@ -135,7 +136,8 @@ FROZEN_QUALIFICATION_RUNTIME_OVERLAY = {
     ),
     "archive_size_bytes": 61440,
     "installer_path": (
-        "/lustre/fsw/portfolios/edgeai/users/rarunachalam/"
+        "/lustre/fsw/portfolios/edgeai/projects/"
+        "edgeai_tao-ptm_image-foundation-model-clip/users/rarunachalam/"
         "tao-pytorch-overlays/segformer-product-fixes/"
         "2681dea4c876b759f8a0446491b3619e6120b531/"
         "install_segformer_source_overlay.py"
@@ -357,11 +359,172 @@ FROZEN_V3_QUALIFICATION_EVIDENCE = {
     "preserve_immutable": True,
     "reuse_for_v4": False,
 }
+FROZEN_V4_QUALIFICATION_EVIDENCE = {
+    "campaign_id": "segformer-voc2012-direct-full-ptm-qualification-v4",
+    "contract_path": (
+        "/localhome/local-rarunachalam/.tao/artifacts/"
+        "cross_model_automl_20260729/"
+        "segformer_voc2012_three_mode/campaign.v4.json"
+    ),
+    "contract_whole_file_sha256": (
+        "acc23f910130abd3fd0be223077322b8845383a14223ecb7edc55496871945d2"
+    ),
+    "contract_sha256": (
+        "aa0f89f62a35d7e8ffb20ed8f8ae1eb1bee35cbe54dc8df747997e68e7347274"
+    ),
+    "completion_path": (
+        "/localhome/local-rarunachalam/.tao/artifacts/"
+        "cross_model_automl_20260729/"
+        "segformer_voc2012_ptm_qualification_v4/completion.json"
+    ),
+    "completion_whole_file_sha256": (
+        "673c35a2f109be9cbd926d4e76a8042272379bc9c3fe3749935fca1bea77cc25"
+    ),
+    "evidence_sha256": (
+        "0b73c7af76a615412fba007cc5d1926a720803eafe0f0b66976d114215f3369d"
+    ),
+    "ptm_stage_manifest_path": (
+        "/localhome/local-rarunachalam/.tao/artifacts/"
+        "cross_model_automl_20260729/"
+        "segformer_voc2012_ptm_qualification_v4/ptm_stage_manifest.json"
+    ),
+    "ptm_stage_manifest_whole_file_sha256": (
+        "48e7a6ae0820781f3b8ea6956d0b75decaedef69765a41dcd2c97ab00e53bad1"
+    ),
+    "ptm_stage_manifest_sha256": (
+        "75201d653f7d60a115d27b4ccb9ff4bc073a9b8f6ce854261f3a427e77ee15f6"
+    ),
+    "launch_preflight_path": (
+        "/localhome/local-rarunachalam/.tao/artifacts/"
+        "cross_model_automl_20260729/"
+        "segformer_voc2012_ptm_qualification_v4/"
+        "qualification_launch_preflight.json"
+    ),
+    "launch_preflight_whole_file_sha256": (
+        "349eeacf62f0fecbd3e88400707d4975098c818e76ec3f07cec0224cca752a5c"
+    ),
+    "automatic_handoff_path": (
+        "/localhome/local-rarunachalam/.tao/artifacts/"
+        "cross_model_automl_20260729/"
+        "segformer_voc2012_ptm_qualification_v4/automatic_handoff.json"
+    ),
+    "automatic_handoff_whole_file_sha256": (
+        "e9924b26183e63d1af136df8e97c6bfd12f2cd6a1380b2c136b6fcb9151d53c3"
+    ),
+    "ptm_load_audit_path": (
+        "/localhome/local-rarunachalam/.tao/artifacts/"
+        "cross_model_automl_20260729/"
+        "segformer_voc2012_ptm_qualification_v4/ptm_load_audit.v2.json"
+    ),
+    "ptm_load_audit_whole_file_sha256": (
+        "f9d6999279cb5619890308c1abfd030f0bdae33bb99d961fdbc417b81b279c87"
+    ),
+    "ptm_load_audit_sha256": (
+        "cbf79f8bf38c53f3747bd95378d8e6a71905c1c4a1ad246b011574d85e5ba1ed"
+    ),
+    "ptm_load_audit_source_sha256": (
+        "cc4d634efd413a19b7956d95edf6154e726e8135134ca192626f4ab95f49d202"
+    ),
+    "source_commit": "88a53144650ea895a2dcfa896828412a858f659b",
+    "status": "terminal_with_failures",
+    "successful_workflows": 0,
+    "failed_workflows": 13,
+    "positive_load_train_workflows": 4,
+    "backbone_prefix_load_failure_workflows": 9,
+    "preserve_immutable": True,
+    "reuse_for_v5": "exact_positive_load_terminal_train_phase_only",
+}
 FROZEN_PRIOR_QUALIFICATION_EVIDENCE = [
     copy.deepcopy(FROZEN_V1_QUALIFICATION_EVIDENCE),
     copy.deepcopy(FROZEN_V2_QUALIFICATION_EVIDENCE),
     copy.deepcopy(FROZEN_V3_QUALIFICATION_EVIDENCE),
+    copy.deepcopy(FROZEN_V4_QUALIFICATION_EVIDENCE),
 ]
+FROZEN_V4_REUSABLE_TRAIN_CHECKPOINT_IDS = (
+    "segformer.cityscapes.fan_base_hybrid.trainable.v1.0",
+    "segformer.cityscapes.fan_large_hybrid.trainable.v1.0",
+    "segformer.cityscapes.fan_small_hybrid.trainable.v1.0",
+    "segformer.cityscapes.fan_tiny_hybrid.trainable.v1.0",
+)
+FROZEN_V5_FRESH_TRAIN_CHECKPOINT_IDS = (
+    "segformer.imagenet.fan_small_hybrid",
+    "segformer.imagenet.fan_tiny_hybrid",
+    "segformer.imagenet22k.fan_base_hybrid",
+    "segformer.imagenet22k.fan_base_hybrid.imagenet1k",
+    "segformer.imagenet22k.fan_base_hybrid.imagenet1k.384",
+    "segformer.imagenet22k.fan_large_hybrid",
+    "segformer.imagenet22k.fan_large_hybrid.384",
+    "segformer.imagenet22k.fan_large_hybrid.imagenet1k",
+    "segformer.imagenet22k.fan_large_hybrid.imagenet1k.384",
+)
+FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY = {
+    "schema_version": 1,
+    "kind": "segformer_v4_terminal_train_phase_reuse_v1",
+    "predecessor_campaign_id": FROZEN_V4_QUALIFICATION_EVIDENCE[
+        "campaign_id"
+    ],
+    "predecessor_completion_whole_file_sha256": (
+        FROZEN_V4_QUALIFICATION_EVIDENCE["completion_whole_file_sha256"]
+    ),
+    "predecessor_load_audit_whole_file_sha256": (
+        FROZEN_V4_QUALIFICATION_EVIDENCE[
+            "ptm_load_audit_whole_file_sha256"
+        ]
+    ),
+    "reused_train_checkpoint_ids": list(
+        FROZEN_V4_REUSABLE_TRAIN_CHECKPOINT_IDS
+    ),
+    "fresh_train_checkpoint_ids": list(FROZEN_V5_FRESH_TRAIN_CHECKPOINT_IDS),
+    "execution_plan_sha256_by_checkpoint_id": {
+        "segformer.cityscapes.fan_base_hybrid.trainable.v1.0": (
+            "2c6477ad2eda63fc8fc8f5b5bfe1cf95e923bc05f6f603ed68f9efdbbfc53ed3"
+        ),
+        "segformer.cityscapes.fan_large_hybrid.trainable.v1.0": (
+            "aac288876c2d9c618492f63161fce122fb2c923596e1c829b0e061df9754e844"
+        ),
+        "segformer.cityscapes.fan_small_hybrid.trainable.v1.0": (
+            "666d99f614dff7b7e676261bbaab45e7337f363ee65ea2b4dc5b76aa98db24b1"
+        ),
+        "segformer.cityscapes.fan_tiny_hybrid.trainable.v1.0": (
+            "9676f0e82397c5e31a179feb5b09c9f8e019ac42eeb1f9cf7eb1ee6c53be1b3a"
+        ),
+        "segformer.imagenet.fan_small_hybrid": (
+            "37b88ef6caeda9f21aa3446e4dcb9c1331ce58d5eb9d5f254b939040852f35e3"
+        ),
+        "segformer.imagenet.fan_tiny_hybrid": (
+            "9583c8170e70b544494f560dc59d822d92298f5b4bd175f00ff89181f45cb0c5"
+        ),
+        "segformer.imagenet22k.fan_base_hybrid": (
+            "c4bcb4c7874b30ffabe6e33c200f31f23b2f02cce78f06213e2aa8c4d1bd6782"
+        ),
+        "segformer.imagenet22k.fan_base_hybrid.imagenet1k": (
+            "51e6a0941400946ab5308f93313798bc0c22bf33420dce91e2c7601d38486bba"
+        ),
+        "segformer.imagenet22k.fan_base_hybrid.imagenet1k.384": (
+            "29ae19d61c11c6a92d3ea15be15edb4be5d6865a3d87c7eee62e6089d35f6a7b"
+        ),
+        "segformer.imagenet22k.fan_large_hybrid": (
+            "4426ad7c5a3d4e2594808d253dca16f5a2204d70263ef174adc7a94a12c99fd8"
+        ),
+        "segformer.imagenet22k.fan_large_hybrid.384": (
+            "fbaa4dde903801e68901b73ed0aaf8fcc0a2ca3a8e4dc110e7870d835c2ea4ee"
+        ),
+        "segformer.imagenet22k.fan_large_hybrid.imagenet1k": (
+            "c66c75219a7a17f98be2046b4a1c7ee7755096b685f174e85fbef6c3fdfed5ea"
+        ),
+        "segformer.imagenet22k.fan_large_hybrid.imagenet1k.384": (
+            "a4bb98f728a7bec66a5302ab0adbb6b846150c815478a64dddb7a4235f8ed63c"
+        ),
+    },
+    "new_full_train_job_count": 9,
+    "new_standalone_evaluation_job_count": 13,
+    "reuse_requires_exact_positive_load_receipt": True,
+    "reuse_requires_exact_epoch_49_checkpoint_identity": True,
+    "reuse_requires_full_50_epoch_validation_evidence": True,
+    "reuse_failed_or_ambiguous_train_allowed": False,
+    "fallback_checkpoint_allowed": False,
+    "successful_train_reexecution_allowed": False,
+}
 LATENCY_PROTOCOL = {
     "warmup_iterations": 50,
     "timed_iterations": 100,
@@ -694,7 +857,7 @@ def profile_overrides(dataset_root: str) -> dict[str, Any]:
 
 
 def qualification_profile_overrides(dataset_root: str) -> dict[str, Any]:
-    """Return the v4 official multi-class fidelity for every PTM arm."""
+    """Return the v5 official multi-class fidelity for every PTM arm."""
     value = profile_overrides(dataset_root)
     fidelity = FROZEN_QUALIFICATION_FIDELITY
     value["dataset"]["segment"]["augmentation"] = {
@@ -797,7 +960,10 @@ def build_preregistered_contract(
         "qualification_policy": {
             "revision": QUALIFICATION_REVISION,
             "campaign_id": QUALIFICATION_CAMPAIGN_ID,
-            "kind": "direct_full_gpu_train_eval_then_supported_registry",
+            "kind": (
+                "selective_v4_train_phase_reuse_or_fresh_full_gpu_train_"
+                "then_new_standalone_evaluation"
+            ),
             "cpu_model_runs": 0,
             "smoke_model_runs": 0,
             "mini_step_runs": 0,
@@ -815,6 +981,9 @@ def build_preregistered_contract(
             ),
             "infrastructure_retry_policy": copy.deepcopy(
                 FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
+            ),
+            "phase_recovery_policy": copy.deepcopy(
+                FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY
             ),
             "prior_revision_evidence": copy.deepcopy(
                 FROZEN_PRIOR_QUALIFICATION_EVIDENCE
@@ -939,6 +1108,11 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
     if (
         qualification.get("revision") != QUALIFICATION_REVISION
         or qualification.get("campaign_id") != QUALIFICATION_CAMPAIGN_ID
+        or qualification.get("kind")
+        != (
+            "selective_v4_train_phase_reuse_or_fresh_full_gpu_train_"
+            "then_new_standalone_evaluation"
+        )
         or qualification.get("training_epochs")
         != FROZEN_QUALIFICATION_TRAINING_EPOCHS
         or qualification.get("recipe_fidelity")
@@ -947,11 +1121,13 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
         != FROZEN_QUALIFICATION_RUNTIME_OVERLAY
         or qualification.get("infrastructure_retry_policy")
         != FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY
+        or qualification.get("phase_recovery_policy")
+        != FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY
         or qualification.get("prior_revision_evidence")
         != FROZEN_PRIOR_QUALIFICATION_EVIDENCE
     ):
         raise CampaignContractError(
-            "qualification v4 fidelity or provenance changed"
+            "qualification v5 fidelity or provenance changed"
         )
     runtime_local = qualification.get("runtime_local_eligibility")
     if runtime_local is not None:
@@ -1087,6 +1263,7 @@ __all__ = [
     "FROZEN_LATENCY_TOLERANCE_MS",
     "FROZEN_QUALIFICATION_FIDELITY",
     "FROZEN_QUALIFICATION_INFRASTRUCTURE_POLICY",
+    "FROZEN_QUALIFICATION_PHASE_RECOVERY_POLICY",
     "FROZEN_QUALIFICATION_RUNTIME_OVERLAY",
     "FROZEN_RUNTIME_LOCAL_CHECKPOINT_SPEC_FILE",
     "FROZEN_QUALIFICATION_TRAINING_EPOCHS",
@@ -1102,6 +1279,9 @@ __all__ = [
     "FROZEN_V1_QUALIFICATION_EVIDENCE",
     "FROZEN_V2_QUALIFICATION_EVIDENCE",
     "FROZEN_V3_QUALIFICATION_EVIDENCE",
+    "FROZEN_V4_QUALIFICATION_EVIDENCE",
+    "FROZEN_V4_REUSABLE_TRAIN_CHECKPOINT_IDS",
+    "FROZEN_V5_FRESH_TRAIN_CHECKPOINT_IDS",
     "LATENCY_PROTOCOL",
     "MODES",
     "QUALIFICATION_CAMPAIGN_ID",
