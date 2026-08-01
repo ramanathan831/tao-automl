@@ -36,7 +36,7 @@ from tao_automl.ptm_registry import canonical_sha256, load_ptm_registry
 from tao_automl.recommendation_audit import validate_recommendation_audit
 from tao_automl.selection import canonical_spec_fingerprint
 
-from . import campaign_contract, runtime_overlay
+from . import campaign_contract, checkpoint_resume, runtime_overlay
 from .qualification_gate import (
     QualificationDecision,
     QualificationLoadEvidence,
@@ -60,11 +60,11 @@ ENV_PATH = Path("/localhome/local-rarunachalam/.tao/config.env")
 DEFAULT_CONTRACT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "mask2former_coco2017_three_mode_v2/campaign.v2.json"
+    "mask2former_coco2017_three_mode_v3/campaign.v3.json"
 )
 DEFAULT_RUNTIME_ROOT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
-    "cross_model_automl_20260729/mask2former_coco2017_three_mode_v2"
+    "cross_model_automl_20260729/mask2former_coco2017_three_mode_v3"
 )
 TERMINAL_JOB_STATUSES = frozenset({"Complete", "Error", "Canceled"})
 SUCCESS_RECOMMENDATION_STATUSES = frozenset({"success", "done"})
@@ -118,7 +118,7 @@ def configure_slurm_runtime(contract: Mapping[str, Any]) -> None:
         {
             # A verified SQSH path is passed directly; no conversion job exists.
             "SLURM_USE_SQSH": "false",
-            "SLURM_USE_REQUEUE": "true",
+            "SLURM_USE_REQUEUE": str(runtime["use_requeue"]).lower(),
             "SLURM_TIME_HOURS": str(runtime["time_hours"]),
             "SLURM_TIMEOUT_HOURS": str(runtime["timeout_hours"]),
             "SLURM_MAX_GPUS_PER_NODE": "8",
@@ -379,6 +379,10 @@ def verify_local_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
         "runtime_overlay": (
             HERE / "runtime_overlay.py",
             contract["launcher_integrity"]["runtime_overlay_sha256"],
+        ),
+        "checkpoint_resume": (
+            HERE / "checkpoint_resume.py",
+            contract["launcher_integrity"]["checkpoint_resume_sha256"],
         ),
     }
     evidence = {}
@@ -1287,11 +1291,13 @@ def configure_runner_runtime_overlay(
     runner: Any,
     contract: Mapping[str, Any],
 ) -> str:
-    """Bind the sealed overlay to every AutoML training recommendation."""
+    """Bind the sealed overlay and same-job resume to every train command."""
     action = copy.deepcopy(runner.skill_ctx.action_cfg)
-    action["command"] = runtime_overlay.wrap_command(
-        action["command"],
-        contract["runtime"]["tao_pytorch_overlay"],
+    action["command"] = checkpoint_resume.wrap_train_command(
+        runtime_overlay.wrap_command(
+            action["command"],
+            contract["runtime"]["tao_pytorch_overlay"],
+        )
     )
     runner.skill_ctx.action_cfg = action
     return text_sha256(action["command"])
@@ -1321,9 +1327,11 @@ def _run_mode(
         ).read_text(encoding="utf-8")
     )["actions"]["train"]
     expected_training_command_sha256 = text_sha256(
-        runtime_overlay.wrap_command(
-            train_action["command"],
-            contract["runtime"]["tao_pytorch_overlay"],
+        checkpoint_resume.wrap_train_command(
+            runtime_overlay.wrap_command(
+                train_action["command"],
+                contract["runtime"]["tao_pytorch_overlay"],
+            )
         )
     )
     candidates: dict[str, Any] = {}

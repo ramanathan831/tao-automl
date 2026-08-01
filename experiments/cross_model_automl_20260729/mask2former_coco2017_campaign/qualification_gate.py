@@ -324,7 +324,7 @@ def audit_qualification(
         runtime = expected_contract.get("runtime", {})
         launchers = expected_contract.get("launcher_integrity", {})
         if (
-            document.get("contract_revision") != "qualification_runtime_v2"
+            document.get("contract_revision") != "qualification_runtime_v3"
             or document.get("walltime_policy")
             != runtime.get("walltime_policy")
             or document["qualification_campaign_sha256"]
@@ -336,7 +336,7 @@ def audit_qualification(
             or evidence_overlay != runtime.get("tao_pytorch_overlay")
         ):
             raise QualificationGateError(
-                "qualification wall-time policy, launcher, or PTM stage "
+                "qualification requeue/resume policy, launcher, or PTM stage "
                 "differs from the sealed final campaign"
             )
         local_stage = Path(stage_path)

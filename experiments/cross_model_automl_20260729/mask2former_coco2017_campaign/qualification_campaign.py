@@ -40,16 +40,21 @@ from tao_automl.ptm_registry import (
     merge_ptm_spec_precedence,
 )
 
-from . import campaign_contract, run_campaign, runtime_overlay
+from . import (
+    campaign_contract,
+    checkpoint_resume,
+    run_campaign,
+    runtime_overlay,
+)
 
 
 DEFAULT_CONTRACT = run_campaign.DEFAULT_CONTRACT
 DEFAULT_RUNTIME_ROOT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "mask2former_coco2017_ptm_qualification_v2"
+    "mask2former_coco2017_ptm_qualification_v3"
 )
-# Runtime v2 reuses the immutable data-only v1 PTM stage.  It never writes to
+# Runtime v3 reuses the immutable data-only v1 PTM stage. It never writes to
 # the v1 runtime tree or republishes the checkpoint.
 DEFAULT_STAGE_MANIFEST = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
@@ -66,7 +71,7 @@ DEFAULT_LUSTRE_INPUT_ROOT = Path(
     "mask2former_coco2017_ptm_qualification_v1/inputs"
 )
 QUALIFICATION_CAMPAIGN_ID = (
-    "mask2former-coco2017-direct-full-qualification-v2-20260801"
+    "mask2former-coco2017-direct-full-qualification-v3-20260801"
 )
 ENV_PATH = run_campaign.ENV_PATH
 CampaignExecutionError = run_campaign.CampaignExecutionError
@@ -394,7 +399,7 @@ def qualification_plan(contract: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": 1,
         "campaign_id": QUALIFICATION_CAMPAIGN_ID,
-        "contract_revision": "qualification_runtime_v2",
+        "contract_revision": "qualification_runtime_v3",
         "contract_sha256": contract["contract_sha256"],
         "model": "mask2former",
         "task": "instance_segmentation",
@@ -418,6 +423,15 @@ def qualification_plan(contract: Mapping[str, Any]) -> dict[str, Any]:
         "sqsh": copy.deepcopy(campaign_contract.FROZEN_SQSH),
         "walltime_policy": copy.deepcopy(
             contract["runtime"]["walltime_policy"]
+        ),
+        "checkpoint_interval_epochs": (
+            campaign_contract.FROZEN_CHECKPOINT_INTERVAL_EPOCHS
+        ),
+        "checkpoint_resume_policy": (
+            "same_job_exact_epoch_step_max_v1"
+        ),
+        "slurm_self_requeue": (
+            campaign_contract.FROZEN_SLURM_USE_REQUEUE
         ),
         "tao_pytorch_overlay": copy.deepcopy(
             contract["runtime"]["tao_pytorch_overlay"]
@@ -616,12 +630,17 @@ def _entrypoint(
         ).read_text(encoding="utf-8")
     )
     action = metadata["actions"][action_name]
+    action_command = runtime_overlay.wrap_command(
+        action["command"],
+        contract["runtime"]["tao_pytorch_overlay"],
+    )
+    if action_name == "train":
+        action_command = checkpoint_resume.wrap_train_command(
+            action_command
+        )
     entrypoint = build_entrypoint(
         command=_gpu_guard(
-            runtime_overlay.wrap_command(
-                action["command"],
-                contract["runtime"]["tao_pytorch_overlay"],
-            )
+            action_command
         ),
         specs=specification,
         inputs=action["inputs"],
@@ -723,6 +742,9 @@ def _run_one(
         "train_spec_sha256": canonical_sha256(train_spec),
         "walltime_policy": copy.deepcopy(
             contract["runtime"]["walltime_policy"]
+        ),
+        "checkpoint_resume_policy": (
+            "same_job_exact_epoch_step_max_v1"
         ),
         "agent_intervention_flags": {
             name: False for name in campaign_contract.AGENT_FLAGS
@@ -917,7 +939,7 @@ def build_completion(
     value = {
         "schema_version": 1,
         "campaign_id": QUALIFICATION_CAMPAIGN_ID,
-        "contract_revision": "qualification_runtime_v2",
+        "contract_revision": "qualification_runtime_v3",
         "model": "mask2former",
         "task": "instance_segmentation",
         "primary_metric": VALIDATION_MASK_AP_METRIC,

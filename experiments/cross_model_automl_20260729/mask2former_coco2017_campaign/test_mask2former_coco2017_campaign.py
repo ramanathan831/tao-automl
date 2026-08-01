@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 import copy
 import json
+import shlex
+import subprocess
 from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +16,7 @@ from tao_automl.ptm_registry import canonical_sha256, load_ptm_registry
 
 from . import (
     campaign_contract,
+    checkpoint_resume,
     manifest_generator,
     qualification_campaign,
     run_campaign,
@@ -74,7 +77,7 @@ def _runtime(tmp_path: Path) -> dict:
         "ptm_stage_manifest_sha256": "e" * 64,
         "ptm_stage_content_sha256": "f" * 64,
         "tao_pytorch_overlay": runtime_overlay.contract_record(),
-        "partition": "polar3",
+        "partition": campaign_contract.FROZEN_SLURM_PARTITION,
         "account": "edgeai_tao-ptm_image-foundation-model-clip",
         "base_results_dir": (
             "/lustre/fsw/portfolios/edgeai/users/rarunachalam"
@@ -82,6 +85,7 @@ def _runtime(tmp_path: Path) -> dict:
         "container_mounts": "/lustre",
         "time_hours": campaign_contract.FROZEN_SLURM_TIME_HOURS,
         "timeout_hours": campaign_contract.FROZEN_SLURM_TIMEOUT_HOURS,
+        "use_requeue": campaign_contract.FROZEN_SLURM_USE_REQUEUE,
         "walltime_policy": copy.deepcopy(
             campaign_contract.FROZEN_WALLTIME_POLICY
         ),
@@ -121,6 +125,9 @@ def contract(tmp_path: Path) -> dict:
         ),
         "runtime_overlay_sha256": campaign_contract.sha256_file(
             HERE / "runtime_overlay.py"
+        ),
+        "checkpoint_resume_sha256": campaign_contract.sha256_file(
+            HERE / "checkpoint_resume.py"
         ),
     }
     value["contract_sha256"] = canonical_sha256(value)
@@ -227,6 +234,7 @@ def _qualification_document(
     value = {
         "schema_version": 1,
         "campaign_id": "mask2former-direct-full-qualification-test",
+        "contract_revision": "qualification_runtime_v3",
         "model": "mask2former",
         "task": "instance_segmentation",
         "primary_metric": "segm_val_mAP",
@@ -247,6 +255,9 @@ def _qualification_document(
         "registry_sha256": snapshot["registry_sha256"],
         "sqsh_sha256": campaign_contract.FROZEN_SQSH["sha256"],
         "tao_pytorch_overlay": runtime_overlay.contract_record(),
+        "walltime_policy": copy.deepcopy(
+            campaign_contract.FROZEN_WALLTIME_POLICY
+        ),
         "cpu_model_runs": 0,
         "smoke_model_runs": 0,
         "mini_step_runs": 0,
@@ -383,6 +394,9 @@ def test_profile_is_instance_coco_eight_gpu_not_smoke():
     assert train["gpu_ids"] == list(range(8))
     assert train["num_nodes"] == 1
     assert train["num_epochs"] == 3
+    assert train["checkpoint_interval"] == 1
+    assert train["checkpoint_interval_unit"] == "epoch"
+    assert train["resume_training_checkpoint_path"] == ""
     assert train["validation_interval"] == 1
     assert train["distributed_strategy"] == "ddp"
     assert train["precision"] == "fp32"
@@ -482,38 +496,79 @@ def test_contract_is_pinned_sqsh_eight_gpu_and_zero_local_runs(contract):
     )
 
 
-def test_v2_walltime_is_frozen_without_changing_scientific_budget(contract):
+def test_v3_requeue_resume_is_frozen_without_scientific_budget_change(
+    contract,
+):
     runtime = contract["runtime"]
     policy = runtime["walltime_policy"]
-    assert runtime["time_hours"] == 8.0
-    assert runtime["timeout_hours"] == 7.8
+    assert runtime["partition"] == "polar3"
+    assert runtime["time_hours"] == 4.0
+    assert runtime["timeout_hours"] == 3.8
+    assert runtime["use_requeue"] is True
     assert policy == campaign_contract.FROZEN_WALLTIME_POLICY
-    assert policy["contract_revision"] == "qualification_runtime_v2"
+    assert policy["contract_revision"] == "qualification_runtime_v3"
     assert policy["observed_full_epoch_minutes_approx"] == 90.0
     assert policy["observed_minimum_training_hours_approx"] == 4.5
     assert policy["training_epochs"] == 3
+    assert policy["slurm_self_requeue"] is True
+    assert policy["checkpoint_interval_epochs"] == 1
+    assert policy["checkpoint_resume_policy"] == (
+        "same_job_exact_epoch_step_max_v1"
+    )
     assert policy["training_budget_changed"] is False
     assert policy["search_space_changed"] is False
     assert policy["candidate_budget_changed"] is False
     assert policy["retry_policy_changed"] is False
     assert policy["v1_runtime_evidence_preserved"] is True
+    assert policy["v2_runtime_evidence_preserved"] is True
     assert contract["search"]["training_epochs"] == 3
     assert contract["search"]["candidate_budget_per_mode"] == 20
     assert contract["search"]["space"] == campaign_contract.SEARCH_SPACE
 
 
-def test_v2_runtime_paths_do_not_overwrite_v1_evidence():
+def test_v3_runtime_paths_do_not_overwrite_v1_or_v2_evidence():
     assert str(qualification_campaign.DEFAULT_RUNTIME_ROOT).endswith(
-        "mask2former_coco2017_ptm_qualification_v2"
+        "mask2former_coco2017_ptm_qualification_v3"
     )
     assert str(qualification_campaign.DEFAULT_STAGE_MANIFEST).endswith(
         "mask2former_coco2017_ptm_qualification_v1/"
         "ptm_stage_manifest.json"
     )
     assert str(run_campaign.DEFAULT_RUNTIME_ROOT).endswith(
-        "mask2former_coco2017_three_mode_v2"
+        "mask2former_coco2017_three_mode_v3"
     )
-    assert run_campaign.DEFAULT_CONTRACT.name == "campaign.v2.json"
+    assert run_campaign.DEFAULT_CONTRACT.name == "campaign.v3.json"
+
+
+def test_v3_slurm_environment_enables_four_hour_self_requeue(
+    contract,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    for name in (
+        "PYTHONPATH",
+        "SLURM_USE_SQSH",
+        "SLURM_USE_REQUEUE",
+        "SLURM_TIME_HOURS",
+        "SLURM_TIMEOUT_HOURS",
+        "SLURM_MAX_GPUS_PER_NODE",
+        "SLURM_PARTITION",
+        "SLURM_ACCOUNT",
+        "SLURM_BASE_RESULTS_DIR",
+        "SLURM_CONTAINER_MOUNTS",
+        "MAX_JOB_RETRIES",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONNOUSERSITE",
+    ):
+        monkeypatch.setenv(name, run_campaign.os.environ.get(name, ""))
+    original_path = list(run_campaign.sys.path)
+    try:
+        run_campaign.configure_slurm_runtime(contract)
+        assert run_campaign.os.environ["SLURM_PARTITION"] == "polar3"
+        assert run_campaign.os.environ["SLURM_TIME_HOURS"] == "4.0"
+        assert run_campaign.os.environ["SLURM_TIMEOUT_HOURS"] == "3.8"
+        assert run_campaign.os.environ["SLURM_USE_REQUEUE"] == "true"
+    finally:
+        run_campaign.sys.path[:] = original_path
 
 
 def test_latency_protocol_is_4000_real_coco_validation_samples(contract):
@@ -679,9 +734,9 @@ def test_qualification_can_precede_registry_promotion_without_bypass(
 def test_direct_full_qualification_plan_is_plan_only(contract):
     plan = qualification_campaign.qualification_plan(contract)
     assert plan["campaign_id"] == (
-        "mask2former-coco2017-direct-full-qualification-v2-20260801"
+        "mask2former-coco2017-direct-full-qualification-v3-20260801"
     )
-    assert plan["contract_revision"] == "qualification_runtime_v2"
+    assert plan["contract_revision"] == "qualification_runtime_v3"
     assert plan["official_checkpoint_ids"] == [
         "mask2former.coco.swin_tiny.trainable.v1.0"
     ]
@@ -698,6 +753,11 @@ def test_direct_full_qualification_plan_is_plan_only(contract):
     assert plan["walltime_policy"] == (
         campaign_contract.FROZEN_WALLTIME_POLICY
     )
+    assert plan["checkpoint_interval_epochs"] == 1
+    assert plan["checkpoint_resume_policy"] == (
+        "same_job_exact_epoch_step_max_v1"
+    )
+    assert plan["slurm_self_requeue"] is True
     assert plan["scheduler_client_constructed"] is False
     assert plan["jobs_submitted"] == 0
     assert plan["cpu_model_runs"] == 0
@@ -706,12 +766,12 @@ def test_direct_full_qualification_plan_is_plan_only(contract):
     assert plan["replacement_workflows_allowed"] is False
 
 
-def test_v2_completion_records_exact_walltime_contract(contract):
+def test_v3_completion_records_exact_requeue_resume_contract(contract):
     completion = qualification_campaign.build_completion(contract, [])
     assert completion["campaign_id"] == (
-        "mask2former-coco2017-direct-full-qualification-v2-20260801"
+        "mask2former-coco2017-direct-full-qualification-v3-20260801"
     )
-    assert completion["contract_revision"] == "qualification_runtime_v2"
+    assert completion["contract_revision"] == "qualification_runtime_v3"
     assert completion["qualification_contract_sha256"] == (
         contract["contract_sha256"]
     )
@@ -723,7 +783,7 @@ def test_v2_completion_records_exact_walltime_contract(contract):
     assert observed == canonical_sha256(payload)
 
 
-def test_v1_evidence_cannot_satisfy_v2_contract(
+def test_v1_or_v2_evidence_cannot_satisfy_v3_contract(
     contract,
     tmp_path: Path,
 ):
@@ -756,7 +816,7 @@ def test_v1_evidence_cannot_satisfy_v2_contract(
     expected["contract_sha256"] = canonical_sha256(expected)
 
     document = _qualification_document()
-    document["contract_revision"] = "qualification_runtime_v2"
+    document["contract_revision"] = "qualification_runtime_v3"
     document["qualification_contract_sha256"] = expected[
         "contract_sha256"
     ]
@@ -781,20 +841,24 @@ def test_v1_evidence_cannot_satisfy_v2_contract(
     evidence_path.write_text(json.dumps(document), encoding="utf-8")
     audit_qualification(evidence_path, expected_contract=expected)
 
-    document["contract_revision"] = "qualification_runtime_v1"
-    document["evidence_sha256"] = canonical_sha256(
-        {
-            key: value
-            for key, value in document.items()
-            if key != "evidence_sha256"
-        }
-    )
-    evidence_path.write_text(json.dumps(document), encoding="utf-8")
-    with pytest.raises(
-        QualificationGateError,
-        match="wall-time policy",
+    for old_revision in (
+        "qualification_runtime_v1",
+        "qualification_runtime_v2",
     ):
-        audit_qualification(evidence_path, expected_contract=expected)
+        document["contract_revision"] = old_revision
+        document["evidence_sha256"] = canonical_sha256(
+            {
+                key: value
+                for key, value in document.items()
+                if key != "evidence_sha256"
+            }
+        )
+        evidence_path.write_text(json.dumps(document), encoding="utf-8")
+        with pytest.raises(
+            QualificationGateError,
+            match="requeue/resume policy",
+        ):
+            audit_qualification(evidence_path, expected_contract=expected)
 
 
 def test_direct_qualification_spec_precedence_preserves_coco_profile(
@@ -1057,13 +1121,13 @@ def test_contract_integrity_rejects_policy_mutation(contract):
         campaign_contract.validate_contract(changed)
 
     changed = copy.deepcopy(contract)
-    changed["runtime"]["time_hours"] = 4.0
-    changed["runtime"]["timeout_hours"] = 3.8
+    changed["runtime"]["time_hours"] = 8.0
+    changed["runtime"]["timeout_hours"] = 7.8
     changed.pop("contract_sha256")
     changed["contract_sha256"] = canonical_sha256(changed)
     with pytest.raises(
         campaign_contract.CampaignContractError,
-        match="frozen v2 wall-time policy",
+        match="frozen v3 requeue/resume policy",
     ):
         campaign_contract.validate_contract(changed)
 
@@ -1135,6 +1199,261 @@ def test_runtime_overlay_wrap_is_fail_closed_and_precedes_action(contract):
         runtime_overlay.wrap_command("mask2former train", changed)
 
 
+def test_checkpoint_resume_no_checkpoint_leaves_yaml_blank_and_audits(
+    tmp_path: Path,
+):
+    results_dir = tmp_path / "tao-job" / "results_dir"
+    spec_path = tmp_path / "tao-job" / "spec.yaml"
+    spec_path.parent.mkdir(parents=True)
+    spec_path.write_text(
+        yaml.safe_dump(
+            {
+                "results_dir": str(results_dir),
+                "train": {
+                    "resume_training_checkpoint_path": (
+                        "/unrelated/stale-checkpoint.pth"
+                    )
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    decision = checkpoint_resume.inject_resume_checkpoint(spec_path)
+
+    updated = yaml.safe_load(spec_path.read_text(encoding="utf-8"))
+    assert updated["train"]["resume_training_checkpoint_path"] == ""
+    assert decision["resume_enabled"] is False
+    assert decision["selected_checkpoint"] is None
+    assert decision["eligible_checkpoint_count"] == 0
+    audit = json.loads(
+        (spec_path.parent / checkpoint_resume.DECISION_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    supplied = audit.pop("decision_sha256")
+    assert supplied == canonical_sha256(audit)
+
+
+def test_checkpoint_resume_selects_latest_exact_numeric_independent_of_order(
+    tmp_path: Path,
+):
+    train_dir = tmp_path / "tao-job" / "results_dir" / "train"
+    train_dir.mkdir(parents=True)
+    paths = [
+        train_dir / "model_epoch_001_step_29572.pth",
+        train_dir / "model_epoch_002_step_00003.pth",
+        train_dir / "model_epoch_002_step_00002.pth",
+    ]
+    for path in paths:
+        path.write_bytes(path.name.encode("utf-8"))
+
+    forward, forward_count = checkpoint_resume.select_latest_checkpoint(
+        train_dir,
+        entries=paths,
+    )
+    reverse, reverse_count = checkpoint_resume.select_latest_checkpoint(
+        train_dir,
+        entries=reversed(paths),
+    )
+
+    assert forward == reverse
+    assert forward_count == reverse_count == 3
+    assert forward is not None
+    assert forward["epoch"] == 2
+    assert forward["step"] == 3
+    assert forward["filename"] == "model_epoch_002_step_00003.pth"
+
+
+def test_checkpoint_resume_rejects_a_different_tao_job_results_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    expected_root = tmp_path / "results"
+    spec_path = tmp_path / "spec.yaml"
+    spec_path.write_text(
+        yaml.safe_dump(
+            {
+                "results_dir": str(
+                    expected_root / "other-job" / "results_dir"
+                ),
+                "train": {"resume_training_checkpoint_path": ""},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TAO_RESULTS_ROOT", str(expected_root))
+    monkeypatch.setenv("TAO_JOB_ID", "current-job")
+
+    with pytest.raises(
+        checkpoint_resume.CheckpointResumeError,
+        match="not this TAO job's output",
+    ):
+        checkpoint_resume.inject_resume_checkpoint(spec_path)
+
+
+def test_checkpoint_resume_ignores_symlink_malformed_and_unrelated(
+    tmp_path: Path,
+):
+    train_dir = tmp_path / "tao-job" / "results_dir" / "train"
+    train_dir.mkdir(parents=True)
+    valid = train_dir / "model_epoch_001_step_00100.pth"
+    valid.write_bytes(b"valid")
+    malformed = train_dir / "mask2former_model_latest.pth"
+    malformed.write_bytes(b"malformed")
+    zero_length = train_dir / "model_epoch_009_step_99999.pth"
+    zero_length.touch()
+    symlink = train_dir / "model_epoch_010_step_99999.pth"
+    symlink.symlink_to(valid.name)
+    unrelated = tmp_path / "other" / "model_epoch_011_step_99999.pth"
+    unrelated.parent.mkdir()
+    unrelated.write_bytes(b"unrelated")
+
+    selected, count = checkpoint_resume.select_latest_checkpoint(
+        train_dir,
+        entries=[symlink, malformed, unrelated, zero_length, valid],
+    )
+
+    assert count == 1
+    assert selected is not None
+    assert selected["path"] == str(valid)
+
+
+def test_checkpoint_resume_injects_latest_exact_path_into_yaml(
+    tmp_path: Path,
+):
+    results_dir = tmp_path / "tao-job" / "results_dir"
+    train_dir = results_dir / "train"
+    train_dir.mkdir(parents=True)
+    first = train_dir / "model_epoch_000_step_14786.pth"
+    latest = train_dir / "model_epoch_001_step_29572.pth"
+    first.write_bytes(b"first")
+    latest.write_bytes(b"latest")
+    spec_path = tmp_path / "tao-job" / "spec.yaml"
+    spec_path.write_text(
+        yaml.safe_dump(
+            {
+                "results_dir": str(results_dir),
+                "train": {"resume_training_checkpoint_path": ""},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    decision = checkpoint_resume.inject_resume_checkpoint(spec_path)
+
+    updated = yaml.safe_load(spec_path.read_text(encoding="utf-8"))
+    assert updated["train"]["resume_training_checkpoint_path"] == str(latest)
+    assert decision["resume_enabled"] is True
+    assert decision["trusted_own_checkpoint_load"] is True
+    assert decision["selected_checkpoint"]["epoch"] == 1
+    assert decision["selected_checkpoint"]["step"] == 29572
+
+
+def test_checkpoint_resume_wraps_command_before_train_and_trusts_only_resume():
+    original = "mask2former train -e {config_path}"
+    wrapped = checkpoint_resume.wrap_train_command(original)
+
+    assert wrapped.endswith(original)
+    assert wrapped.count("{config_path}") == 2
+    assert "MASK2FORMER_RESUME_STATE" in wrapped
+    assert "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1" in wrapped
+    assert "fresh) unset TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD" in wrapped
+    assert wrapped.index("MASK2FORMER_RESUME_STATE") < wrapped.index(
+        "mask2former train"
+    )
+
+
+def test_checkpoint_resume_wrapped_command_executes_fresh_and_resume(
+    tmp_path: Path,
+):
+    results_dir = tmp_path / "tao-job" / "results_dir"
+    spec_path = tmp_path / "tao-job" / "spec.yaml"
+    marker = tmp_path / "trusted-env.txt"
+    spec_path.parent.mkdir(parents=True)
+
+    def write_spec() -> None:
+        spec_path.write_text(
+            yaml.safe_dump(
+                {
+                    "results_dir": str(results_dir),
+                    "train": {"resume_training_checkpoint_path": ""},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    probe = (
+        "import os,sys;"
+        "open(sys.argv[2],'w').write("
+        "os.environ.get('TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD',''))"
+    )
+    original = " ".join(
+        [
+            "python3 -c",
+            shlex.quote(probe),
+            "{config_path}",
+            shlex.quote(str(marker)),
+        ]
+    )
+    wrapped = checkpoint_resume.wrap_train_command(original)
+
+    write_spec()
+    subprocess.run(
+        ["bash", "-c", wrapped.format(config_path=shlex.quote(str(spec_path)))],
+        check=True,
+        timeout=30,
+    )
+    assert marker.read_text(encoding="utf-8") == ""
+
+    train_dir = results_dir / "train"
+    train_dir.mkdir(parents=True)
+    latest = train_dir / "model_epoch_001_step_29572.pth"
+    latest.write_bytes(b"checkpoint")
+    write_spec()
+    subprocess.run(
+        ["bash", "-c", wrapped.format(config_path=shlex.quote(str(spec_path)))],
+        check=True,
+        timeout=30,
+    )
+    assert marker.read_text(encoding="utf-8") == "1"
+    updated = yaml.safe_load(spec_path.read_text(encoding="utf-8"))
+    assert updated["train"]["resume_training_checkpoint_path"] == str(
+        latest
+    )
+
+
+def test_direct_qualification_train_command_uses_resume_wrapper(
+    contract,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import tao_sdk.script_runner
+
+    captured: dict[str, object] = {}
+
+    def fake_build_entrypoint(**kwargs):
+        captured.update(kwargs)
+        return {"command": kwargs["command"]}
+
+    monkeypatch.setattr(
+        tao_sdk.script_runner,
+        "build_entrypoint",
+        fake_build_entrypoint,
+    )
+    command, digest = qualification_campaign._entrypoint(
+        contract,
+        "train",
+        {"results_dir": "", "train": {}},
+    )
+
+    assert digest == run_campaign.text_sha256(command)
+    assert "MASK2FORMER_RESUME_STATE" in command
+    assert "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1" in command
+    assert command.index("MASK2FORMER_RESUME_STATE") < command.index(
+        "mask2former train"
+    )
+
+
 def test_runtime_overlay_remote_identity_and_readonly_are_launch_gates(
     contract,
     monkeypatch: pytest.MonkeyPatch,
@@ -1180,7 +1499,7 @@ def test_runtime_overlay_remote_identity_and_readonly_are_launch_gates(
         run_campaign.verify_runtime_overlay_remote(contract)
 
 
-def test_runner_training_command_uses_same_sealed_overlay(contract):
+def test_runner_training_command_uses_sealed_overlay_and_resume(contract):
     original = "mask2former train -e {config_path}"
     runner = SimpleNamespace(
         skill_ctx=SimpleNamespace(action_cfg={"command": original})
@@ -1191,6 +1510,8 @@ def test_runner_training_command_uses_same_sealed_overlay(contract):
     assert contract["runtime"]["tao_pytorch_overlay"]["archive"][
         "sha256"
     ] in wrapped
+    assert "MASK2FORMER_RESUME_STATE" in wrapped
+    assert "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1" in wrapped
     assert wrapped.endswith(original)
 
 

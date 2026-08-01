@@ -44,10 +44,10 @@ DEFAULT_STAGE_MANIFEST = (
 DEFAULT_QUALIFICATION = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "mask2former_coco2017_ptm_qualification_v2/completion.json"
+    "mask2former_coco2017_ptm_qualification_v3/completion.json"
 )
-# The already sealed PTM bytes are intentionally reused.  Only execution
-# wall time and runtime destinations change in qualification/runtime v2.
+# The already sealed PTM bytes are intentionally reused. Qualification/runtime
+# v3 changes only slice-safe checkpointing and same-job continuation.
 DEFAULT_PTM_STAGE_MANIFEST = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
@@ -341,7 +341,7 @@ def _runtime(
         "ptm_stage_manifest_sha256": ptm_stage["sha256"],
         "ptm_stage_content_sha256": ptm_stage["manifest_sha256"],
         "tao_pytorch_overlay": runtime_overlay.contract_record(),
-        "partition": "polar3",
+        "partition": campaign_contract.FROZEN_SLURM_PARTITION,
         "account": "edgeai_tao-ptm_image-foundation-model-clip",
         "base_results_dir": (
             "/lustre/fsw/portfolios/edgeai/users/rarunachalam"
@@ -349,6 +349,7 @@ def _runtime(
         "container_mounts": "/lustre",
         "time_hours": campaign_contract.FROZEN_SLURM_TIME_HOURS,
         "timeout_hours": campaign_contract.FROZEN_SLURM_TIMEOUT_HOURS,
+        "use_requeue": campaign_contract.FROZEN_SLURM_USE_REQUEUE,
         "walltime_policy": copy.deepcopy(
             campaign_contract.FROZEN_WALLTIME_POLICY
         ),
@@ -373,7 +374,7 @@ def build_contract(
     repository_path = Path(repository).resolve()
     value = campaign_contract.build_preregistered_contract(
         campaign_id=(
-            "mask2former-coco2017-objective-aware-three-mode-v2-20260801"
+            "mask2former-coco2017-objective-aware-three-mode-v3-20260801"
         ),
         dataset=dataset_record(dataset_manifest, stage_manifest),
         skill_dir=(
@@ -410,6 +411,9 @@ def build_contract(
         ),
         "runtime_overlay_sha256": campaign_contract.sha256_file(
             HERE / "runtime_overlay.py"
+        ),
+        "checkpoint_resume_sha256": campaign_contract.sha256_file(
+            HERE / "checkpoint_resume.py"
         ),
         "manifest_generator_sha256": campaign_contract.sha256_file(
             HERE / "manifest_generator.py"
