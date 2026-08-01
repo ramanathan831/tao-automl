@@ -36,11 +36,15 @@ DEFAULT_CONTRACT = run_campaign.DEFAULT_CONTRACT
 DEFAULT_RUNTIME_ROOT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "oneformer_coco2017_ptm_qualification_v1"
+    "oneformer_coco2017_ptm_qualification_v2"
 )
-DEFAULT_STAGE_MANIFEST = DEFAULT_RUNTIME_ROOT / "ptm_stage_manifest.json"
+DEFAULT_STAGE_MANIFEST = Path(
+    "/localhome/local-rarunachalam/.tao/artifacts/"
+    "cross_model_automl_20260729/"
+    "oneformer_coco2017_ptm_qualification_v1/ptm_stage_manifest.json"
+)
 QUALIFICATION_CAMPAIGN_ID = (
-    "oneformer-coco2017-direct-full-ptm-qualification-20260801"
+    "oneformer-coco2017-direct-full-ptm-qualification-v2-20260801"
 )
 CampaignExecutionError = run_campaign.CampaignExecutionError
 atomic_json = run_campaign.atomic_json

@@ -44,7 +44,7 @@ DEFAULT_STAGE_MANIFEST = (
 DEFAULT_QUALIFICATION = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "oneformer_coco2017_ptm_qualification_v1/completion.json"
+    "oneformer_coco2017_ptm_qualification_v2/completion.json"
 )
 DEFAULT_PTM_STAGE_MANIFEST = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
@@ -398,7 +398,9 @@ def build_contract(
 ) -> dict[str, Any]:
     repository_path = Path(repository).resolve()
     value = campaign_contract.build_preregistered_contract(
-        campaign_id="oneformer-coco2017-objective-aware-three-mode-20260731",
+        campaign_id=(
+            "oneformer-coco2017-objective-aware-three-mode-v2-20260801"
+        ),
         dataset=dataset_record(dataset_manifest, stage_manifest),
         skill_dir=(
             Path(skills).resolve()

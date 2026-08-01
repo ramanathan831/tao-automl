@@ -29,6 +29,15 @@ installs that overlay before importing TAO PyTorch, and persists an installer
 receipt. A missing, changed, or inapplicable overlay leaves the automatic
 trigger closed.
 
+The first GPU qualification (`v1`) exposed a launcher defect: the overlay
+prefix was appended directly to the SDK command, so its shell operators were
+not contained inside the Pyxis container.  The installer therefore inspected
+the allocation host instead of the pinned SQSH and the unpatched OneFormer
+schema rejected `evaluate.task`.  All four v1 failures are preserved.  The v2
+launcher executes the complete overlay-plus-entrypoint payload through one
+quoted in-container `bash -lc`; no model, dataset, PTM, metric, budget, or gate
+setting changed.
+
 All campaign children use the pinned TAO 7.1 SQSH, one node/eight A100s, and
 the native 133-category panoptic label map. Candidate zero runs independently
 in all three modes. Only after all three first candidates pass training,
@@ -108,11 +117,11 @@ full-run PQ qualification evidence exists, and registry support is reviewed:
 cd /localhome/local-rarunachalam/tao-automl
 python -m experiments.cross_model_automl_20260729.oneformer_coco2017_campaign.manifest_generator \
   --runtime-overlay /localhome/local-rarunachalam/.tao/artifacts/oneformer-runtime-product-fixes-c25a20e0/oneformer-runtime-overlay.tar \
-  --output /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/oneformer_coco2017_three_mode/campaign.v1.json
+  --output /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/oneformer_coco2017_three_mode_v2/campaign.v2.json
 
 python -m experiments.cross_model_automl_20260729.oneformer_coco2017_campaign.run_campaign \
-  --contract /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/oneformer_coco2017_three_mode/campaign.v1.json \
-  --runtime-root /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/oneformer_coco2017_three_mode \
+  --contract /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/oneformer_coco2017_three_mode_v2/campaign.v2.json \
+  --runtime-root /localhome/local-rarunachalam/.tao/artifacts/cross_model_automl_20260729/oneformer_coco2017_three_mode_v2 \
   --automatic-trigger \
   --launch
 ```

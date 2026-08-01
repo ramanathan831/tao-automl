@@ -57,10 +57,14 @@ except ModuleNotFoundError:  # pragma: no cover - direct execution
 
 HERE = Path(__file__).resolve().parent
 ENV_PATH = Path("/localhome/local-rarunachalam/.tao/config.env")
-DEFAULT_CONTRACT = HERE / "campaign.v1.json"
+DEFAULT_CONTRACT = Path(
+    "/localhome/local-rarunachalam/.tao/artifacts/"
+    "cross_model_automl_20260729/"
+    "oneformer_coco2017_three_mode_v2/campaign.v2.json"
+)
 DEFAULT_RUNTIME_ROOT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
-    "cross_model_automl_20260729/oneformer_coco2017_three_mode"
+    "cross_model_automl_20260729/oneformer_coco2017_three_mode_v2"
 )
 STATIC_SQSH_AUDIT = HERE / "static_sqsh_audit.v1.json"
 TERMINAL_JOB_STATUSES = frozenset({"Complete", "Error", "Canceled"})
@@ -151,10 +155,17 @@ class RuntimeOverlaySDK:
         arguments = list(args)
         if "command" in kwargs:
             command = kwargs["command"]
-            kwargs["command"] = f"{self._prefix} && {command}"
+            payload = f"{self._prefix} && {command}"
+            # The SDK appends the supplied command directly after ``srun``.
+            # Without an explicit in-container shell, ``&&`` is interpreted
+            # by the outer sbatch shell and the overlay installer sees the
+            # login-node filesystem instead of the pinned SQSH.  Keep the
+            # entire overlay + entrypoint chain inside the Pyxis container.
+            kwargs["command"] = f"bash -lc {shlex.quote(payload)}"
         elif len(arguments) >= 2:
             command = arguments[1]
-            arguments[1] = f"{self._prefix} && {command}"
+            payload = f"{self._prefix} && {command}"
+            arguments[1] = f"bash -lc {shlex.quote(payload)}"
         else:
             raise CampaignExecutionError(
                 "runtime-overlay SDK received a container job without a command"

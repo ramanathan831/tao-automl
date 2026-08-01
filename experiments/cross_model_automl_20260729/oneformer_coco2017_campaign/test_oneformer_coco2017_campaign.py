@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import shlex
 from pathlib import Path
 
 import pytest
@@ -539,16 +540,40 @@ def test_runtime_overlay_prefix_is_applied_to_every_container_job():
     job = wrapped.create_job(image="image", command="tao model train")
     assert job.id == "job-1"
     command = raw.calls[0][1]["command"]
+    tokens = shlex.split(command)
+    assert tokens[:2] == ["bash", "-lc"]
+    assert len(tokens) == 3
+    in_container_payload = tokens[2]
     overlay = campaign_contract.FROZEN_RUNTIME_OVERLAY
-    assert command.endswith("&& tao model train")
-    assert overlay["archive_path"] in command
-    assert overlay["archive_sha256"] in command
-    assert "install_overlay.py" in command
-    assert "runtime_overlay/receipt.json" in command
+    assert in_container_payload.endswith("&& tao model train")
+    assert overlay["archive_path"] in in_container_payload
+    assert overlay["archive_sha256"] in in_container_payload
+    assert "install_overlay.py" in in_container_payload
+    assert "runtime_overlay/receipt.json" in in_container_payload
     command_evidence = wrapped.command_evidence(job.id)
     assert command_evidence["runtime_overlay_applied"] is True
     assert command_evidence["command_sha256"] == run_campaign.text_sha256(
         command
+    )
+
+
+def test_runtime_overlay_positional_command_is_one_in_container_shell():
+    class DummySDK:
+        def __init__(self):
+            self.calls = []
+
+        def create_job(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return type("Job", (), {"id": "job-positional"})()
+
+    raw = DummySDK()
+    wrapped = run_campaign.RuntimeOverlaySDK(raw, contract())
+    wrapped.create_job("image", "/bin/bash /lustre/entrypoint.sh")
+    arguments = raw.calls[0][0]
+    tokens = shlex.split(arguments[1])
+    assert tokens[:2] == ["bash", "-lc"]
+    assert tokens[2].endswith(
+        "&& /bin/bash /lustre/entrypoint.sh"
     )
 
 
