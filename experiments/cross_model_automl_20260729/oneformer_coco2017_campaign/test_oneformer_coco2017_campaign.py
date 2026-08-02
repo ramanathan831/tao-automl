@@ -1343,3 +1343,39 @@ def test_terminal_checkpoint_probe_rejects_equal_numeric_maximum(
     )
 
     assert result.returncode != 0
+
+
+def test_latency_payload_is_compressed_below_safe_argument_budget():
+    repository = Path(run_campaign.__file__).resolve().parents[3]
+    contract = {
+        "runtime": {"repository": str(repository)},
+        "latency_protocol": copy.deepcopy(
+            campaign_contract.LATENCY_PROTOCOL
+        ),
+        "launcher_integrity": {
+            "oneformer_latency_worker_sha256": (
+                campaign_contract.sha256_file(
+                    Path(run_campaign.__file__).with_name(
+                        "oneformer_latency_worker.py"
+                    )
+                )
+            )
+        },
+        "sqsh": {"sha256": "a" * 64},
+    }
+    descriptor = {
+        "schema_version": 1,
+        "validation_files": [
+            {"name": f"image-{index}.jpg", "sha256": "b" * 64}
+            for index in range(16)
+        ],
+    }
+
+    command, latency_contract = run_campaign._payload_command(
+        contract,
+        descriptor,
+    )
+
+    assert len(command.encode("utf-8")) < 64 * 1024
+    assert "zlib.decompress" in command
+    assert latency_contract["expected_replicas"] == 8

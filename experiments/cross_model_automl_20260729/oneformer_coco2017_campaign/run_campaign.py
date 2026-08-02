@@ -27,6 +27,7 @@ import signal
 import subprocess
 import sys
 import time
+import zlib
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -1285,14 +1286,25 @@ def _payload_command(
             descriptor, sort_keys=True
         ).encode("utf-8"),
     }
-    encoded = {
+    encoded_files = {
         name: base64.b64encode(content).decode("ascii")
         for name, content in files.items()
     }
+    compressed_payload = base64.b64encode(
+        zlib.compress(
+            json.dumps(
+                encoded_files,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8"),
+            level=9,
+        )
+    ).decode("ascii")
     installer = (
-        "import base64,json,pathlib;"
+        "import base64,json,pathlib,zlib;"
         "root=pathlib.Path('/tmp/oneformer_campaign_runtime');"
-        f"files=json.loads({json.dumps(json.dumps(encoded))});"
+        "files=json.loads(zlib.decompress(base64.b64decode("
+        f"{json.dumps(compressed_payload)})));"
         "[(root/name).parent.mkdir(parents=True,exist_ok=True) "
         "for name in files];"
         "[(root/name).write_bytes(base64.b64decode(data)) "
