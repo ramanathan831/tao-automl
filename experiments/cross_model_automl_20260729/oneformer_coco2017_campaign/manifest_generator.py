@@ -81,7 +81,8 @@ EXPECTED_WHEEL_REGISTRY_FILE_SHA256 = (
 EXPECTED_WHEEL_ONEFORMER_REGISTRY_SHA256 = (
     "3872bec8c0e58f79cd2f941d18bcc1bcb5660ed90c9a4500f8ab5cf3004bde2a"
 )
-EXPECTED_SDK_COMMIT = "1a981d79af40d156735f3d89b98495e7818d0891"
+QUALIFICATION_SDK_COMMIT = "1a981d79af40d156735f3d89b98495e7818d0891"
+EXPECTED_SDK_COMMIT = "98c1144fd57b28f38ab5b7b41c113fac6e5e670a"
 EXPECTED_SKILLS_COMMIT = "2e9c1b25f3c7cb1ae444c75652e36c47eace8229"
 
 
@@ -141,7 +142,7 @@ def _successor_qualification_evidence_record(
         or runtime.get("source_commit")
         != "35972c1bc63e64901c40b0de5be95cc14c19ec80"
         or runtime.get("wheel_sha256") != EXPECTED_WHEEL_SHA256
-        or runtime.get("sdk_commit") != EXPECTED_SDK_COMMIT
+        or runtime.get("sdk_commit") != QUALIFICATION_SDK_COMMIT
         or runtime.get("skills_commit") != EXPECTED_SKILLS_COMMIT
         or policy.get("checkpoint_resume_policy")
         != campaign_contract.CHECKPOINT_RESUME_POLICY
