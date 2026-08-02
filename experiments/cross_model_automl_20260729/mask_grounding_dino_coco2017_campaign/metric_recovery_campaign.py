@@ -39,16 +39,16 @@ DEFAULT_PREDECESSOR_COMPLETION = DEFAULT_PREDECESSOR_CONTRACT.with_name(
 DEFAULT_OUTPUT_ROOT = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "mask_grounding_dino_coco2017_ptm_qualification_v4"
+    "mask_grounding_dino_coco2017_ptm_qualification_v5"
 )
-DEFAULT_CONTRACT = DEFAULT_OUTPUT_ROOT / "qualification.v4.json"
+DEFAULT_CONTRACT = DEFAULT_OUTPUT_ROOT / "qualification.v5.json"
 DEFAULT_REPOSITORY = Path("/localhome/local-rarunachalam/tao-automl")
 DEFAULT_TAO_PYTORCH = Path(
     "/localhome/local-rarunachalam/.tao/worktrees/"
     "tao-pytorch-mask-grounding-dino-coco-evaluator"
 )
 CAMPAIGN_ID = (
-    "mask_grounding_dino-coco2017-coco-metric-recovery-v4-20260802"
+    "mask_grounding_dino-coco2017-coco-metric-recovery-v5-20260802"
 )
 OVERLAY = {
     "schema_version": 1,
@@ -437,6 +437,15 @@ def _run_one(
     return progress
 
 
+def _sdk_for_workflow(sdk_type: Any, workflow_dir: Path) -> Any:
+    """Create isolated SDK state only after its directory is durable."""
+    workflow_dir.mkdir(parents=True, exist_ok=True)
+    return sdk_type(
+        poll_interval=10,
+        state_file=workflow_dir / "slurm_state.json",
+    )
+
+
 def launch(
     *,
     contract_path: Path = DEFAULT_CONTRACT,
@@ -474,11 +483,29 @@ def launch(
 
     def invoke(record: Mapping[str, Any]) -> dict[str, Any]:
         workflow_dir = runtime_root / record["checkpoint_id"].replace("/", "_")
-        sdk = SlurmSDK(
-            poll_interval=10,
-            state_file=workflow_dir / "slurm_state.json",
-        )
-        return _run_one(contract, record, runtime_root, sdk)
+        try:
+            sdk = _sdk_for_workflow(SlurmSDK, workflow_dir)
+            return _run_one(contract, record, runtime_root, sdk)
+        except Exception as exc:  # preserve every frozen arm independently
+            failure = {
+                "checkpoint_id": record["checkpoint_id"],
+                "status": "failure",
+                "failure_code": "metric_recovery_workflow_exception",
+                "failure_reason": f"{type(exc).__name__}: {exc}",
+                "terminal_checkpoint": copy.deepcopy(
+                    record["terminal_checkpoint"]
+                ),
+                "training_reused": True,
+                "training_jobs_submitted": 0,
+                "agent_intervention_flags": {
+                    name: False for name in campaign_contract.AGENT_FLAGS
+                },
+            }
+            failure["workflow_sha256"] = canonical_sha256(failure)
+            run_campaign.atomic_json(
+                workflow_dir / "workflow_progress.json", failure
+            )
+            return failure
 
     results = {}
     with concurrent.futures.ThreadPoolExecutor(

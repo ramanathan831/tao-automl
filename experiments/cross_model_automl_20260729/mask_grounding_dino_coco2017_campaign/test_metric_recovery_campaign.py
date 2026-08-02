@@ -103,3 +103,23 @@ def test_workflow_submits_evaluation_only_with_frozen_checkpoint(
     assert result["training_jobs_submitted"] == 0
     assert result["segm_val_mAP50_95"] == 0.11
     assert result["bbox_val_mAP50_95"] == 0.22
+
+
+def test_sdk_state_directory_exists_before_database_construction(tmp_path):
+    observed = {}
+
+    class FakeSDK:
+        def __init__(self, *, poll_interval, state_file):
+            observed["parent_exists"] = state_file.parent.is_dir()
+            observed["poll_interval"] = poll_interval
+            observed["state_file"] = state_file
+
+    workflow_dir = tmp_path / "previously-missing" / "workflow"
+    sdk = recovery._sdk_for_workflow(FakeSDK, workflow_dir)
+
+    assert isinstance(sdk, FakeSDK)
+    assert observed == {
+        "parent_exists": True,
+        "poll_interval": 10,
+        "state_file": workflow_dir / "slurm_state.json",
+    }
