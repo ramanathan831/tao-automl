@@ -1172,7 +1172,8 @@ def test_runner_source_preserves_objective_aware_and_automatic_gates():
     assert "gpu_count=8" in source
     assert "num_nodes=1" in source
     assert "TAO_AUTOML_ONEFORMER_LATENCY_COMPLETE" in source
-    assert "model_epoch_000_step_" in source
+    assert "same_job_max_epoch_step" in source
+    assert "model_epoch_([0-9]+)_step_([0-9]+)" in source
     assert "sdk = RuntimeOverlaySDK(" in source
     assert 'names=(\"test_PQ\", \"PQ\")' in source
 
@@ -1289,3 +1290,56 @@ def test_shared_checkpoint_resume_fails_closed_after_requeue_without_file(
             decision_filename="decision.json",
             history_directory="history",
         )
+
+
+def test_terminal_checkpoint_probe_selects_latest_saved_numeric_step(
+    tmp_path: Path,
+):
+    train_dir = tmp_path / "train"
+    train_dir.mkdir()
+    (train_dir / "model_epoch_000_step_00100.pth").write_bytes(b"first")
+    latest = train_dir / "model_epoch_000_step_14700.pth"
+    latest.write_bytes(b"latest")
+    (train_dir / "unrelated.pth").write_bytes(b"ignored")
+    (train_dir / "model_epoch_000_step_14786.pth").symlink_to(latest)
+
+    result = subprocess.run(
+        [
+            "python3",
+            "-c",
+            run_campaign._terminal_checkpoint_probe_script(),
+            str(train_dir),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    evidence = json.loads(result.stdout)
+
+    assert evidence["filename"] == "model_epoch_000_step_14700.pth"
+    assert evidence["epoch"] == 0
+    assert evidence["step"] == 14700
+    assert evidence["eligible_checkpoint_count"] == 2
+
+
+def test_terminal_checkpoint_probe_rejects_equal_numeric_maximum(
+    tmp_path: Path,
+):
+    train_dir = tmp_path / "train"
+    train_dir.mkdir()
+    (train_dir / "model_epoch_000_step_14700.pth").write_bytes(b"first")
+    (train_dir / "model_epoch_00_step_014700.pth").write_bytes(b"duplicate")
+
+    result = subprocess.run(
+        [
+            "python3",
+            "-c",
+            run_campaign._terminal_checkpoint_probe_script(),
+            str(train_dir),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0

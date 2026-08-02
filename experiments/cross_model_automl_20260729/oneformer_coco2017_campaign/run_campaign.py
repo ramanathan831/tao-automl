@@ -887,18 +887,10 @@ def _terminal_checkpoint(
     sdk: Any,
     job_id: str,
 ) -> dict[str, Any]:
-    """Resolve exactly one terminal epoch-zero OneFormer checkpoint."""
+    """Resolve the latest unambiguous saved OneFormer checkpoint."""
     root = _local_lustre_path(sdk.get_job_results_dir(job_id))
     folder = f"{root}/results_dir/train"
-    script = (
-        "import glob,hashlib,json,pathlib,sys;"
-        "paths=sorted(glob.glob(sys.argv[1]+'/model_epoch_000_step_*.pth'));"
-        "assert len(paths)==1,paths;"
-        "p=pathlib.Path(paths[0]);h=hashlib.sha256();f=p.open('rb');"
-        "[(h.update(c)) for c in iter(lambda:f.read(1048576),b'')];f.close();"
-        "print(json.dumps({'path':str(p),'filename':p.name,"
-        "'size_bytes':p.stat().st_size,'sha256':h.hexdigest()}))"
-    )
+    script = _terminal_checkpoint_probe_script()
     try:
         evidence = json.loads(
             remote_output(
@@ -907,12 +899,15 @@ def _terminal_checkpoint(
         )
     except Exception as exc:
         raise CampaignExecutionError(
-            "exact terminal OneFormer checkpoint is unavailable or ambiguous"
+            "latest saved OneFormer checkpoint is unavailable or ambiguous"
         ) from exc
     if (
-        not re.fullmatch(r"model_epoch_000_step_[0-9]+[.]pth", evidence["filename"])
+        not re.fullmatch(r"model_epoch_[0-9]+_step_[0-9]+[.]pth", evidence["filename"])
         or not evidence["path"].startswith("/lustre/")
         or evidence["size_bytes"] < 1
+        or evidence["eligible_checkpoint_count"] < 1
+        or evidence["epoch"] < 0
+        or evidence["step"] < 0
     ):
         raise CampaignExecutionError(
             "terminal OneFormer checkpoint identity is invalid"
@@ -920,12 +915,39 @@ def _terminal_checkpoint(
     evidence.update(
         {
             "training_epochs": campaign_contract.FROZEN_TRAINING_EPOCHS,
-            "terminal_epoch_index": 0,
-            "naming_contract": "model_epoch_000_step_numeric",
-            "ambiguity_policy": "fail_closed",
+            "selection_policy": "same_job_max_epoch_step",
+            "naming_contract": "model_epoch_numeric_step_numeric",
+            "ambiguity_policy": "fail_closed_equal_numeric_max",
         }
     )
     return evidence
+
+
+def _terminal_checkpoint_probe_script() -> str:
+    """Return a remote probe selecting max numeric epoch/step deterministically."""
+    script = (
+        "import hashlib,json,pathlib,re,sys\n"
+        "folder=pathlib.Path(sys.argv[1])\n"
+        "pattern=re.compile(r'^model_epoch_([0-9]+)_step_([0-9]+)[.]pth$')\n"
+        "eligible=[]\n"
+        "for p in folder.iterdir():\n"
+        " m=pattern.fullmatch(p.name)\n"
+        " if m and not p.is_symlink() and p.is_file() and p.stat().st_size>0:\n"
+        "  eligible.append((int(m.group(1)),int(m.group(2)),p.name,p))\n"
+        "assert eligible,eligible\n"
+        "maximum=max((item[0],item[1]) for item in eligible)\n"
+        "winners=[item for item in eligible if (item[0],item[1])==maximum]\n"
+        "assert len(winners)==1,winners\n"
+        "epoch,step,name,p=winners[0]\n"
+        "h=hashlib.sha256()\n"
+        "with p.open('rb') as f:\n"
+        " for chunk in iter(lambda:f.read(1048576),b''):\n"
+        "  h.update(chunk)\n"
+        "print(json.dumps({'path':str(p),'filename':name,'epoch':epoch,"
+        "'step':step,'size_bytes':p.stat().st_size,'sha256':h.hexdigest(),"
+        "'eligible_checkpoint_count':len(eligible)}))\n"
+    )
+    return script
 
 
 def _status_metric(
