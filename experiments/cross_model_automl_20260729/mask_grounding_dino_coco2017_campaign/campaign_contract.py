@@ -928,6 +928,28 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
         raise CampaignContractError("pinned SQSH identity changed")
     runtime = value.get("runtime", {})
     search = value.get("search", {})
+    resume_predecessor = runtime.get("resume_predecessor_contract")
+    if resume_predecessor is not None and (
+        not isinstance(resume_predecessor, Mapping)
+        or resume_predecessor.get("schema_version") != 1
+        or resume_predecessor.get("kind")
+        != "evaluator_overlay_only_successor"
+        or not isinstance(resume_predecessor.get("path"), str)
+        or not Path(resume_predecessor["path"]).is_absolute()
+        or not _is_lower_sha256(resume_predecessor.get("file_sha256"))
+        or not _is_lower_sha256(resume_predecessor.get("contract_sha256"))
+        or resume_predecessor.get("campaign_id") != campaign_id
+        or not isinstance(resume_predecessor.get("source_commit"), str)
+        or len(resume_predecessor["source_commit"]) != 40
+        or resume_predecessor.get("workspace_reuse_allowed") is not True
+        or resume_predecessor.get("training_job_reuse_required") is not True
+        or resume_predecessor.get("recommendation_change_allowed") is not False
+        or resume_predecessor.get("training_relaunch_allowed") is not False
+        or resume_predecessor.get("objective_policy_change_allowed") is not False
+    ):
+        raise CampaignContractError(
+            "evaluator-overlay resume predecessor contract changed"
+        )
     predecessor = runtime.get("predecessor_failure_evidence", {})
     runtime_eligibility = runtime.get("runtime_local_eligibility", {})
     if (
@@ -1023,6 +1045,7 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
             "runtime-local PTM eligibility contract changed"
         )
     if runtime_eligibility.get("qualification_successor_version") == 5:
+        evaluation_overlay = runtime.get("evaluation_overlay", {})
         successor_sha_fields = (
             "qualification_contract_file_sha256",
             "training_qualification_file_sha256",
@@ -1086,6 +1109,27 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
                 )
                 for name in successor_commit_fields
             )
+            or not isinstance(evaluation_overlay, Mapping)
+            or evaluation_overlay.get("schema_version") != 1
+            or evaluation_overlay.get("source_repository") != "tao-pytorch"
+            or evaluation_overlay.get("source_commit")
+            != runtime_eligibility.get("metric_recovery_source_commit")
+            or evaluation_overlay.get("archive_sha256")
+            != runtime_eligibility.get("metric_recovery_overlay_sha256")
+            or not isinstance(evaluation_overlay.get("archive_path"), str)
+            or not evaluation_overlay["archive_path"].startswith("/lustre/")
+            or not isinstance(
+                evaluation_overlay.get("archive_size_bytes"), int
+            )
+            or isinstance(
+                evaluation_overlay.get("archive_size_bytes"), bool
+            )
+            or evaluation_overlay["archive_size_bytes"] < 1
+            or evaluation_overlay.get("archive_root")
+            != "mask-grounding-dino-coco-evaluator-overlay"
+            or evaluation_overlay.get("base_site_packages")
+            != "/usr/local/lib/python3.12/dist-packages"
+            or evaluation_overlay.get("installed_package_mutated") is not False
         ):
             raise CampaignContractError(
                 "v5 evaluation-recovery eligibility contract changed"

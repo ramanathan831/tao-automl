@@ -417,6 +417,47 @@ def _lower_sha256(value: Any, name: str) -> str:
     return value
 
 
+def resume_predecessor_record(path: str | Path) -> dict[str, Any]:
+    """Bind an interrupted campaign whose workspaces may be resumed exactly."""
+    contract_path = Path(path).resolve()
+    try:
+        document = json.loads(contract_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ManifestGenerationError(
+            "resume predecessor contract is unavailable or invalid"
+        ) from exc
+    payload = copy.deepcopy(document)
+    supplied = payload.pop("contract_sha256", None)
+    if (
+        supplied != canonical_sha256(payload)
+        or document.get("model") != "mask_grounding_dino"
+        or document.get("campaign_id")
+        != "mask_grounding_dino-coco2017-objective-aware-three-mode-v5-20260803"
+        or document.get("search", {}).get("space_sha256")
+        != canonical_sha256(campaign_contract.SEARCH_SPACE)
+        or document.get("search", {}).get("candidate_budget_per_mode")
+        != campaign_contract.FROZEN_CANDIDATE_BUDGET
+        or any(document.get("agent_intervention_flags", {}).values())
+    ):
+        raise ManifestGenerationError(
+            "resume predecessor is not the frozen Mask Grounding DINO campaign"
+        )
+    return {
+        "schema_version": 1,
+        "kind": "evaluator_overlay_only_successor",
+        "path": str(contract_path),
+        "file_sha256": campaign_contract.sha256_file(contract_path),
+        "contract_sha256": supplied,
+        "campaign_id": document["campaign_id"],
+        "source_commit": document["runtime"]["source_commit"],
+        "workspace_reuse_allowed": True,
+        "training_job_reuse_required": True,
+        "recommendation_change_allowed": False,
+        "training_relaunch_allowed": False,
+        "objective_policy_change_allowed": False,
+    }
+
+
 def _successor_qualification_evidence_record(
     evidence_path: Path,
     contract_path: Path,
@@ -817,6 +858,23 @@ def _runtime(
     eligibility = qualification_evidence_record(
         qualification, qualification_contract
     )
+    qualification_source = json.loads(
+        qualification_contract.read_text(encoding="utf-8")
+    )
+    evaluation_overlay = qualification_source.get("overlay")
+    if (
+        eligibility.get("qualification_successor_version") == 5
+        and (
+            not isinstance(evaluation_overlay, dict)
+            or evaluation_overlay.get("archive_sha256")
+            != eligibility.get("metric_recovery_overlay_sha256")
+            or evaluation_overlay.get("source_commit")
+            != eligibility.get("metric_recovery_source_commit")
+        )
+    ):
+        raise ManifestGenerationError(
+            "v5 qualification evaluator overlay identity changed"
+        )
     eligibility.update(
         {
             "eligibility_source_commit": source_commit,
@@ -864,6 +922,7 @@ def _runtime(
         "qualification_contract_file_sha256": eligibility.get(
             "qualification_contract_file_sha256"
         ),
+        "evaluation_overlay": copy.deepcopy(evaluation_overlay),
         "runtime_local_eligibility": eligibility,
         "predecessor_failure_evidence": copy.deepcopy(
             eligibility["predecessor_failure_evidence"]
@@ -904,8 +963,24 @@ def build_contract(
     predecessor_qualification: str | Path = (
         DEFAULT_PREDECESSOR_QUALIFICATION
     ),
+    resume_predecessor_contract: str | Path | None = None,
 ) -> dict[str, Any]:
     repository_path = Path(repository).resolve()
+    runtime = _runtime(
+        repository=repository_path,
+        wheel=Path(wheel).resolve(),
+        sdk=Path(sdk).resolve(),
+        skills=Path(skills).resolve(),
+        qualification=Path(qualification),
+        qualification_contract=Path(qualification_contract),
+        ptm_stage_manifest=Path(ptm_stage_manifest),
+        text_encoder_stage=Path(text_encoder_stage),
+        predecessor_qualification=Path(predecessor_qualification),
+    )
+    if resume_predecessor_contract is not None:
+        runtime["resume_predecessor_contract"] = resume_predecessor_record(
+            resume_predecessor_contract
+        )
     value = campaign_contract.build_preregistered_contract(
         campaign_id=(
             "mask_grounding_dino-coco2017-objective-aware-three-mode-v5-20260803"
@@ -919,17 +994,7 @@ def build_contract(
             Path(skills).resolve()
             / "skills/models/tao-train-mask-grounding-dino"
         ),
-        runtime=_runtime(
-            repository=repository_path,
-            wheel=Path(wheel).resolve(),
-            sdk=Path(sdk).resolve(),
-            skills=Path(skills).resolve(),
-            qualification=Path(qualification),
-            qualification_contract=Path(qualification_contract),
-            ptm_stage_manifest=Path(ptm_stage_manifest),
-            text_encoder_stage=Path(text_encoder_stage),
-            predecessor_qualification=Path(predecessor_qualification),
-        ),
+        runtime=runtime,
     )
     value.pop("contract_sha256")
     value["launcher_integrity"] = {
@@ -1008,6 +1073,15 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=DEFAULT_PTM_STAGE_MANIFEST,
     )
+    parser.add_argument(
+        "--resume-predecessor-contract",
+        type=Path,
+        default=None,
+        help=(
+            "Seal an evaluator-overlay-only successor that resumes the exact "
+            "predecessor AutoML workspaces and training jobs."
+        ),
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     contract = build_contract(
@@ -1025,6 +1099,7 @@ def main(argv: list[str] | None = None) -> int:
         ptm_stage_manifest=args.ptm_stage_manifest,
         text_encoder_stage=args.text_encoder_stage,
         predecessor_qualification=args.predecessor_qualification,
+        resume_predecessor_contract=args.resume_predecessor_contract,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(

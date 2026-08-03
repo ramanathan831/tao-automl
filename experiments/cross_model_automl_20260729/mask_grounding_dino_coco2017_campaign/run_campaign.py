@@ -432,6 +432,12 @@ def verify_local_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
                 ),
             }
         )
+    resume_predecessor = runtime.get("resume_predecessor_contract")
+    if isinstance(resume_predecessor, Mapping):
+        identities["resume_predecessor_contract"] = (
+            resume_predecessor["path"],
+            resume_predecessor["file_sha256"],
+        )
     evidence = {}
     for name, (path_value, expected_sha) in identities.items():
         path = Path(path_value).resolve()
@@ -478,6 +484,29 @@ def launch_readiness(
             raise CampaignExecutionError("pinned SQSH SHA-256 changed")
     except Exception as exc:
         blockers.append({"code": "sqsh_not_ready", "reason": str(exc)})
+    try:
+        overlay = contract["runtime"]["evaluation_overlay"]
+        identity = _remote_file_identity(overlay["archive_path"])
+        if (
+            identity["sha256"] != overlay["archive_sha256"]
+            or identity["size_bytes"] != overlay["archive_size_bytes"]
+        ):
+            raise CampaignExecutionError(
+                "selection-time evaluator overlay identity changed"
+            )
+        readonly = remote_output(
+            "test ! -w "
+            + shlex.quote(overlay["archive_path"])
+            + " && echo readonly"
+        ).strip()
+        if readonly != "readonly":
+            raise CampaignExecutionError(
+                "selection-time evaluator overlay is writable"
+            )
+    except Exception as exc:
+        blockers.append(
+            {"code": "evaluation_overlay_not_ready", "reason": str(exc)}
+        )
     try:
         decision = audit_qualification(
             contract["qualification_policy"]["qualification_evidence_path"],
@@ -793,6 +822,57 @@ def evaluation_spec(
     return spec
 
 
+def evaluator_overlay_install_command(
+    contract: Mapping[str, Any],
+) -> str:
+    """Build the fail-closed evaluator overlay prefix sealed by the campaign.
+
+    Mask Grounding DINO's COCO evaluator correction is intentionally installed
+    into an ephemeral ``PYTHONPATH`` tree.  The SQSH and its installed package
+    remain immutable.  Qualification proved the exact overlay; selection-time
+    evaluation must consume that same artifact rather than merely citing its
+    qualification evidence.
+    """
+    overlay = contract.get("runtime", {}).get("evaluation_overlay")
+    if not isinstance(overlay, Mapping):
+        raise CampaignExecutionError(
+            "selection-time Mask Grounding DINO evaluation requires the "
+            "sealed evaluator overlay"
+        )
+    archive = shlex.quote(str(overlay["archive_path"]))
+    digest = shlex.quote(str(overlay["archive_sha256"]))
+    base = shlex.quote(str(overlay["base_site_packages"]))
+    installer = shlex.quote(
+        f"{overlay['archive_root']}/install_overlay.py"
+    )
+    return " ".join(
+        [
+            "mgdino_overlay_tmp=$(mktemp -d",
+            "/tmp/mgdino-coco-evaluator.XXXXXX)",
+            "&& test \"$(sha256sum",
+            archive,
+            "| awk '{print $1}')\" =",
+            digest,
+            "&& tar --extract --file",
+            archive,
+            "--directory \"$mgdino_overlay_tmp\"",
+            "&& mgdino_overlay_site=\"$mgdino_overlay_tmp/site-packages\"",
+            "&& mkdir -p \"$mgdino_overlay_site/nvidia_tao_pytorch\"",
+            "&& cp -as",
+            f"{base}/nvidia_tao_pytorch/.",
+            "\"$mgdino_overlay_site/nvidia_tao_pytorch/\"",
+            f"&& python \"$mgdino_overlay_tmp\"/{installer}",
+            "--base-site-packages",
+            base,
+            "--site-packages \"$mgdino_overlay_site\"",
+            "--receipt \"${TAO_RESULTS_ROOT:?}/${TAO_JOB_ID:?}/"
+            "runtime_overlay/receipt.json\"",
+            "&& export PYTHONPATH=\"$mgdino_overlay_site"
+            "${PYTHONPATH:+:$PYTHONPATH}\"",
+        ]
+    )
+
+
 def _launch_evaluation(
     sdk: Any,
     contract: Mapping[str, Any],
@@ -818,10 +898,15 @@ def _launch_evaluation(
         config_format=action["config_format"],
         upload_excludes=action.get("upload_excludes", []),
     )
+    base_command = entrypoint["command"]
+    command = (
+        f"{evaluator_overlay_install_command(contract)} && (\n"
+        f"{base_command}\n)"
+    )
     runtime = contract["runtime"]
     job = sdk.create_job(
         image=contract["sqsh"]["path"],
-        command=entrypoint["command"],
+        command=command,
         gpu_count=8,
         num_nodes=1,
         partition=runtime["partition"],
@@ -832,7 +917,15 @@ def _launch_evaluation(
         "status": "submitted",
         "submitted_at_utc": utc_timestamp(),
         "spec_sha256": canonical_sha256(spec),
-        "command_sha256": text_sha256(entrypoint["command"]),
+        "base_command_sha256": text_sha256(base_command),
+        "command_sha256": text_sha256(command),
+        "overlay_sha256": contract["runtime"]["evaluation_overlay"][
+            "archive_sha256"
+        ],
+        "overlay_source_commit": contract["runtime"][
+            "evaluation_overlay"
+        ]["source_commit"],
+        "installed_package_mutated": False,
     }
     status = _wait_for_job(
         sdk,
@@ -1329,11 +1422,20 @@ def _run_mode(
     events = mode_dir / "events.jsonl"
     evidence_path = mode_dir / "candidate_evidence.json"
     candidates: dict[str, Any] = {}
+    evidence_migration: dict[str, Any] | None = None
     if resume and evidence_path.is_file():
         document = json.loads(evidence_path.read_text(encoding="utf-8"))
+        source_contract_sha256 = document.get("contract_sha256")
+        predecessor = contract["runtime"].get(
+            "resume_predecessor_contract"
+        )
+        direct_resume = source_contract_sha256 == contract["contract_sha256"]
+        successor_resume = (
+            isinstance(predecessor, Mapping)
+            and source_contract_sha256 == predecessor.get("contract_sha256")
+        )
         if (
-            document.get("contract_sha256")
-            != contract["contract_sha256"]
+            not (direct_resume or successor_resume)
             or document.get("mode") != mode
             or not isinstance(document.get("candidates"), Mapping)
         ):
@@ -1341,6 +1443,35 @@ def _run_mode(
                 f"{mode} resume evidence is incompatible"
             )
         candidates = copy.deepcopy(dict(document["candidates"]))
+        if successor_resume:
+            if (
+                len(candidates) != 1
+                or any(
+                    record.get("status") != "recommended"
+                    or "objective_values" in record
+                    or any(
+                        record.get("agent_intervention_flags", {}).get(name)
+                        is not False
+                        for name in campaign_contract.AGENT_FLAGS
+                    )
+                    for record in candidates.values()
+                )
+            ):
+                raise CampaignExecutionError(
+                    f"{mode} evaluator-overlay successor may resume only the "
+                    "single untouched first recommendation"
+                )
+            evidence_migration = {
+                "schema_version": 1,
+                "kind": "evaluator_overlay_only_successor",
+                "predecessor_contract_sha256": source_contract_sha256,
+                "successor_contract_sha256": contract["contract_sha256"],
+                "recommendations_changed": False,
+                "training_jobs_relaunched": False,
+                "objective_policy_changed": False,
+                "selection_invoked": False,
+                "migrated_at_utc": utc_timestamp(),
+            }
 
     configure_slurm_runtime(contract)
     from tao_automl.runner import AutoMLRunner
@@ -1385,15 +1516,15 @@ def _run_mode(
     runner.skill_ctx.action_cfg = train_action
 
     def persist() -> None:
-        atomic_json(
-            evidence_path,
-            {
-                "schema_version": 1,
-                "contract_sha256": contract["contract_sha256"],
-                "mode": mode,
-                "candidates": candidates,
-            },
-        )
+        value = {
+            "schema_version": 1,
+            "contract_sha256": contract["contract_sha256"],
+            "mode": mode,
+            "candidates": candidates,
+        }
+        if evidence_migration is not None:
+            value["evidence_migration"] = evidence_migration
+        atomic_json(evidence_path, value)
 
     def on_recommendation(rec: Any) -> None:
         record = _immutable_recommendation_record(

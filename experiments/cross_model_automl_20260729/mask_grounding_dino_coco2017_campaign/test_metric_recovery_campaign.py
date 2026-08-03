@@ -2,12 +2,17 @@
 
 import copy
 import json
+from pathlib import Path
 
 import pytest
 
 from tao_automl.ptm_registry import canonical_sha256
 
-from . import manifest_generator, metric_recovery_campaign as recovery
+from . import (
+    campaign_contract,
+    manifest_generator,
+    metric_recovery_campaign as recovery,
+)
 from .qualification_gate import QualificationGateError, audit_qualification
 
 
@@ -172,6 +177,71 @@ def test_v5_recovery_is_bound_to_v3_training_and_projects_all_ptms(
     assert decision.runtime_eligibility[
         "evaluation_recovery_jobs_submitted"
     ] == 4
+    assert contract["runtime"]["evaluation_overlay"] == recovery.OVERLAY
+    command = recovery.run_campaign.evaluator_overlay_install_command(
+        contract
+    )
+    assert recovery.OVERLAY["archive_path"] in command
+    assert recovery.OVERLAY["archive_sha256"] in command
+    assert "runtime_overlay/receipt.json" in command
+    assert "export PYTHONPATH=" in command
+
+
+def test_selection_evaluator_rejects_missing_or_changed_overlay(monkeypatch):
+    real_git = manifest_generator._git
+
+    def clean_git(repository, *arguments):
+        if arguments == ("status", "--porcelain"):
+            return ""
+        return real_git(repository, *arguments)
+
+    monkeypatch.setattr(manifest_generator, "_git", clean_git)
+    contract = manifest_generator.build_contract()
+    missing = copy.deepcopy(contract)
+    missing["runtime"].pop("evaluation_overlay")
+    with pytest.raises(
+        recovery.run_campaign.CampaignExecutionError,
+        match="requires the sealed evaluator overlay",
+    ):
+        recovery.run_campaign.evaluator_overlay_install_command(missing)
+
+    changed = copy.deepcopy(contract)
+    changed.pop("contract_sha256")
+    changed["runtime"]["evaluation_overlay"]["archive_sha256"] = "0" * 64
+    changed["contract_sha256"] = canonical_sha256(changed)
+    with pytest.raises(
+        campaign_contract.CampaignContractError,
+        match="v5 evaluation-recovery eligibility contract changed",
+    ):
+        campaign_contract.validate_contract(changed)
+
+
+def test_evaluator_overlay_successor_seals_exact_predecessor(monkeypatch):
+    predecessor = Path(
+        "/localhome/local-rarunachalam/.tao/artifacts/"
+        "cross_model_automl_20260729/"
+        "mask_grounding_dino_coco2017_three_mode_v5/campaign.v5.json"
+    )
+    real_git = manifest_generator._git
+
+    def clean_git(repository, *arguments):
+        if arguments == ("status", "--porcelain"):
+            return ""
+        return real_git(repository, *arguments)
+
+    monkeypatch.setattr(manifest_generator, "_git", clean_git)
+    contract = manifest_generator.build_contract(
+        resume_predecessor_contract=predecessor
+    )
+    record = contract["runtime"]["resume_predecessor_contract"]
+    predecessor_document = json.loads(predecessor.read_text(encoding="utf-8"))
+    assert record["contract_sha256"] == predecessor_document[
+        "contract_sha256"
+    ]
+    assert record["training_job_reuse_required"] is True
+    assert record["training_relaunch_allowed"] is False
+    assert record["recommendation_change_allowed"] is False
+    assert record["objective_policy_change_allowed"] is False
 
 
 def test_v5_recovery_rejects_changed_metric(tmp_path):
