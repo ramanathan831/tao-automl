@@ -1230,6 +1230,31 @@ def test_first_candidate_gate_fails_closed_on_any_failed_mode(
     assert release["release_remaining_budget"] is False
 
 
+def test_successor_gate_preserves_predecessor_release(tmp_path: Path):
+    predecessor_sha = "b" * 64
+    successor_sha = "c" * 64
+    predecessor_release = {
+        "schema_version": 1,
+        "contract_sha256": predecessor_sha,
+        "release_remaining_budget": False,
+        "modes": list(campaign_contract.MODES),
+        "reason": "preserved predecessor failure",
+    }
+    run_campaign.atomic_json(
+        tmp_path / "first_candidate_gate" / "release.json",
+        predecessor_release,
+    )
+    successor_dir = run_campaign._first_candidate_gate_dir(
+        tmp_path, successor_sha
+    )
+    assert successor_dir == (
+        tmp_path / f"first_candidate_gate_{successor_sha[:16]}"
+    )
+    assert json.loads(
+        (tmp_path / "first_candidate_gate" / "release.json").read_text()
+    ) == predecessor_release
+
+
 def test_launch_plan_is_automatic_and_does_not_launch(contract):
     plan = run_campaign.launch_plan(
         contract,

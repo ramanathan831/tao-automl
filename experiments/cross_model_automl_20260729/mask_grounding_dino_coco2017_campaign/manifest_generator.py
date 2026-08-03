@@ -978,8 +978,19 @@ def build_contract(
         predecessor_qualification=Path(predecessor_qualification),
     )
     if resume_predecessor_contract is not None:
+        predecessor_path = Path(resume_predecessor_contract).resolve()
+        predecessor_document = json.loads(
+            predecessor_path.read_text(encoding="utf-8")
+        )
         runtime["resume_predecessor_contract"] = resume_predecessor_record(
-            resume_predecessor_contract
+            predecessor_path
+        )
+        # Resume must reconstruct the byte-identical PTM runtime manifest that
+        # the hierarchical brain persisted before interruption.  The source
+        # successor changes only evaluator execution; it must not manufacture
+        # a new PTM-preflight identity or search configuration.
+        runtime["runtime_local_eligibility"] = copy.deepcopy(
+            predecessor_document["runtime"]["runtime_local_eligibility"]
         )
     value = campaign_contract.build_preregistered_contract(
         campaign_id=(

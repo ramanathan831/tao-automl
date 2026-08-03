@@ -242,6 +242,12 @@ def test_evaluator_overlay_successor_seals_exact_predecessor(monkeypatch):
     assert record["training_relaunch_allowed"] is False
     assert record["recommendation_change_allowed"] is False
     assert record["objective_policy_change_allowed"] is False
+    assert contract["runtime"]["runtime_local_eligibility"] == (
+        predecessor_document["runtime"]["runtime_local_eligibility"]
+    )
+    assert contract["qualification_policy"]["runtime_local_eligibility"] == (
+        predecessor_document["runtime"]["runtime_local_eligibility"]
+    )
 
 
 def test_v5_recovery_rejects_changed_metric(tmp_path):

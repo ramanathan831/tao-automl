@@ -1382,13 +1382,33 @@ def _preserve_or_add_recommendation(
             stored[key] = copy.deepcopy(value)
 
 
+def _first_candidate_gate_dir(
+    runtime_root: Path,
+    contract_sha256: str,
+) -> Path:
+    """Preserve a predecessor gate while isolating a successor decision."""
+    primary = runtime_root / "first_candidate_gate"
+    release = primary / "release.json"
+    if release.is_file():
+        try:
+            existing = json.loads(release.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            existing = {}
+        if existing.get("contract_sha256") != contract_sha256:
+            return runtime_root / (
+                "first_candidate_gate_" + contract_sha256[:16]
+            )
+    return primary
+
+
 def _await_first_candidate_release(
     *,
     runtime_root: Path,
     mode: str,
     evidence: Mapping[str, Any],
 ) -> None:
-    gate_dir = runtime_root / "first_candidate_gate"
+    contract_sha256 = str(evidence["contract_sha256"])
+    gate_dir = _first_candidate_gate_dir(runtime_root, contract_sha256)
     atomic_json(gate_dir / f"{mode}.json", evidence)
     release = gate_dir / "release.json"
     while not release.is_file():
@@ -1705,7 +1725,7 @@ def _release_first_candidate_gate(
     processes: Mapping[str, mp.Process],
     contract_sha256: str,
 ) -> dict[str, Any] | None:
-    gate_dir = runtime_root / "first_candidate_gate"
+    gate_dir = _first_candidate_gate_dir(runtime_root, contract_sha256)
     release = gate_dir / "release.json"
     if release.is_file():
         return json.loads(release.read_text(encoding="utf-8"))

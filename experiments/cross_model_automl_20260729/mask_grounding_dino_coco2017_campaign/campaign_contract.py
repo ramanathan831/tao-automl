@@ -952,6 +952,11 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
         )
     predecessor = runtime.get("predecessor_failure_evidence", {})
     runtime_eligibility = runtime.get("runtime_local_eligibility", {})
+    expected_eligibility_source_commit = (
+        resume_predecessor["source_commit"]
+        if isinstance(resume_predecessor, Mapping)
+        else runtime.get("source_commit")
+    )
     if (
         not isinstance(predecessor, Mapping)
         or not isinstance(predecessor.get("path"), str)
@@ -989,7 +994,7 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
         or runtime_eligibility.get("base_registry_version")
         != value.get("ptm_inventory", {}).get("registry_version")
         or runtime_eligibility.get("eligibility_source_commit")
-        != runtime.get("source_commit")
+        != expected_eligibility_source_commit
         or runtime_eligibility.get("wheel_sha256")
         != runtime.get("wheel_sha256")
         or runtime_eligibility.get("sdk_commit")
