@@ -409,6 +409,26 @@ def verify_local_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
             contract["launcher_integrity"]["checkpoint_resume_sha256"],
         ),
     }
+    eligibility = runtime["runtime_local_eligibility"]
+    if eligibility.get("qualification_successor_version") == 5:
+        identities.update(
+            {
+                "qualification_contract": (
+                    runtime["qualification_contract_path"],
+                    runtime["qualification_contract_file_sha256"],
+                ),
+                "training_qualification": (
+                    eligibility["training_qualification_path"],
+                    eligibility["training_qualification_file_sha256"],
+                ),
+                "training_qualification_contract": (
+                    eligibility["training_qualification_contract_path"],
+                    eligibility[
+                        "training_qualification_contract_file_sha256"
+                    ],
+                ),
+            }
+        )
     evidence = {}
     for name, (path_value, expected_sha) in identities.items():
         path = Path(path_value).resolve()

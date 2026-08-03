@@ -213,6 +213,14 @@ def sha256_file(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def _is_lower_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
 def _finite_fraction(value: Any, name: str) -> float:
     if isinstance(value, bool):
         raise CampaignContractError(f"{name} must be finite in (0, 1]")
@@ -1014,6 +1022,74 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
         raise CampaignContractError(
             "runtime-local PTM eligibility contract changed"
         )
+    if runtime_eligibility.get("qualification_successor_version") == 5:
+        successor_sha_fields = (
+            "qualification_contract_file_sha256",
+            "training_qualification_file_sha256",
+            "training_qualification_evidence_sha256",
+            "training_qualification_contract_file_sha256",
+            "training_qualification_contract_sha256",
+            "ptm_stage_manifest_sha256",
+            "ptm_stage_content_sha256",
+            "qualification_source_wheel_sha256",
+            "metric_recovery_overlay_sha256",
+        )
+        successor_commit_fields = (
+            "qualification_source_commit",
+            "qualification_source_sdk_commit",
+            "qualification_source_skills_commit",
+            "metric_recovery_source_commit",
+        )
+        if (
+            runtime.get("qualification_contract_path")
+            != runtime_eligibility.get("qualification_contract_path")
+            or runtime.get("qualification_contract_file_sha256")
+            != runtime_eligibility.get(
+                "qualification_contract_file_sha256"
+            )
+            or runtime_eligibility.get("ptm_stage_manifest_path")
+            != runtime.get("ptm_stage_manifest_path")
+            or runtime_eligibility.get("ptm_stage_manifest_sha256")
+            != runtime.get("ptm_stage_manifest_sha256")
+            or runtime_eligibility.get("ptm_stage_content_sha256")
+            != runtime.get("ptm_stage_content_sha256")
+            or runtime_eligibility.get("predecessor_failure_evidence")
+            != predecessor
+            or runtime_eligibility.get("evaluation_recovery_jobs_submitted")
+            != 4
+            or runtime_eligibility.get("training_jobs_submitted") != 0
+            or runtime_eligibility.get("replacement_workflows_submitted")
+            is not True
+            or runtime_eligibility.get("replacement_workflow_count") != 4
+            or runtime_eligibility.get("checkpoint_resume_policy")
+            != CHECKPOINT_RESUME_POLICY
+            or any(
+                not isinstance(runtime_eligibility.get(name), str)
+                or not Path(runtime_eligibility[name]).is_absolute()
+                for name in (
+                    "qualification_contract_path",
+                    "training_qualification_path",
+                    "training_qualification_contract_path",
+                    "ptm_stage_manifest_path",
+                )
+            )
+            or any(
+                not _is_lower_sha256(runtime_eligibility.get(name))
+                for name in successor_sha_fields
+            )
+            or any(
+                not isinstance(runtime_eligibility.get(name), str)
+                or len(runtime_eligibility[name]) != 40
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in runtime_eligibility[name]
+                )
+                for name in successor_commit_fields
+            )
+        ):
+            raise CampaignContractError(
+                "v5 evaluation-recovery eligibility contract changed"
+            )
     if (
         value.get("ptm_inventory") != mask_grounding_dino_registry_snapshot()
         or value.get("latency_protocol") != LATENCY_PROTOCOL

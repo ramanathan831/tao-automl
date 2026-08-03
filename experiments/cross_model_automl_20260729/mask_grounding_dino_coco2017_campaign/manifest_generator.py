@@ -52,7 +52,12 @@ DEFAULT_TEXT_ENCODER_STAGE = (
 DEFAULT_QUALIFICATION = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
     "cross_model_automl_20260729/"
-    "mask_grounding_dino_coco2017_ptm_qualification_v3/completion.json"
+    "mask_grounding_dino_coco2017_ptm_qualification_v5/completion.json"
+)
+DEFAULT_QUALIFICATION_CONTRACT = Path(
+    "/localhome/local-rarunachalam/.tao/artifacts/"
+    "cross_model_automl_20260729/"
+    "mask_grounding_dino_coco2017_ptm_qualification_v5/qualification.v5.json"
 )
 DEFAULT_PREDECESSOR_QUALIFICATION = Path(
     "/localhome/local-rarunachalam/.tao/artifacts/"
@@ -79,7 +84,7 @@ EXPECTED_TEXT_ENCODER_STAGE_SHA256 = (
 EXPECTED_WHEEL_SHA256 = (
     "304824dc95ee0ef763ae72f8872e79e593613a36a17e20dbf50b3a561892b381"
 )
-EXPECTED_SDK_COMMIT = "1a981d79af40d156735f3d89b98495e7818d0891"
+EXPECTED_SDK_COMMIT = "98c1144fd57b28f38ab5b7b41c113fac6e5e670a"
 EXPECTED_SKILLS_COMMIT = "2e9c1b25f3c7cb1ae444c75652e36c47eace8229"
 EXPECTED_PREDECESSOR_QUALIFICATION_SHA256 = (
     "35e2d52317ab8458cbfa4efdf8bfa320f083aa19daaaf822b7cde9ed39dfe0eb"
@@ -402,14 +407,237 @@ def ptm_stage_record(path: str | Path) -> dict[str, Any]:
     }
 
 
-def qualification_evidence_record(path: str | Path) -> dict[str, Any]:
-    """Bind the immutable checkpoint-resumable v3 completion."""
+def _lower_sha256(value: Any, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ManifestGenerationError(f"{name} must be lowercase SHA-256")
+    return value
+
+
+def _successor_qualification_evidence_record(
+    evidence_path: Path,
+    contract_path: Path,
+) -> dict[str, Any]:
+    """Bind v5 evaluator recovery to the exact frozen v3 training evidence."""
+    try:
+        source = json.loads(contract_path.read_text(encoding="utf-8"))
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ManifestGenerationError(
+            "Mask Grounding DINO v5 qualification JSON is invalid"
+        ) from exc
+    source_payload = copy.deepcopy(source)
+    source_internal = source_payload.pop("contract_sha256", None)
+    evidence_payload = copy.deepcopy(evidence)
+    evidence_internal = evidence_payload.pop("evidence_sha256", None)
+    predecessor = source.get("predecessor", {})
+    try:
+        training_path = Path(predecessor["completion_path"]).resolve()
+        training = json.loads(training_path.read_text(encoding="utf-8"))
+    except (KeyError, OSError, ValueError) as exc:
+        raise ManifestGenerationError(
+            "frozen v3 training qualification is unavailable"
+        ) from exc
+    training_payload = copy.deepcopy(training)
+    training_internal = training_payload.pop("evidence_sha256", None)
+    snapshot = campaign_contract.mask_grounding_dino_registry_snapshot()
+    expected_ids = {record["id"] for record in snapshot["records"]}
+    source_workflows = training.get("workflows")
+    recovery_workflows = evidence.get("workflows")
+    if (
+        source_internal != canonical_sha256(source_payload)
+        or source.get("campaign_id")
+        != "mask_grounding_dino-coco2017-coco-metric-recovery-v5-20260802"
+        or source.get("model") != "mask_grounding_dino"
+        or source.get("task")
+        != "category_prompted_grounded_instance_segmentation"
+        or source.get("primary_metric") != "segm_val_mAP50_95"
+        or source.get("sqsh") != campaign_contract.FROZEN_SQSH
+        or source.get("execution", {}).get("scope")
+        != "standalone_full_validation_only"
+        or source.get("execution", {}).get("training_jobs_submitted") != 0
+        or source.get("execution", {}).get("evaluation_jobs_expected") != 4
+        or source.get("execution", {}).get("gpus_per_job") != 8
+        or any(source.get("agent_intervention_flags", {}).values())
+        or evidence_internal != canonical_sha256(evidence_payload)
+        or evidence.get("campaign_id") != source.get("campaign_id")
+        or evidence.get("contract_sha256") != source_internal
+        or evidence.get("model") != "mask_grounding_dino"
+        or evidence.get("task")
+        != "category_prompted_grounded_instance_segmentation"
+        or evidence.get("primary_metric") != "segm_val_mAP50_95"
+        or evidence.get("predecessor") != predecessor
+        or evidence.get("overlay") != source.get("overlay")
+        or evidence.get("training_jobs_submitted") != 0
+        or evidence.get("evaluation_jobs_submitted") != 4
+        or evidence.get("evaluations_submitted_concurrently") is not True
+        or any(evidence.get(name) != 0 for name in (
+            "cpu_model_runs", "smoke_model_runs", "mini_step_runs"
+        ))
+        or evidence.get("selection_invoked") is not False
+        or evidence.get("validation_measurements_feed_selection") is not False
+        or any(evidence.get("agent_intervention_flags", {}).values())
+        or training_internal != canonical_sha256(training_payload)
+        or predecessor.get("completion_path") != str(training_path)
+        or predecessor.get("completion_file_sha256")
+        != campaign_contract.sha256_file(training_path)
+        or predecessor.get("evidence_sha256") != training_internal
+        or training.get("campaign_id")
+        != "mask_grounding_dino-coco2017-direct-full-qualification-v3-20260801"
+        or training.get("model") != "mask_grounding_dino"
+        or training.get("task")
+        != "category_prompted_grounded_instance_segmentation"
+        or training.get("primary_metric") != "segm_val_mAP50_95"
+        or not isinstance(source_workflows, list)
+        or not isinstance(recovery_workflows, list)
+        or len(source_workflows) != 4
+        or len(recovery_workflows) != 4
+        or {item.get("checkpoint_id") for item in source_workflows}
+        != expected_ids
+        or {item.get("checkpoint_id") for item in recovery_workflows}
+        != expected_ids
+    ):
+        raise ManifestGenerationError(
+            "Mask Grounding DINO v5 qualification identity changed"
+        )
+    for workflow in recovery_workflows:
+        payload = copy.deepcopy(workflow)
+        workflow_sha = payload.pop("workflow_sha256", None)
+        evaluation = workflow.get("evaluation_job", {})
+        if (
+            workflow_sha != canonical_sha256(payload)
+            or workflow.get("status") != "success"
+            or workflow.get("training_reused") is not True
+            or workflow.get("training_jobs_submitted") != 0
+            or workflow.get("metric_sanity_gate_passed") is not True
+            or evaluation.get("status") != "Complete"
+            or evaluation.get("nodes") != 1
+            or evaluation.get("gpus") != 8
+            or any(workflow.get("agent_intervention_flags", {}).values())
+        ):
+            raise ManifestGenerationError(
+                "Mask Grounding DINO v5 recovery workflow is invalid"
+            )
+    for workflow in source_workflows:
+        diagnostics = workflow.get("diagnostics", {})
+        if (
+            workflow.get("status") != "failure"
+            or workflow.get("failure_code") != "task_correct_metric_missing"
+            or diagnostics.get("train_job", {}).get("status") != "Complete"
+            or diagnostics.get("evaluation_job", {}).get("status") != "Complete"
+            or not isinstance(
+                diagnostics.get("train_job", {}).get("terminal_checkpoint"),
+                dict,
+            )
+        ):
+            raise ManifestGenerationError(
+                "frozen v3 training workflow is not the expected metric-only failure"
+            )
+    for name, value in (
+        ("v5 contract SHA-256", source_internal),
+        ("v5 evidence SHA-256", evidence_internal),
+        ("v3 evidence SHA-256", training_internal),
+    ):
+        _lower_sha256(value, name)
+    runtime = source["runtime"]
+    return {
+        "schema_version": 2,
+        "kind": "direct_full_gpu_qualification_runtime_local_v2",
+        "enabled": True,
+        "scope": "campaign_local_in_memory_projection",
+        "model": "mask_grounding_dino",
+        "task": "category_prompted_grounded_instance_segmentation",
+        "tao_version": "7.1.0",
+        "container_sha256": campaign_contract.FROZEN_SQSH["sha256"],
+        "base_registry_version": snapshot["registry_version"],
+        "base_registry_sha256": snapshot["registry_sha256"],
+        "qualification_file_sha256": campaign_contract.sha256_file(
+            evidence_path
+        ),
+        "qualification_evidence_sha256": evidence_internal,
+        "qualification_contract_path": str(contract_path),
+        "qualification_contract_file_sha256": (
+            campaign_contract.sha256_file(contract_path)
+        ),
+        "qualification_contract_sha256": source_internal,
+        "qualification_campaign_id": source["campaign_id"],
+        "qualification_campaign_sha256": training[
+            "qualification_campaign_sha256"
+        ],
+        "qualification_successor_version": 5,
+        "training_qualification_path": str(training_path),
+        "training_qualification_file_sha256": (
+            campaign_contract.sha256_file(training_path)
+        ),
+        "training_qualification_evidence_sha256": training_internal,
+        "training_qualification_contract_path": predecessor["contract_path"],
+        "training_qualification_contract_file_sha256": predecessor[
+            "contract_file_sha256"
+        ],
+        "training_qualification_contract_sha256": predecessor[
+            "contract_sha256"
+        ],
+        "evaluation_recovery_jobs_submitted": 4,
+        "training_jobs_submitted": 0,
+        "metric_recovery_overlay_sha256": source["overlay"][
+            "archive_sha256"
+        ],
+        "metric_recovery_source_commit": source["overlay"][
+            "source_commit"
+        ],
+        "replacement_workflows_submitted": True,
+        "replacement_workflow_count": 4,
+        "checkpoint_resume_policy": copy.deepcopy(
+            campaign_contract.CHECKPOINT_RESUME_POLICY
+        ),
+        "predecessor_failure_evidence": copy.deepcopy(
+            training["predecessor_failure_evidence"]
+        ),
+        "ptm_stage_manifest_path": training["ptm_stage_manifest_path"],
+        "ptm_stage_manifest_sha256": training[
+            "ptm_stage_manifest_sha256"
+        ],
+        "ptm_stage_content_sha256": runtime["ptm_stage_content_sha256"],
+        "qualification_source_commit": runtime["source_commit"],
+        "qualification_source_wheel_sha256": runtime["wheel_sha256"],
+        "qualification_source_sdk_commit": runtime["sdk_commit"],
+        "qualification_source_skills_commit": runtime["skills_commit"],
+        "repository_registry_mutation_allowed": False,
+        "failed_arm_promotion_allowed": False,
+        "unsupported_arm_promotion_allowed": False,
+        "agent_override_allowed": False,
+    }
+
+
+def qualification_evidence_record(
+    path: str | Path,
+    qualification_contract: str | Path | None = None,
+) -> dict[str, Any]:
+    """Bind immutable direct-run evidence, including v5 metric recovery."""
     evidence_path = Path(path).resolve()
     if not evidence_path.is_file():
         raise ManifestGenerationError(
             "completed Mask Grounding DINO qualification is unavailable"
         )
     document = json.loads(evidence_path.read_text(encoding="utf-8"))
+    if document.get("campaign_id") == (
+        "mask_grounding_dino-coco2017-coco-metric-recovery-v5-20260802"
+    ):
+        if qualification_contract is None:
+            raise ManifestGenerationError(
+                "v5 qualification contract is required"
+            )
+        contract_path = Path(qualification_contract).resolve()
+        if not contract_path.is_file():
+            raise ManifestGenerationError(
+                "v5 qualification contract is unavailable"
+            )
+        return _successor_qualification_evidence_record(
+            evidence_path, contract_path
+        )
     supplied = document.get("evidence_sha256")
     payload = copy.deepcopy(document)
     payload.pop("evidence_sha256", None)
@@ -511,6 +739,7 @@ def _runtime(
     sdk: Path,
     skills: Path,
     qualification: Path,
+    qualification_contract: Path,
     ptm_stage_manifest: Path,
     text_encoder_stage: Path,
     predecessor_qualification: Path,
@@ -585,7 +814,9 @@ def _runtime(
             "preserved v1 qualification is not the sealed four-arm failure"
         )
     source_commit = _git(repository, "rev-parse", "HEAD")
-    eligibility = qualification_evidence_record(qualification)
+    eligibility = qualification_evidence_record(
+        qualification, qualification_contract
+    )
     eligibility.update(
         {
             "eligibility_source_commit": source_commit,
@@ -627,6 +858,12 @@ def _runtime(
             text_encoder["offline_runtime"]
         ),
         "qualification_evidence_path": str(qualification.resolve()),
+        "qualification_contract_path": str(
+            qualification_contract.resolve()
+        ),
+        "qualification_contract_file_sha256": eligibility.get(
+            "qualification_contract_file_sha256"
+        ),
         "runtime_local_eligibility": eligibility,
         "predecessor_failure_evidence": copy.deepcopy(
             eligibility["predecessor_failure_evidence"]
@@ -661,6 +898,7 @@ def build_contract(
         DEFAULT_CONTIGUOUS_VALIDATION_MANIFEST
     ),
     qualification: str | Path = DEFAULT_QUALIFICATION,
+    qualification_contract: str | Path = DEFAULT_QUALIFICATION_CONTRACT,
     ptm_stage_manifest: str | Path = DEFAULT_PTM_STAGE_MANIFEST,
     text_encoder_stage: str | Path = DEFAULT_TEXT_ENCODER_STAGE,
     predecessor_qualification: str | Path = (
@@ -670,7 +908,7 @@ def build_contract(
     repository_path = Path(repository).resolve()
     value = campaign_contract.build_preregistered_contract(
         campaign_id=(
-            "mask_grounding_dino-coco2017-objective-aware-three-mode-v4-20260801"
+            "mask_grounding_dino-coco2017-objective-aware-three-mode-v5-20260803"
         ),
         dataset=dataset_record(
             dataset_manifest,
@@ -687,6 +925,7 @@ def build_contract(
             sdk=Path(sdk).resolve(),
             skills=Path(skills).resolve(),
             qualification=Path(qualification),
+            qualification_contract=Path(qualification_contract),
             ptm_stage_manifest=Path(ptm_stage_manifest),
             text_encoder_stage=Path(text_encoder_stage),
             predecessor_qualification=Path(predecessor_qualification),
@@ -755,6 +994,11 @@ def main(argv: list[str] | None = None) -> int:
         "--qualification", type=Path, default=DEFAULT_QUALIFICATION
     )
     parser.add_argument(
+        "--qualification-contract",
+        type=Path,
+        default=DEFAULT_QUALIFICATION_CONTRACT,
+    )
+    parser.add_argument(
         "--predecessor-qualification",
         type=Path,
         default=DEFAULT_PREDECESSOR_QUALIFICATION,
@@ -777,6 +1021,7 @@ def main(argv: list[str] | None = None) -> int:
             args.contiguous_validation_manifest
         ),
         qualification=args.qualification,
+        qualification_contract=args.qualification_contract,
         ptm_stage_manifest=args.ptm_stage_manifest,
         text_encoder_stage=args.text_encoder_stage,
         predecessor_qualification=args.predecessor_qualification,

@@ -79,9 +79,10 @@ class QualifiedPTM:
     terminal_checkpoint_path: str
     terminal_checkpoint_sha256: str
     terminal_checkpoint_size_bytes: int
-    val_mask_ap: float
+    val_mask_ap: float | None
     standalone_mask_ap: float
     workflow_sha256: str
+    metric_evidence_kind: str = "in_epoch_and_standalone"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -95,6 +96,7 @@ class QualifiedPTM:
             "val_mask_ap": self.val_mask_ap,
             "standalone_mask_ap": self.standalone_mask_ap,
             "workflow_sha256": self.workflow_sha256,
+            "metric_evidence_kind": self.metric_evidence_kind,
         }
 
 
@@ -271,6 +273,119 @@ def _successful_workflow(
     )
 
 
+def _validated_json_with_digest(
+    path: Path,
+    *,
+    digest_field: str,
+    name: str,
+) -> dict[str, Any]:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise QualificationGateError(f"{name} is unavailable or invalid") from exc
+    payload = copy.deepcopy(document)
+    supplied = payload.pop(digest_field, None)
+    if supplied != canonical_sha256(payload):
+        raise QualificationGateError(f"{name} integrity failed")
+    return document
+
+
+def _recovered_workflow(
+    *,
+    checkpoint_id: str,
+    training_workflow: Mapping[str, Any],
+    recovery_workflow: Mapping[str, Any],
+    registry_record: Mapping[str, Any],
+    overlay_sha256: str,
+) -> QualifiedPTM:
+    """Combine immutable v3 training with its corrected v5 evaluation."""
+    training_payload = copy.deepcopy(dict(training_workflow))
+    training_sha = training_payload.pop("workflow_sha256", None)
+    recovery_payload = copy.deepcopy(dict(recovery_workflow))
+    recovery_sha = recovery_payload.pop("workflow_sha256", None)
+    diagnostics = training_workflow.get("diagnostics", {})
+    train = diagnostics.get("train_job", {})
+    failed_evaluation = diagnostics.get("evaluation_job", {})
+    evaluation = recovery_workflow.get("evaluation_job", {})
+    source_flags = diagnostics.get("agent_intervention_flags", {})
+    recovery_flags = recovery_workflow.get("agent_intervention_flags", {})
+    if (
+        training_sha != canonical_sha256(training_payload)
+        or recovery_sha != canonical_sha256(recovery_payload)
+        or training_workflow.get("checkpoint_id") != checkpoint_id
+        or training_workflow.get("status") != "failure"
+        or training_workflow.get("failure_code")
+        != "task_correct_metric_missing"
+        or training_workflow.get("terminal") is not True
+        or training_workflow.get("failure_preserved") is not True
+        or train.get("status") != "Complete"
+        or train.get("nodes") != 1
+        or train.get("gpus") != 8
+        or failed_evaluation.get("status") != "Complete"
+        or failed_evaluation.get("nodes") != 1
+        or failed_evaluation.get("gpus") != 8
+        or source_flags != {name: False for name in AGENT_FLAGS}
+        or recovery_workflow.get("checkpoint_id") != checkpoint_id
+        or recovery_workflow.get("status") != "success"
+        or recovery_workflow.get("training_reused") is not True
+        or recovery_workflow.get("training_jobs_submitted") != 0
+        or recovery_workflow.get("metric_sanity_gate_passed") is not True
+        or recovery_workflow.get("source_train_job_id") != train.get("tao_job_id")
+        or recovery_workflow.get("failed_evaluation_job_id")
+        != failed_evaluation.get("tao_job_id")
+        or recovery_flags != {name: False for name in AGENT_FLAGS}
+        or evaluation.get("status") != "Complete"
+        or evaluation.get("nodes") != 1
+        or evaluation.get("gpus") != 8
+        or evaluation.get("overlay_sha256") != overlay_sha256
+    ):
+        raise QualificationGateError(
+            f"{checkpoint_id} v3/v5 qualification chain is invalid"
+        )
+    source_path, source_sha, source_size = _artifact(
+        diagnostics.get("source_checkpoint"),
+        name=f"{checkpoint_id}.source_checkpoint",
+        expected_size=int(registry_record["expected_size_bytes"]),
+    )
+    checkpoint_path, checkpoint_sha, checkpoint_size = _artifact(
+        train.get("terminal_checkpoint"),
+        name=f"{checkpoint_id}.terminal_checkpoint",
+    )
+    if recovery_workflow.get("terminal_checkpoint") != train.get(
+        "terminal_checkpoint"
+    ):
+        raise QualificationGateError(
+            f"{checkpoint_id} v5 evaluation changed the v3 terminal checkpoint"
+        )
+    standalone_mask_ap = _metric(
+        recovery_workflow.get("segm_val_mAP50_95"),
+        f"{checkpoint_id}.recovered.segm_val_mAP50_95",
+    )
+    if standalone_mask_ap < FROZEN_VALIDATION_SANITY_MIN_MASK_AP:
+        raise QualificationGateError(
+            f"{checkpoint_id} is below the preregistered 0.05 COCO mask "
+            "AP50-95 experiment sanity gate"
+        )
+    return QualifiedPTM(
+        checkpoint_id=checkpoint_id,
+        source_checkpoint_path=source_path,
+        source_checkpoint_sha256=source_sha,
+        source_checkpoint_size_bytes=source_size,
+        terminal_checkpoint_path=checkpoint_path,
+        terminal_checkpoint_sha256=checkpoint_sha,
+        terminal_checkpoint_size_bytes=checkpoint_size,
+        val_mask_ap=None,
+        standalone_mask_ap=standalone_mask_ap,
+        workflow_sha256=canonical_sha256(
+            {
+                "training_workflow_sha256": training_sha,
+                "recovery_workflow_sha256": recovery_sha,
+            }
+        ),
+        metric_evidence_kind="v3_training_plus_v5_standalone_recovery",
+    )
+
+
 def _runtime_local_policy(
     expected_contract: Mapping[str, Any] | None,
 ) -> Mapping[str, Any] | None:
@@ -320,6 +435,62 @@ def _runtime_local_policy(
         ):
             raise QualificationGateError(
                 f"runtime_local_eligibility.{name} must be a Git commit"
+            )
+    if value.get("qualification_successor_version") == 5:
+        for name in (
+            "qualification_contract_file_sha256",
+            "training_qualification_file_sha256",
+            "training_qualification_evidence_sha256",
+            "training_qualification_contract_file_sha256",
+            "training_qualification_contract_sha256",
+            "ptm_stage_manifest_sha256",
+            "ptm_stage_content_sha256",
+            "qualification_source_wheel_sha256",
+            "metric_recovery_overlay_sha256",
+        ):
+            _sha(value.get(name), f"runtime_local_eligibility.{name}")
+        for name in (
+            "qualification_contract_path",
+            "training_qualification_path",
+            "training_qualification_contract_path",
+            "ptm_stage_manifest_path",
+        ):
+            path = value.get(name)
+            if not isinstance(path, str) or not Path(path).is_absolute():
+                raise QualificationGateError(
+                    f"runtime_local_eligibility.{name} must be absolute"
+                )
+        for name in (
+            "qualification_source_commit",
+            "qualification_source_sdk_commit",
+            "qualification_source_skills_commit",
+            "metric_recovery_source_commit",
+        ):
+            commit = value.get(name)
+            if (
+                not isinstance(commit, str)
+                or len(commit) != 40
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in commit
+                )
+            ):
+                raise QualificationGateError(
+                    f"runtime_local_eligibility.{name} must be a Git commit"
+                )
+        if (
+            value.get("evaluation_recovery_jobs_submitted") != 4
+            or value.get("training_jobs_submitted") != 0
+            or value.get("replacement_workflows_submitted") is not True
+            or value.get("replacement_workflow_count") != 4
+            or value.get("checkpoint_resume_policy")
+            != CHECKPOINT_RESUME_POLICY
+            or not isinstance(
+                value.get("predecessor_failure_evidence"), Mapping
+            )
+        ):
+            raise QualificationGateError(
+                "sealed v5 evaluation-recovery policy is invalid"
             )
     return value
 
@@ -440,6 +611,7 @@ def _project_runtime_registry(
             "base repository registry changed during projection"
         )
     eligibility = {
+        **copy.deepcopy(dict(policy)),
         "schema_version": 2,
         "kind": "direct_full_gpu_qualification_runtime_local_v2",
         "scope": "campaign_local_in_memory_projection",
@@ -488,6 +660,294 @@ def _project_runtime_registry(
     return projected, eligibility
 
 
+def _audit_v5_recovery(
+    *,
+    evidence_path: Path,
+    document: Mapping[str, Any],
+    supplied_sha: str,
+    expected_contract: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    registry: PTMRegistry,
+    snapshot: Mapping[str, Any],
+) -> QualificationDecision:
+    """Audit evaluator-only recovery without weakening v3 training provenance."""
+    contract_path = Path(policy["qualification_contract_path"])
+    training_path = Path(policy["training_qualification_path"])
+    training_contract_path = Path(
+        policy["training_qualification_contract_path"]
+    )
+    stage_path = Path(policy["ptm_stage_manifest_path"])
+    if (
+        policy["qualification_file_sha256"] != sha256_file(evidence_path)
+        or policy["qualification_evidence_sha256"] != supplied_sha
+        or expected_contract.get("runtime", {}).get(
+            "qualification_contract_path"
+        )
+        != str(contract_path)
+        or expected_contract.get("runtime", {}).get(
+            "qualification_contract_file_sha256"
+        )
+        != policy["qualification_contract_file_sha256"]
+    ):
+        raise QualificationGateError(
+            "v5 recovery is not bound to the sealed campaign contract"
+        )
+    for path, expected_sha, name in (
+        (
+            contract_path,
+            policy["qualification_contract_file_sha256"],
+            "v5 qualification contract",
+        ),
+        (
+            training_path,
+            policy["training_qualification_file_sha256"],
+            "v3 training completion",
+        ),
+        (
+            training_contract_path,
+            policy["training_qualification_contract_file_sha256"],
+            "v3 training contract",
+        ),
+        (
+            stage_path,
+            policy["ptm_stage_manifest_sha256"],
+            "PTM stage manifest",
+        ),
+    ):
+        if not path.is_file() or sha256_file(path) != expected_sha:
+            raise QualificationGateError(f"sealed {name} changed")
+    recovery_contract = _validated_json_with_digest(
+        contract_path,
+        digest_field="contract_sha256",
+        name="v5 qualification contract",
+    )
+    training = _validated_json_with_digest(
+        training_path,
+        digest_field="evidence_sha256",
+        name="v3 training completion",
+    )
+    training_contract = _validated_json_with_digest(
+        training_contract_path,
+        digest_field="contract_sha256",
+        name="v3 training contract",
+    )
+    predecessor = recovery_contract.get("predecessor", {})
+    recovery_execution = recovery_contract.get("execution", {})
+    training_policy = training_contract.get("qualification_policy", {})
+    if (
+        recovery_contract.get("contract_sha256")
+        != policy["qualification_contract_sha256"]
+        or recovery_contract.get("campaign_id")
+        != policy["qualification_campaign_id"]
+        or recovery_contract.get("model") != "mask_grounding_dino"
+        or recovery_contract.get("task")
+        != "category_prompted_grounded_instance_segmentation"
+        or recovery_contract.get("primary_metric") != "segm_val_mAP50_95"
+        or recovery_contract.get("sqsh") != FROZEN_SQSH
+        or recovery_contract.get("overlay", {}).get("archive_sha256")
+        != policy["metric_recovery_overlay_sha256"]
+        or recovery_contract.get("overlay", {}).get("source_commit")
+        != policy["metric_recovery_source_commit"]
+        or recovery_execution.get("scope")
+        != "standalone_full_validation_only"
+        or recovery_execution.get("training_jobs_submitted") != 0
+        or recovery_execution.get("evaluation_jobs_expected") != 4
+        or recovery_execution.get("nodes_per_job") != 1
+        or recovery_execution.get("gpus_per_job") != 8
+        or recovery_execution.get("cpu_model_runs") != 0
+        or recovery_execution.get("smoke_model_runs") != 0
+        or recovery_execution.get("mini_step_runs") != 0
+        or recovery_execution.get("selection_invoked") is not False
+        or recovery_execution.get("validation_measurements_feed_selection")
+        is not False
+        or any(recovery_contract.get("agent_intervention_flags", {}).values())
+        or predecessor.get("completion_path") != str(training_path)
+        or predecessor.get("completion_file_sha256")
+        != policy["training_qualification_file_sha256"]
+        or predecessor.get("evidence_sha256")
+        != policy["training_qualification_evidence_sha256"]
+        or predecessor.get("contract_path") != str(training_contract_path)
+        or predecessor.get("contract_file_sha256")
+        != policy["training_qualification_contract_file_sha256"]
+        or predecessor.get("contract_sha256")
+        != policy["training_qualification_contract_sha256"]
+        or training.get("evidence_sha256")
+        != policy["training_qualification_evidence_sha256"]
+        or training.get("qualification_contract_sha256")
+        != policy["training_qualification_contract_sha256"]
+        or training.get("qualification_campaign_sha256")
+        != policy["qualification_campaign_sha256"]
+        or training.get("registry_sha256") != policy["base_registry_sha256"]
+        or training.get("ptm_stage_manifest_path") != str(stage_path)
+        or training.get("ptm_stage_manifest_sha256")
+        != policy["ptm_stage_manifest_sha256"]
+        or training.get("replacement_workflows_submitted") is not True
+        or training.get("replacement_workflow_count") != 4
+        or training.get("checkpoint_resume_policy")
+        != CHECKPOINT_RESUME_POLICY
+        or training.get("predecessor_failure_evidence")
+        != policy["predecessor_failure_evidence"]
+        or training_contract.get("contract_sha256")
+        != policy["training_qualification_contract_sha256"]
+        or training_contract.get("campaign_id") != training.get("campaign_id")
+        or training_contract.get("sqsh") != FROZEN_SQSH
+        or training_policy.get("full_dataset") is not True
+        or training_policy.get("training_epochs") != FROZEN_TRAINING_EPOCHS
+        or training_policy.get("standalone_evaluation") is not True
+        or training_policy.get("nodes_per_job") != 1
+        or training_policy.get("gpus_per_job") != 8
+        or training_policy.get("checkpoint_resume_policy")
+        != CHECKPOINT_RESUME_POLICY
+    ):
+        raise QualificationGateError(
+            "v5 recovery or its v3 training provenance changed"
+        )
+    if (
+        document.get("campaign_id") != recovery_contract.get("campaign_id")
+        or document.get("contract_sha256")
+        != recovery_contract.get("contract_sha256")
+        or document.get("model") != "mask_grounding_dino"
+        or document.get("task")
+        != "category_prompted_grounded_instance_segmentation"
+        or document.get("primary_metric") != "segm_val_mAP50_95"
+        or document.get("overlay") != recovery_contract.get("overlay")
+        or document.get("predecessor") != predecessor
+        or document.get("training_jobs_submitted") != 0
+        or document.get("evaluation_jobs_submitted") != 4
+        or document.get("evaluations_submitted_concurrently") is not True
+        or any(document.get(name) != 0 for name in (
+            "cpu_model_runs", "smoke_model_runs", "mini_step_runs"
+        ))
+        or document.get("selection_invoked") is not False
+        or document.get("validation_measurements_feed_selection") is not False
+        or document.get("agent_intervention_flags")
+        != {name: False for name in AGENT_FLAGS}
+    ):
+        raise QualificationGateError(
+            "v5 recovery completion execution policy changed"
+        )
+    try:
+        stage = json.loads(stage_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise QualificationGateError("sealed PTM stage is invalid") from exc
+    stage_by_id = {
+        item.get("id"): item
+        for item in stage.get("checkpoints", [])
+        if isinstance(item, Mapping)
+    }
+    training_by_id = {
+        item.get("checkpoint_id"): item
+        for item in training.get("workflows", [])
+        if isinstance(item, Mapping)
+    }
+    recovery_by_id = {
+        item.get("checkpoint_id"): item
+        for item in document.get("workflows", [])
+        if isinstance(item, Mapping)
+    }
+    expected_ids = tuple(item["id"] for item in snapshot["records"])
+    if (
+        set(stage_by_id) != set(expected_ids)
+        or set(training_by_id) != set(expected_ids)
+        or set(recovery_by_id) != set(expected_ids)
+        or len(training.get("workflows", [])) != len(expected_ids)
+        or len(document.get("workflows", [])) != len(expected_ids)
+    ):
+        raise QualificationGateError(
+            "v5 recovery must preserve exactly one workflow per official PTM"
+        )
+    qualified: list[QualifiedPTM] = []
+    blockers: list[dict[str, Any]] = []
+    for checkpoint_id in expected_ids:
+        record = registry.checkpoint(checkpoint_id)
+        try:
+            item = _recovered_workflow(
+                checkpoint_id=checkpoint_id,
+                training_workflow=training_by_id[checkpoint_id],
+                recovery_workflow=recovery_by_id[checkpoint_id],
+                registry_record=record,
+                overlay_sha256=policy["metric_recovery_overlay_sha256"],
+            )
+        except QualificationGateError as exc:
+            blockers.append(
+                {
+                    "checkpoint_id": checkpoint_id,
+                    "code": "invalid_v5_recovery_evidence",
+                    "reason": str(exc),
+                }
+            )
+            continue
+        staged = stage_by_id[checkpoint_id]
+        if (
+            staged.get("path") != item.source_checkpoint_path
+            or staged.get("size_bytes") != item.source_checkpoint_size_bytes
+            or staged.get("sha256") != item.source_checkpoint_sha256
+        ):
+            blockers.append(
+                {
+                    "checkpoint_id": checkpoint_id,
+                    "code": "qualification_source_not_in_sealed_stage",
+                    "reason": "v3 source checkpoint differs from sealed PTM stage",
+                }
+            )
+        elif record.get("status") == "unsupported":
+            blockers.append(
+                {
+                    "checkpoint_id": checkpoint_id,
+                    "code": "registry_explicitly_unsupported",
+                    "reason": "unsupported PTMs cannot enter the projection",
+                }
+            )
+        elif record.get("sha256") not in (
+            None,
+            item.source_checkpoint_sha256,
+        ):
+            blockers.append(
+                {
+                    "checkpoint_id": checkpoint_id,
+                    "code": "qualified_checkpoint_registry_sha_mismatch",
+                    "reason": "repository and sealed source checksums differ",
+                }
+            )
+        else:
+            qualified.append(item)
+    if not qualified:
+        blockers.append(
+            {
+                "checkpoint_id": None,
+                "code": "no_runtime_qualified_ptm",
+                "reason": "no v3/v5 qualification chain passed",
+            }
+        )
+    runtime_registry, runtime_eligibility = _project_runtime_registry(
+        base_registry=registry,
+        successful=tuple(qualified),
+        evidence_path=evidence_path,
+        evidence_sha256=supplied_sha,
+        policy=policy,
+    )
+    payload = {
+        "evidence_path": str(evidence_path),
+        "evidence_sha256": supplied_sha,
+        "qualification_campaign_id": document.get("campaign_id"),
+        "qualified": [item.to_dict() for item in qualified],
+        "exclusions": [],
+        "blockers": blockers,
+        "runtime_eligibility": runtime_eligibility,
+    }
+    return QualificationDecision(
+        evidence_path=str(evidence_path),
+        evidence_sha256=supplied_sha,
+        qualification_campaign_id=str(document.get("campaign_id", "")),
+        qualified=tuple(qualified),
+        exclusions=(),
+        blockers=tuple(blockers),
+        runtime_eligibility=runtime_eligibility,
+        decision_sha256=canonical_sha256(payload),
+        runtime_registry=runtime_registry,
+    )
+
+
 def audit_qualification(
     path: str | Path,
     *,
@@ -507,6 +967,20 @@ def audit_qualification(
     policy = _runtime_local_policy(expected_contract)
     registry = load_ptm_registry()
     snapshot = mask_grounding_dino_registry_snapshot()
+    if policy is not None and policy.get("qualification_successor_version") == 5:
+        if expected_contract is None:
+            raise QualificationGateError(
+                "v5 recovery requires a sealed campaign contract"
+            )
+        return _audit_v5_recovery(
+            evidence_path=evidence_path,
+            document=document,
+            supplied_sha=supplied_sha,
+            expected_contract=expected_contract,
+            policy=policy,
+            registry=registry,
+            snapshot=snapshot,
+        )
     evidence_registry_sha = document.get("registry_sha256")
     for name in (
         "qualification_contract_sha256",

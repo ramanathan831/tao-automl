@@ -1,8 +1,14 @@
 """Contract tests for evaluator-only Mask Grounding DINO recovery."""
 
+import copy
 import json
 
-from . import metric_recovery_campaign as recovery
+import pytest
+
+from tao_automl.ptm_registry import canonical_sha256
+
+from . import manifest_generator, metric_recovery_campaign as recovery
+from .qualification_gate import QualificationGateError, audit_qualification
 
 
 def test_frozen_predecessor_yields_exact_four_checkpoint_cohort():
@@ -123,3 +129,87 @@ def test_sdk_state_directory_exists_before_database_construction(tmp_path):
         "poll_interval": 10,
         "state_file": workflow_dir / "slurm_state.json",
     }
+
+
+def test_v5_recovery_is_bound_to_v3_training_and_projects_all_ptms(
+    monkeypatch,
+):
+    real_git = manifest_generator._git
+
+    def clean_git(repository, *arguments):
+        if arguments == ("status", "--porcelain"):
+            return ""
+        return real_git(repository, *arguments)
+
+    monkeypatch.setattr(manifest_generator, "_git", clean_git)
+    contract = manifest_generator.build_contract()
+    decision = audit_qualification(
+        manifest_generator.DEFAULT_QUALIFICATION,
+        expected_contract=contract,
+    )
+
+    assert decision.runtime_ready is True
+    assert len(decision.qualified) == 4
+    assert decision.blockers == ()
+    assert all(
+        item.val_mask_ap is None
+        and item.standalone_mask_ap >= 0.05
+        and item.metric_evidence_kind
+        == "v3_training_plus_v5_standalone_recovery"
+        for item in decision.qualified
+    )
+    assert decision.runtime_eligibility[
+        "qualification_successor_version"
+    ] == 5
+    assert decision.runtime_eligibility["training_jobs_submitted"] == 0
+    assert decision.runtime_eligibility[
+        "evaluation_recovery_jobs_submitted"
+    ] == 4
+
+
+def test_v5_recovery_rejects_changed_metric(tmp_path):
+    evidence = json.loads(
+        manifest_generator.DEFAULT_QUALIFICATION.read_text(encoding="utf-8")
+    )
+    evidence["workflows"][0]["segm_val_mAP50_95"] = 0.99
+    changed = tmp_path / "completion.json"
+    changed.write_text(json.dumps(evidence), encoding="utf-8")
+
+    with pytest.raises(
+        manifest_generator.ManifestGenerationError,
+        match="identity changed",
+    ):
+        manifest_generator.qualification_evidence_record(
+            changed,
+            manifest_generator.DEFAULT_QUALIFICATION_CONTRACT,
+        )
+
+
+def test_v5_contract_rejects_changed_training_provenance(monkeypatch):
+    real_git = manifest_generator._git
+
+    def clean_git(repository, *arguments):
+        if arguments == ("status", "--porcelain"):
+            return ""
+        return real_git(repository, *arguments)
+
+    monkeypatch.setattr(manifest_generator, "_git", clean_git)
+    contract = manifest_generator.build_contract()
+    changed = copy.deepcopy(contract)
+    changed.pop("contract_sha256")
+    changed["runtime"]["runtime_local_eligibility"][
+        "training_qualification_file_sha256"
+    ] = "0" * 64
+    changed["qualification_policy"]["runtime_local_eligibility"] = copy.deepcopy(
+        changed["runtime"]["runtime_local_eligibility"]
+    )
+    changed["contract_sha256"] = canonical_sha256(changed)
+
+    with pytest.raises(
+        QualificationGateError,
+        match="training completion changed",
+    ):
+        audit_qualification(
+            manifest_generator.DEFAULT_QUALIFICATION,
+            expected_contract=changed,
+        )
