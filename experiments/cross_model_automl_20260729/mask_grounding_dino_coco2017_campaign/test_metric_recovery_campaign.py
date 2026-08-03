@@ -142,13 +142,20 @@ def test_v5_recovery_is_bound_to_v3_training_and_projects_all_ptms(
         return real_git(repository, *arguments)
 
     monkeypatch.setattr(manifest_generator, "_git", clean_git)
+    monkeypatch.setattr(recovery.run_campaign, "_git", clean_git)
     contract = manifest_generator.build_contract()
+    local = recovery.run_campaign.verify_local_contract(contract)
     decision = audit_qualification(
         manifest_generator.DEFAULT_QUALIFICATION,
         expected_contract=contract,
     )
 
     assert decision.runtime_ready is True
+    assert local["artifacts"]["predecessor_qualification"]["sha256"] == (
+        contract["runtime"]["predecessor_failure_evidence"][
+            "file_sha256"
+        ]
+    )
     assert len(decision.qualified) == 4
     assert decision.blockers == ()
     assert all(

@@ -368,7 +368,10 @@ def verify_local_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "predecessor_qualification": (
             runtime["predecessor_failure_evidence"]["path"],
-            runtime["predecessor_failure_evidence"]["sha256"],
+            runtime["predecessor_failure_evidence"].get(
+                "file_sha256",
+                runtime["predecessor_failure_evidence"].get("sha256"),
+            ),
         ),
         "qualification_evidence": (
             runtime["qualification_evidence_path"],
