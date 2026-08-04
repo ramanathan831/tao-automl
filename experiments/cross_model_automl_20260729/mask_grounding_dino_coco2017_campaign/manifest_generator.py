@@ -7,11 +7,14 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import sqlite3
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from tao_automl.ptm_registry import canonical_sha256
+from tao_automl.selection import canonical_spec_fingerprint
 
 from . import campaign_contract
 
@@ -456,6 +459,160 @@ def resume_predecessor_record(path: str | Path) -> dict[str, Any]:
         "training_relaunch_allowed": False,
         "objective_policy_change_allowed": False,
     }
+
+
+def first_candidate_training_reuse_record(
+    predecessor_contract: str | Path,
+    predecessor_runtime_root: str | Path,
+) -> dict[str, Any]:
+    """Bind the exact completed rec-0 training jobs for a clean successor."""
+    contract_path = Path(predecessor_contract).resolve()
+    runtime_root = Path(predecessor_runtime_root).resolve()
+    try:
+        predecessor = json.loads(contract_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ManifestGenerationError(
+            "first-candidate predecessor contract is unavailable or invalid"
+        ) from exc
+    payload = copy.deepcopy(predecessor)
+    predecessor_sha256 = payload.pop("contract_sha256", None)
+    if (
+        predecessor_sha256 != canonical_sha256(payload)
+        or predecessor.get("model") != "mask_grounding_dino"
+        or predecessor.get("campaign_id")
+        != "mask_grounding_dino-coco2017-objective-aware-three-mode-v5-20260803"
+        or any(predecessor.get("agent_intervention_flags", {}).values())
+    ):
+        raise ManifestGenerationError(
+            "first-candidate predecessor is not the frozen MGD campaign"
+        )
+
+    modes: dict[str, Any] = {}
+    for mode in campaign_contract.MODES:
+        mode_root = runtime_root / mode
+        evidence_path = mode_root / "candidate_evidence.json"
+        state_db = mode_root / "slurm_state.db"
+        try:
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ManifestGenerationError(
+                f"{mode} predecessor candidate evidence is unavailable"
+            ) from exc
+        candidates = evidence.get("candidates")
+        candidate_id = f"{mode}_rec_0"
+        candidate = (
+            candidates.get(candidate_id)
+            if isinstance(candidates, Mapping)
+            else None
+        )
+        if (
+            evidence.get("contract_sha256") != predecessor_sha256
+            or evidence.get("mode") != mode
+            or not isinstance(candidate, Mapping)
+            or candidate.get("rec_id") != "0"
+            or candidate.get("status") != "terminal_failure"
+            or candidate.get("automl_status") != "failure"
+            or not str(candidate.get("failure_reason", "")).startswith(
+                "required_eval_fn_failed:latency job "
+            )
+            or not isinstance(candidate.get("terminal_checkpoint"), Mapping)
+            or not isinstance(candidate.get("specs"), Mapping)
+            or candidate.get("candidate_fingerprint")
+            != canonical_spec_fingerprint(candidate["specs"])
+            or not isinstance(candidate.get("train_job_id"), str)
+        ):
+            raise ManifestGenerationError(
+                f"{mode} rec-0 is not the expected latency-only failure"
+            )
+        later = [
+            value
+            for key, value in candidates.items()
+            if key != candidate_id
+        ]
+        if any(
+            not isinstance(value, Mapping)
+            or value.get("status") not in {"terminal_failure", "recommended"}
+            or "objective_values" in value
+            for value in later
+        ):
+            raise ManifestGenerationError(
+                f"{mode} contains an observation that cannot be discarded"
+            )
+        if not state_db.is_file():
+            raise ManifestGenerationError(
+                f"{mode} predecessor SLURM state is unavailable"
+            )
+        with sqlite3.connect(state_db) as connection:
+            row = connection.execute(
+                "SELECT status, results_dir FROM jobs WHERE job_id = ?",
+                (candidate["train_job_id"],),
+            ).fetchone()
+        if row is None or row[0] != "Complete":
+            raise ManifestGenerationError(
+                f"{mode} rec-0 training job is not durably complete"
+            )
+        results_dir = str(row[1])
+        results_path = (
+            results_dir.removeprefix("lustre://")
+            if results_dir.startswith("lustre://")
+            else results_dir
+        )
+        checkpoint = dict(candidate["terminal_checkpoint"])
+        if (
+            not checkpoint.get("path", "").startswith(
+                results_path.rstrip("/") + "/"
+            )
+            or not isinstance(checkpoint.get("size_bytes"), int)
+            or checkpoint["size_bytes"] < 1
+            or not isinstance(checkpoint.get("sha256"), str)
+            or len(checkpoint["sha256"]) != 64
+        ):
+            raise ManifestGenerationError(
+                f"{mode} rec-0 checkpoint is outside its training job"
+            )
+        modes[mode] = {
+            "candidate_id": candidate_id,
+            "rec_id": "0",
+            "candidate_fingerprint": candidate["candidate_fingerprint"],
+            "checkpoint_id": candidate["checkpoint_id"],
+            "specs_sha256": canonical_sha256(candidate["specs"]),
+            "recommendation_audit_sha256": candidate[
+                "recommendation_audit"
+            ]["audit_sha256"],
+            "source_train_job_id": candidate["train_job_id"],
+            "source_results_dir": results_dir,
+            "terminal_checkpoint": checkpoint,
+            "source_state_file": str((mode_root / "slurm_state.json").resolve()),
+            "source_state_db": str(state_db.resolve()),
+            "source_state_db_sha256": campaign_contract.sha256_file(state_db),
+            "source_candidate_evidence": str(evidence_path.resolve()),
+            "source_candidate_evidence_sha256": campaign_contract.sha256_file(
+                evidence_path
+            ),
+            "discarded_non_observations": len(later),
+        }
+    value = {
+        "schema_version": 1,
+        "kind": "first_candidate_completed_training_reuse",
+        "source_contract": {
+            "path": str(contract_path),
+            "file_sha256": campaign_contract.sha256_file(contract_path),
+            "contract_sha256": predecessor_sha256,
+            "source_commit": predecessor["runtime"]["source_commit"],
+        },
+        "source_runtime_root": str(runtime_root),
+        "modes": modes,
+        "fresh_controller_state_required": True,
+        "training_relaunch_allowed": False,
+        "objective_reuse_allowed": False,
+        "evaluation_reuse_allowed": False,
+        "latency_reuse_allowed": False,
+        "new_training_jobs_submitted": 0,
+        "agent_selected_candidate": False,
+        "agent_overrode_observation": False,
+    }
+    value["record_sha256"] = canonical_sha256(value)
+    return value
 
 
 def _successor_qualification_evidence_record(
@@ -964,6 +1121,8 @@ def build_contract(
         DEFAULT_PREDECESSOR_QUALIFICATION
     ),
     resume_predecessor_contract: str | Path | None = None,
+    first_candidate_reuse_root: str | Path | None = None,
+    first_candidate_reuse_contract: str | Path | None = None,
 ) -> dict[str, Any]:
     repository_path = Path(repository).resolve()
     runtime = _runtime(
@@ -991,6 +1150,23 @@ def build_contract(
         # a new PTM-preflight identity or search configuration.
         runtime["runtime_local_eligibility"] = copy.deepcopy(
             predecessor_document["runtime"]["runtime_local_eligibility"]
+        )
+    if (first_candidate_reuse_root is None) != (
+        first_candidate_reuse_contract is None
+    ):
+        raise ManifestGenerationError(
+            "first-candidate reuse root and contract must be supplied together"
+        )
+    if first_candidate_reuse_root is not None:
+        if resume_predecessor_contract is not None:
+            raise ManifestGenerationError(
+                "workspace resume and fresh first-candidate reuse conflict"
+            )
+        runtime["first_candidate_training_reuse"] = (
+            first_candidate_training_reuse_record(
+                first_candidate_reuse_contract,
+                first_candidate_reuse_root,
+            )
         )
     value = campaign_contract.build_preregistered_contract(
         campaign_id=(
@@ -1093,6 +1269,18 @@ def main(argv: list[str] | None = None) -> int:
             "predecessor AutoML workspaces and training jobs."
         ),
     )
+    parser.add_argument(
+        "--first-candidate-reuse-root",
+        type=Path,
+        default=None,
+        help="Fresh-state successor source containing exact completed rec-0 jobs.",
+    )
+    parser.add_argument(
+        "--first-candidate-reuse-contract",
+        type=Path,
+        default=None,
+        help="Contract that produced the reusable rec-0 training jobs.",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     contract = build_contract(
@@ -1111,6 +1299,8 @@ def main(argv: list[str] | None = None) -> int:
         text_encoder_stage=args.text_encoder_stage,
         predecessor_qualification=args.predecessor_qualification,
         resume_predecessor_contract=args.resume_predecessor_contract,
+        first_candidate_reuse_root=args.first_candidate_reuse_root,
+        first_candidate_reuse_contract=args.first_candidate_reuse_contract,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(

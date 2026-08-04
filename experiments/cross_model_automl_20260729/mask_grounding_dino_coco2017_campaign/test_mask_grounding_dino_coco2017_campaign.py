@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import copy
 import json
+import sqlite3
 import threading
 from functools import lru_cache
 from pathlib import Path
@@ -12,6 +13,7 @@ import pytest
 import yaml
 
 from tao_automl.ptm_registry import canonical_sha256, load_ptm_registry
+from tao_automl.selection import canonical_spec_fingerprint
 
 from . import (
     campaign_contract,
@@ -1318,6 +1320,171 @@ def test_latency_worker_receives_frozen_offline_text_environment(contract):
         "TRANSFORMERS_OFFLINE": "1",
         "TOKENIZERS_PARALLELISM": "false",
     }
+
+
+def _first_candidate_reuse_fixture(
+    tmp_path: Path,
+    contract: dict,
+) -> dict:
+    predecessor = copy.deepcopy(contract)
+    predecessor["campaign_id"] = (
+        "mask_grounding_dino-coco2017-objective-aware-three-mode-v5-20260803"
+    )
+    predecessor["runtime"]["source_commit"] = "a" * 40
+    predecessor.pop("contract_sha256", None)
+    predecessor["contract_sha256"] = canonical_sha256(predecessor)
+    contract_path = tmp_path / "campaign.v7.json"
+    contract_path.write_text(json.dumps(predecessor), encoding="utf-8")
+    root = tmp_path / "runtime"
+    for mode in campaign_contract.MODES:
+        mode_root = root / mode
+        mode_root.mkdir(parents=True)
+        job_id = f"{mode}-train-job"
+        results_dir = f"lustre:///lustre/results/{job_id}"
+        specs = {"train": {"optim": {"lr": 0.0002}}}
+        candidate = {
+            "candidate_id": f"{mode}_rec_0",
+            "rec_id": "0",
+            "status": "terminal_failure",
+            "automl_status": "failure",
+            "failure_reason": "required_eval_fn_failed:latency job failed",
+            "checkpoint_id": "checkpoint-arm",
+            "specs": specs,
+            "candidate_fingerprint": canonical_spec_fingerprint(specs),
+            "recommendation_audit": {"audit_sha256": "b" * 64},
+            "train_job_id": job_id,
+            "terminal_checkpoint": {
+                "path": (
+                    f"/lustre/results/{job_id}/results_dir/train/"
+                    "model_epoch_002_step_00100.pth"
+                ),
+                "filename": "model_epoch_002_step_00100.pth",
+                "size_bytes": 10,
+                "sha256": "c" * 64,
+            },
+        }
+        evidence_path = mode_root / "candidate_evidence.json"
+        evidence_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "contract_sha256": predecessor["contract_sha256"],
+                    "mode": mode,
+                    "candidates": {
+                        f"{mode}_rec_0": candidate,
+                        f"{mode}_rec_1": {
+                            "status": "terminal_failure"
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        state_db = mode_root / "slurm_state.db"
+        with sqlite3.connect(state_db) as connection:
+            connection.execute(
+                "CREATE TABLE jobs (job_id TEXT, status TEXT, results_dir TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO jobs VALUES (?, ?, ?)",
+                (job_id, "Complete", results_dir),
+            )
+    return manifest_generator.first_candidate_training_reuse_record(
+        contract_path, root
+    )
+
+
+def test_first_candidate_reuse_is_exact_completed_training_only(
+    tmp_path: Path,
+    contract,
+):
+    reuse = _first_candidate_reuse_fixture(tmp_path, contract)
+    assert set(reuse["modes"]) == set(campaign_contract.MODES)
+    assert reuse["training_relaunch_allowed"] is False
+    assert reuse["objective_reuse_allowed"] is False
+    assert reuse["evaluation_reuse_allowed"] is False
+    assert reuse["latency_reuse_allowed"] is False
+    assert reuse["new_training_jobs_submitted"] == 0
+    for mode, record in reuse["modes"].items():
+        assert record["candidate_id"] == f"{mode}_rec_0"
+        assert record["discarded_non_observations"] == 1
+
+
+def test_contract_accepts_fresh_first_candidate_training_reuse(
+    tmp_path: Path,
+    contract,
+):
+    value = copy.deepcopy(contract)
+    value["runtime"]["first_candidate_training_reuse"] = (
+        _first_candidate_reuse_fixture(tmp_path, contract)
+    )
+    value.pop("contract_sha256")
+    value["contract_sha256"] = canonical_sha256(value)
+    assert campaign_contract.validate_contract(value) == value
+
+
+def test_first_candidate_training_reuse_sdk_is_one_shot():
+    class FakeSDK:
+        def __init__(self, jobs=None):
+            self.jobs = jobs or {}
+            self.created = []
+
+        def get_job(self, job_id):
+            return self.jobs.get(job_id)
+
+        def create_job(self, *args, **kwargs):
+            self.created.append((args, kwargs))
+            return SimpleNamespace(id="new-job", backend_job_id="new-backend")
+
+    specs = {"model": {"num_select": 100}}
+    fingerprint = canonical_spec_fingerprint(specs)
+    record = {
+        "candidate_fingerprint": fingerprint,
+        "specs_sha256": canonical_sha256(specs),
+        "checkpoint_id": "checkpoint-arm",
+        "source_train_job_id": "source-job",
+        "source_results_dir": "lustre:///lustre/results/source-job",
+        "source_state_db_sha256": "a" * 64,
+        "source_candidate_evidence_sha256": "b" * 64,
+        "terminal_checkpoint": {
+            "path": "/lustre/results/source-job/model_epoch_002_step_1.pth",
+            "sha256": "c" * 64,
+            "size_bytes": 1,
+        },
+    }
+    source = FakeSDK(
+        {
+            "source-job": {
+                "status": "Complete",
+                "results_dir": record["source_results_dir"],
+                "backend_job_id": "source-backend",
+            }
+        }
+    )
+    delegate = FakeSDK()
+    sdk = run_campaign.FirstCandidateTrainingReuseSDK(
+        delegate, source, record
+    )
+    recommendation = SimpleNamespace(
+        id=0,
+        specs=specs,
+        recommendation_audit={
+            "acquisition": {
+                "proposal": {
+                    "ptm": {"arm_id": "checkpoint-arm"}
+                }
+            }
+        },
+    )
+    sdk.arm_first_candidate_training_reuse(recommendation)
+    reused = sdk.create_job(image="sqsh", command="train")
+    fresh = sdk.create_job(image="sqsh", command="train")
+    assert reused.id == "source-job"
+    assert fresh.id == "new-job"
+    assert len(delegate.created) == 1
+    assert sdk.training_reuse_evidence("source-job")[
+        "new_training_job_submitted"
+    ] is False
 
 
 def test_launch_plan_is_automatic_and_does_not_launch(contract):

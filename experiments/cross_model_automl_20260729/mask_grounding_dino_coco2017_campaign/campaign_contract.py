@@ -950,6 +950,91 @@ def validate_contract(document: Mapping[str, Any]) -> dict[str, Any]:
         raise CampaignContractError(
             "evaluator-overlay resume predecessor contract changed"
         )
+    first_candidate_reuse = runtime.get("first_candidate_training_reuse")
+    if first_candidate_reuse is not None:
+        reuse_payload = copy.deepcopy(dict(first_candidate_reuse))
+        reuse_sha256 = reuse_payload.pop("record_sha256", None)
+        source_contract = first_candidate_reuse.get("source_contract", {})
+        reuse_modes = first_candidate_reuse.get("modes")
+        if (
+            resume_predecessor is not None
+            or reuse_sha256 != canonical_sha256(reuse_payload)
+            or first_candidate_reuse.get("schema_version") != 1
+            or first_candidate_reuse.get("kind")
+            != "first_candidate_completed_training_reuse"
+            or not isinstance(source_contract, Mapping)
+            or not isinstance(source_contract.get("path"), str)
+            or not Path(source_contract["path"]).is_absolute()
+            or not _is_lower_sha256(source_contract.get("file_sha256"))
+            or not _is_lower_sha256(source_contract.get("contract_sha256"))
+            or not isinstance(source_contract.get("source_commit"), str)
+            or len(source_contract["source_commit"]) != 40
+            or not isinstance(
+                first_candidate_reuse.get("source_runtime_root"), str
+            )
+            or not Path(
+                first_candidate_reuse["source_runtime_root"]
+            ).is_absolute()
+            or set(reuse_modes or {}) != set(MODES)
+            or first_candidate_reuse.get("fresh_controller_state_required")
+            is not True
+            or first_candidate_reuse.get("training_relaunch_allowed")
+            is not False
+            or first_candidate_reuse.get("objective_reuse_allowed") is not False
+            or first_candidate_reuse.get("evaluation_reuse_allowed") is not False
+            or first_candidate_reuse.get("latency_reuse_allowed") is not False
+            or first_candidate_reuse.get("new_training_jobs_submitted") != 0
+            or first_candidate_reuse.get("agent_selected_candidate") is not False
+            or first_candidate_reuse.get("agent_overrode_observation") is not False
+        ):
+            raise CampaignContractError(
+                "first-candidate completed-training reuse contract changed"
+            )
+        for mode in MODES:
+            record = reuse_modes[mode]
+            if not isinstance(record, Mapping):
+                raise CampaignContractError(
+                    f"{mode} first-candidate training reuse changed"
+                )
+            checkpoint = record.get("terminal_checkpoint", {})
+            if (
+                record.get("candidate_id") != f"{mode}_rec_0"
+                or record.get("rec_id") != "0"
+                or not _is_lower_sha256(record.get("candidate_fingerprint"))
+                or not isinstance(record.get("checkpoint_id"), str)
+                or not _is_lower_sha256(record.get("specs_sha256"))
+                or not _is_lower_sha256(
+                    record.get("recommendation_audit_sha256")
+                )
+                or not isinstance(record.get("source_train_job_id"), str)
+                or not isinstance(record.get("source_results_dir"), str)
+                or not record["source_results_dir"].startswith("lustre:///")
+                or not isinstance(checkpoint, Mapping)
+                or not isinstance(checkpoint.get("path"), str)
+                or not checkpoint["path"].startswith("/lustre/")
+                or not _is_lower_sha256(checkpoint.get("sha256"))
+                or not isinstance(checkpoint.get("size_bytes"), int)
+                or checkpoint["size_bytes"] < 1
+                or not isinstance(record.get("source_state_file"), str)
+                or not Path(record["source_state_file"]).is_absolute()
+                or not isinstance(record.get("source_state_db"), str)
+                or not Path(record["source_state_db"]).is_absolute()
+                or not _is_lower_sha256(record.get("source_state_db_sha256"))
+                or not isinstance(
+                    record.get("source_candidate_evidence"), str
+                )
+                or not Path(record["source_candidate_evidence"]).is_absolute()
+                or not _is_lower_sha256(
+                    record.get("source_candidate_evidence_sha256")
+                )
+                or not isinstance(
+                    record.get("discarded_non_observations"), int
+                )
+                or record["discarded_non_observations"] < 0
+            ):
+                raise CampaignContractError(
+                    f"{mode} first-candidate training reuse changed"
+                )
     predecessor = runtime.get("predecessor_failure_evidence", {})
     runtime_eligibility = runtime.get("runtime_local_eligibility", {})
     expected_eligibility_source_commit = (

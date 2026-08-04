@@ -29,6 +29,7 @@ import sys
 import time
 from collections.abc import Mapping
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import yaml
@@ -150,6 +151,134 @@ def _offline_text_environment(
             "Mask Grounding DINO offline text environment changed"
         )
     return {**environment, "TOKENIZERS_PARALLELISM": "false"}
+
+
+class FirstCandidateTrainingReuseSDK:
+    """Reuse one exact completed rec-0 train job in a fresh controller."""
+
+    def __init__(
+        self,
+        delegate: Any,
+        source: Any,
+        record: Mapping[str, Any],
+    ):
+        self._delegate = delegate
+        self._source = source
+        self._record = copy.deepcopy(dict(record))
+        self._source_job_id = str(record["source_train_job_id"])
+        self._armed = False
+        self._reused = False
+        source_job = source.get_job(self._source_job_id)
+        if (
+            not isinstance(source_job, Mapping)
+            or source_job.get("status") != "Complete"
+            or source_job.get("results_dir") != record["source_results_dir"]
+        ):
+            raise CampaignExecutionError(
+                "first-candidate source training job is not durably reusable"
+            )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+    def arm_first_candidate_training_reuse(self, recommendation: Any) -> None:
+        rec_id = int(recommendation.id)
+        if rec_id != 0:
+            return
+        if self._armed or self._reused:
+            raise CampaignExecutionError(
+                "first-candidate training reuse was armed more than once"
+            )
+        fingerprint = canonical_spec_fingerprint(recommendation.specs)
+        if (
+            fingerprint != self._record["candidate_fingerprint"]
+            or canonical_sha256(recommendation.specs)
+            != self._record["specs_sha256"]
+            or _ptm_id(
+                recommendation.recommendation_audit,
+                (self._record["checkpoint_id"],),
+            )
+            != self._record["checkpoint_id"]
+        ):
+            raise CampaignExecutionError(
+                "fresh rec-0 differs from the completed training candidate"
+            )
+        self._armed = True
+
+    def create_job(self, *args: Any, **kwargs: Any) -> Any:
+        if not self._armed:
+            return self._delegate.create_job(*args, **kwargs)
+        self._armed = False
+        self._reused = True
+        source_job = self._source.get_job(self._source_job_id)
+        return SimpleNamespace(
+            id=self._source_job_id,
+            backend_job_id=source_job.get("backend_job_id", self._source_job_id),
+        )
+
+    def _for_source(self, job_id: str) -> Any | None:
+        return self._source if job_id == self._source_job_id else None
+
+    def get_job_status(self, job_id: str) -> Any:
+        sdk = self._for_source(job_id) or self._delegate
+        return sdk.get_job_status(job_id)
+
+    def get_job_logs(self, job_id: str, tail: int | None = None) -> str:
+        sdk = self._for_source(job_id) or self._delegate
+        return sdk.get_job_logs(job_id, tail=tail)
+
+    def get_job_results_dir(self, job_id: str) -> str:
+        sdk = self._for_source(job_id) or self._delegate
+        return sdk.get_job_results_dir(job_id)
+
+    def get_failure_analysis(self, job_id: str) -> Any:
+        sdk = self._for_source(job_id) or self._delegate
+        return sdk.get_failure_analysis(job_id)
+
+    def get_job(self, job_id: str) -> Any:
+        sdk = self._for_source(job_id) or self._delegate
+        return sdk.get_job(job_id)
+
+    def get_checkpoints(self, job_id: str) -> list[str]:
+        sdk = self._for_source(job_id) or self._delegate
+        return sdk.get_checkpoints(job_id)
+
+    def cancel_job(self, job_id: str) -> bool:
+        sdk = self._for_source(job_id) or self._delegate
+        return sdk.cancel_job(job_id)
+
+    def assert_terminal_checkpoint(
+        self,
+        job_id: str,
+        checkpoint: Mapping[str, Any],
+    ) -> None:
+        if job_id == self._source_job_id and dict(checkpoint) != self._record[
+            "terminal_checkpoint"
+        ]:
+            raise CampaignExecutionError(
+                "reused first-candidate terminal checkpoint identity changed"
+            )
+
+    def training_reuse_evidence(self, job_id: str) -> dict[str, Any] | None:
+        if job_id != self._source_job_id:
+            return None
+        return {
+            "schema_version": 1,
+            "kind": "completed_training_job_reuse",
+            "source_train_job_id": self._source_job_id,
+            "source_results_dir": self._record["source_results_dir"],
+            "source_state_db_sha256": self._record[
+                "source_state_db_sha256"
+            ],
+            "source_candidate_evidence_sha256": self._record[
+                "source_candidate_evidence_sha256"
+            ],
+            "training_job_reused": True,
+            "new_training_job_submitted": False,
+            "objective_values_reused": False,
+            "standalone_evaluation_reused": False,
+            "latency_measurement_reused": False,
+        }
 
 
 def _remote_file_identity(path: str) -> dict[str, Any]:
@@ -452,6 +581,23 @@ def verify_local_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
             resume_predecessor["path"],
             resume_predecessor["file_sha256"],
         )
+    first_candidate_reuse = runtime.get(
+        "first_candidate_training_reuse"
+    )
+    if isinstance(first_candidate_reuse, Mapping):
+        identities["first_candidate_source_contract"] = (
+            first_candidate_reuse["source_contract"]["path"],
+            first_candidate_reuse["source_contract"]["file_sha256"],
+        )
+        for mode, record in first_candidate_reuse["modes"].items():
+            identities[f"{mode}_first_candidate_state"] = (
+                record["source_state_db"],
+                record["source_state_db_sha256"],
+            )
+            identities[f"{mode}_first_candidate_evidence"] = (
+                record["source_candidate_evidence"],
+                record["source_candidate_evidence_sha256"],
+            )
     evidence = {}
     for name, (path_value, expected_sha) in identities.items():
         path = Path(path_value).resolve()
@@ -1561,10 +1707,24 @@ def _run_mode(
         mode=mode,
         cache_root=root / "verified_ptm_cache",
     )
-    sdk = SlurmSDK(
+    delegate_sdk = SlurmSDK(
         poll_interval=10,
         state_file=mode_dir / "slurm_state.json",
     )
+    reuse = contract["runtime"].get("first_candidate_training_reuse")
+    if isinstance(reuse, Mapping):
+        reuse_record = reuse["modes"][mode]
+        source_sdk = SlurmSDK(
+            poll_interval=10,
+            state_file=reuse_record["source_state_file"],
+        )
+        sdk: Any = FirstCandidateTrainingReuseSDK(
+            delegate_sdk,
+            source_sdk,
+            reuse_record,
+        )
+    else:
+        sdk = delegate_sdk
     runner = AutoMLRunner(
         sdk=sdk,
         skill_dir=Path(contract["runtime"]["skill_dir"]),
@@ -1604,6 +1764,11 @@ def _run_mode(
         record = _immutable_recommendation_record(
             rec, mode, decision.checkpoint_ids
         )
+        arm_reuse = getattr(
+            sdk, "arm_first_candidate_training_reuse", None
+        )
+        if callable(arm_reuse):
+            arm_reuse(rec)
         _preserve_or_add_recommendation(candidates, record)
         persist()
 
@@ -1622,6 +1787,11 @@ def _run_mode(
                 for name, value in cached.items()
             }
         terminal_checkpoint = _terminal_checkpoint(sdk, train_job_id)
+        checkpoint_assertion = getattr(
+            sdk, "assert_terminal_checkpoint", None
+        )
+        if callable(checkpoint_assertion):
+            checkpoint_assertion(train_job_id, terminal_checkpoint)
         checkpoint = terminal_checkpoint["path"]
         specification = evaluation_spec(
             contract,
@@ -1635,6 +1805,11 @@ def _run_mode(
                 "terminal_checkpoint": terminal_checkpoint,
             }
         )
+        reuse_evidence = getattr(sdk, "training_reuse_evidence", None)
+        if callable(reuse_evidence):
+            training_reuse = reuse_evidence(train_job_id)
+            if training_reuse is not None:
+                record["training_reuse"] = training_reuse
         persist()
         validation_mask_ap, accuracy_job = _launch_evaluation(
             sdk,
