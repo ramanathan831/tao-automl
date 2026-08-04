@@ -138,6 +138,20 @@ def configure_slurm_runtime(contract: Mapping[str, Any]) -> None:
     )
 
 
+def _offline_text_environment(
+    contract: Mapping[str, Any],
+) -> dict[str, str]:
+    environment = dict(contract["text_encoder"]["offline_environment"])
+    if environment != {
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+    }:
+        raise CampaignExecutionError(
+            "Mask Grounding DINO offline text environment changed"
+        )
+    return {**environment, "TOKENIZERS_PARALLELISM": "false"}
+
+
 def _remote_file_identity(path: str) -> dict[str, Any]:
     script = (
         "import hashlib,json,pathlib,sys;"
@@ -1188,6 +1202,7 @@ def _launch_latency(
         num_nodes=1,
         partition=runtime["partition"],
         account=runtime["account"],
+        env_vars=_offline_text_environment(contract),
     )
     evidence = {
         "tao_job_id": job.id,
@@ -1424,6 +1439,40 @@ def _await_first_candidate_release(
         )
 
 
+def _require_remaining_budget_release(
+    *,
+    runtime_root: Path,
+    contract_sha256: str,
+    recommendation_id: Any,
+) -> None:
+    """Fail before launching any recommendation beyond the first candidate."""
+    try:
+        rec_id = int(recommendation_id)
+    except (TypeError, ValueError) as exc:
+        raise CampaignExecutionError(
+            f"invalid recommendation id: {recommendation_id!r}"
+        ) from exc
+    if rec_id == 0:
+        return
+    release = _first_candidate_gate_dir(
+        runtime_root, contract_sha256
+    ) / "release.json"
+    if not release.is_file():
+        raise CampaignExecutionError(
+            f"recommendation {rec_id} blocked: first-candidate release is missing"
+        )
+    decision = json.loads(release.read_text(encoding="utf-8"))
+    if (
+        decision.get("contract_sha256") != contract_sha256
+        or decision.get("modes") != list(campaign_contract.MODES)
+        or decision.get("release_remaining_budget") is not True
+    ):
+        raise CampaignExecutionError(
+            f"recommendation {rec_id} blocked by first-candidate gate: "
+            f"{decision.get('reason', 'unspecified')}"
+        )
+
+
 def _run_mode(
     contract_path: str,
     runtime_root: str,
@@ -1547,6 +1596,11 @@ def _run_mode(
         atomic_json(evidence_path, value)
 
     def on_recommendation(rec: Any) -> None:
+        _require_remaining_budget_release(
+            runtime_root=root,
+            contract_sha256=contract["contract_sha256"],
+            recommendation_id=rec.id,
+        )
         record = _immutable_recommendation_record(
             rec, mode, decision.checkpoint_ids
         )
@@ -1590,6 +1644,17 @@ def _run_mode(
             mode=mode,
             candidate_id=candidate_id,
         )
+        # Persist the completed standalone evaluation before latency starts.
+        # A latency failure must not erase already validated accuracy evidence.
+        record.update(
+            {
+                "standalone_validation": accuracy_job,
+                "partial_objective_values": {
+                    "segm_val_mAP50_95": validation_mask_ap,
+                },
+            }
+        )
+        persist()
         latency, latency_job = _launch_latency(
             sdk,
             contract,

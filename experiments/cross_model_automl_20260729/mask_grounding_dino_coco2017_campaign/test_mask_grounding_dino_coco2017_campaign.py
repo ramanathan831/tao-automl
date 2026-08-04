@@ -1255,6 +1255,71 @@ def test_successor_gate_preserves_predecessor_release(tmp_path: Path):
     ) == predecessor_release
 
 
+def test_remaining_budget_gate_blocks_second_recommendation_after_rejection(
+    tmp_path: Path,
+):
+    contract_sha256 = "d" * 64
+    gate = run_campaign._first_candidate_gate_dir(
+        tmp_path, contract_sha256
+    )
+    run_campaign.atomic_json(
+        gate / "release.json",
+        {
+            "schema_version": 1,
+            "contract_sha256": contract_sha256,
+            "release_remaining_budget": False,
+            "modes": list(campaign_contract.MODES),
+            "reason": "one or more real first candidates failed",
+        },
+    )
+    run_campaign._require_remaining_budget_release(
+        runtime_root=tmp_path,
+        contract_sha256=contract_sha256,
+        recommendation_id=0,
+    )
+    with pytest.raises(
+        run_campaign.CampaignExecutionError,
+        match="blocked by first-candidate gate",
+    ):
+        run_campaign._require_remaining_budget_release(
+            runtime_root=tmp_path,
+            contract_sha256=contract_sha256,
+            recommendation_id=1,
+        )
+
+
+def test_remaining_budget_gate_allows_second_recommendation_only_after_release(
+    tmp_path: Path,
+):
+    contract_sha256 = "e" * 64
+    gate = run_campaign._first_candidate_gate_dir(
+        tmp_path, contract_sha256
+    )
+    run_campaign.atomic_json(
+        gate / "release.json",
+        {
+            "schema_version": 1,
+            "contract_sha256": contract_sha256,
+            "release_remaining_budget": True,
+            "modes": list(campaign_contract.MODES),
+            "reason": "all real first candidates passed",
+        },
+    )
+    run_campaign._require_remaining_budget_release(
+        runtime_root=tmp_path,
+        contract_sha256=contract_sha256,
+        recommendation_id="1",
+    )
+
+
+def test_latency_worker_receives_frozen_offline_text_environment(contract):
+    assert run_campaign._offline_text_environment(contract) == {
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "TOKENIZERS_PARALLELISM": "false",
+    }
+
+
 def test_launch_plan_is_automatic_and_does_not_launch(contract):
     plan = run_campaign.launch_plan(
         contract,
