@@ -30,6 +30,27 @@ def test_corrupt_active_job_ledger_fails_closed(tmp_path):
         _load_active_jobs(str(tmp_path))
 
 
+def test_resume_replays_only_pending_recommendations_without_backend_jobs():
+    from tao_automl.runner import _durable_unlaunched_recommendations
+    from tao_automl.types import JobStates
+
+    def rec(identifier, status, job_id=None):
+        return SimpleNamespace(id=identifier, status=status, job_id=job_id)
+
+    history = [
+        rec(0, JobStates.success, "job-0"),
+        rec(1, JobStates.pending),
+        rec(2, JobStates.pending),
+        rec(3, JobStates.pending, "job-3"),
+        rec(4, JobStates.failure),
+    ]
+    active_entries = [{"rec_id": 2, "job_id": "job-2-ledger"}]
+
+    replay = _durable_unlaunched_recommendations(history, active_entries)
+
+    assert [item.id for item in replay] == [1]
+
+
 # ---------------------------------------------------------------------------
 # SkillContext
 # ---------------------------------------------------------------------------

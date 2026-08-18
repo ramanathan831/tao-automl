@@ -54,6 +54,7 @@ from typing import Any
 import numpy as np
 import yaml
 from tao_automl.objectives import is_latency_metric, parse_objective_config
+from tao_automl.types import JobStates
 from tao_automl.utils.spec_utils import resolve_schema_leaf
 from tao_sdk.checkpoints import (
     build_checkpoint_candidate,
@@ -2291,6 +2292,23 @@ def _load_active_jobs(workspace_path: str) -> list:
     return validated
 
 
+def _durable_unlaunched_recommendations(history, active_entries):
+    """Return persisted pending recommendations that have no backend job.
+
+    Parallel brains persist a whole recommendation batch before the runner
+    assigns backend IDs. A crash in that window must replay the unassigned
+    members on resume instead of leaving phantom pending records that block
+    the brain forever.
+    """
+    active_rec_ids = {int(entry["rec_id"]) for entry in active_entries}
+    return [
+        rec for rec in history
+        if rec.status == JobStates.pending
+        and not rec.job_id
+        and rec.id not in active_rec_ids
+    ]
+
+
 def _artifact_jobs_path(workspace_path: str):
     return Path(workspace_path) / "artifact_jobs.json"
 
@@ -3466,6 +3484,7 @@ class AutoMLRunner:
         # --- fix #3: if resuming, recover any jobs that were in flight when
         #              the previous orchestrator died. Poll each to terminal,
         #              report to the brain, then continue.
+        resume_unlaunched = []
         if resume:
             pending = _load_active_jobs(workspace_path)
             if pending:
@@ -3494,6 +3513,16 @@ class AutoMLRunner:
                         platform_kwargs=platform_kwargs,
                     )
 
+            resume_unlaunched = _durable_unlaunched_recommendations(
+                automl.get_history(), pending
+            )
+            if resume_unlaunched:
+                logger.info(
+                    "Resume: replaying %d durable unlaunched recommendation(s): %s",
+                    len(resume_unlaunched),
+                    [rec.id for rec in resume_unlaunched],
+                )
+
         while not automl.is_complete():
             progress = automl.get_progress()
             max_recommendations = automl_settings.get("automl_max_recommendations")
@@ -3507,7 +3536,11 @@ class AutoMLRunner:
             # Generate only after the runner-level cap check. Once a brain
             # emits a batch, run the whole batch: slicing can strand pending
             # promotion records inside multi-fidelity algorithms.
-            recs = automl.next_recommendation()
+            if resume_unlaunched:
+                recs = resume_unlaunched
+                resume_unlaunched = []
+            else:
+                recs = automl.next_recommendation()
             if not recs:
                 logger.info("No recommendations available — waiting for results")
                 time.sleep(5)
