@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """AutoML algorithm's Base Class"""
+import hashlib
+import json
 import math
 import numpy as np
 import random
@@ -8,6 +10,7 @@ import logging
 
 
 from tao_automl.utils.math_utils import (
+    JobStates,
     fix_input_dimension,
     fix_power_of_factor,
     get_valid_options,
@@ -20,6 +23,12 @@ from tao_automl.utils import automl_helper
 
 
 logger = logging.getLogger(__name__)
+
+
+def stable_seed(identity) -> int:
+    """Return a process-independent 31-bit seed for an experiment identity."""
+    digest = hashlib.sha256(str(identity).encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % (2**31)
 
 
 def is_nan_value(val):
@@ -66,7 +75,7 @@ class AutoMLAlgorithmBase:
         # Use the job ID by default, while allowing composite algorithms to
         # vary proposal seeds without changing the state-store job identity.
         seed_identity = getattr(context, "automl_seed_identity", context.id)
-        seed = hash(str(seed_identity)) % 2**31
+        seed = stable_seed(seed_identity)
         np.random.seed(seed)
         random.seed(seed)
 
@@ -941,3 +950,92 @@ class AutoMLAlgorithmBase:
                 "dimension(s) to the narrowed coordinate system",
                 len(design_points), len(transforms))
         return transforms
+
+    def normalize_observation_value(self, parameter, value):
+        """Map a persisted recommendation value back to a stable [0, 1] coordinate."""
+        options = get_valid_options(parameter, self.custom_ranges)
+        if options not in (None, "", []):
+            options = list(options) if isinstance(options, (list, tuple)) else [options]
+            for index, option in enumerate(options):
+                if value == option:
+                    return index / max(1, len(options) - 1)
+
+        value_type = parameter.get("value_type")
+        if value_type in ("float", "int", "integer"):
+            v_min, v_max = get_valid_range(
+                parameter, self.parent_params, self.custom_ranges
+            )
+            if (
+                np.isscalar(v_min)
+                and np.isscalar(v_max)
+                and np.isfinite(v_min)
+                and np.isfinite(v_max)
+            ):
+                if v_max > v_min:
+                    return float(
+                        np.clip(
+                            (float(value) - float(v_min))
+                            / (float(v_max) - float(v_min)),
+                            0.0,
+                            1.0,
+                        )
+                    )
+                return 0.5
+
+        if value_type == "bool" or isinstance(value, bool):
+            return float(bool(value))
+
+        canonical = json.dumps(
+            value, sort_keys=True, separators=(",", ":"), default=str
+        )
+        digest = int.from_bytes(
+            hashlib.sha256(canonical.encode("utf-8")).digest()[:8], "big"
+        )
+        return digest / float((1 << 64) - 1)
+
+    def sync_successful_observations(self, history, design_points, values):
+        """Reconcile GP observations from durable recommendation history.
+
+        A controller can persist a launched recommendation before the brain's
+        process-local design-point cache is saved. On resume, reconstruct the
+        missing coordinate from the authoritative persisted specs. Existing
+        pending coordinates are replaced as well so callback-adjusted specs,
+        rather than the pre-callback proposal, train the surrogate.
+        """
+        successes = [
+            rec
+            for rec in history
+            if rec.status == JobStates.success
+            and rec.result is not None
+            and not is_nan_value(rec.result)
+        ]
+        if len(values) > len(successes):
+            raise RuntimeError(
+                "surrogate observation state contains more values than "
+                "successful durable recommendations"
+            )
+
+        for rec in successes[len(values):]:
+            vector = np.array(
+                [
+                    self.normalize_observation_value(
+                        parameter, rec.specs.get(parameter["parameter"])
+                    )
+                    for parameter in self.parameters
+                ],
+                dtype=float,
+            )
+            index = len(values)
+            if index < len(design_points):
+                design_points[index] = vector
+            elif index == len(design_points):
+                design_points.append(vector)
+            else:
+                raise RuntimeError(
+                    "surrogate design-point state is missing an earlier observation"
+                )
+            values.append(rec.result)
+            logger.info(
+                "Reconciled surrogate observation from durable recommendation %s",
+                rec.id,
+            )

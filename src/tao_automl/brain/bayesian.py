@@ -447,7 +447,7 @@ class Bayesian(AutoMLAlgorithmBase):
             self.Xs.append(suggestions)
         else:
             # Update the GP based on results
-            self.ys.append(history[-1].result)
+            self.sync_successful_observations(history, self.Xs, self.ys)
             # LLM-guided range narrowing: renormalize stored design points
             # into the narrowed coordinate system BEFORE the refit so the GP
             # keeps every observation at its true real-world location.

@@ -372,7 +372,7 @@ class BFBO(AutoMLAlgorithmBase):
                 recommendations.append(recommendation_value)
             return [dict(zip([param["parameter"] for param in self.parameters], recommendations))]
 
-        self.ys.append(history[-1].result)
+        self.sync_successful_observations(history, self.Xs, self.ys)
         # LLM-guided range narrowing: renormalize stored design points into
         # the narrowed coordinate system BEFORE the refit (mirrors bayesian).
         direction = "minimize" if "loss" in self.metric.lower() else "maximize"

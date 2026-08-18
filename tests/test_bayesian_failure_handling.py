@@ -87,3 +87,48 @@ def test_search_alternates_failure_and_success(tmp_path):
     # Only the successful trial is an observation; rec3's point is pending.
     assert brain.ys == [0.75]
     assert len(brain.Xs) == len(brain.ys) + 1
+
+
+def test_resume_rebuilds_missing_bayesian_design_point(tmp_path):
+    automl = _make_automl(tmp_path)
+    brain = automl._controller.brain
+
+    rec = automl.next_recommendation()[0]
+    automl.report_result(rec.id, 0.8, status="success")
+    brain.Xs.clear()
+    brain.ys.clear()
+
+    next_rec = automl.next_recommendation()
+
+    assert next_rec
+    assert brain.ys == [0.8]
+    assert len(brain.Xs) == 2
+    assert all(0.0 <= value <= 1.0 for value in brain.Xs[0])
+
+
+def test_resume_rebuilds_missing_bfbo_design_point(tmp_path):
+    schema = _schema()
+    automl = AutoML(
+        workspace=str(tmp_path),
+        network="external_failure_model",
+        train_specs=schema["default"],
+        settings={
+            "algorithm": "bfbo",
+            "metric": "accuracy",
+            "automl_max_recommendations": 5,
+        },
+        search_schema=schema,
+    )
+    brain = automl._controller.brain
+
+    rec = automl.next_recommendation()[0]
+    automl.report_result(rec.id, 0.7, status="success")
+    brain.Xs.clear()
+    brain.ys.clear()
+
+    next_rec = automl.next_recommendation()
+
+    assert next_rec
+    assert brain.ys == [0.7]
+    assert len(brain.Xs) == 2
+    assert all(0.0 <= value <= 1.0 for value in brain.Xs[0])
